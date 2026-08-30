@@ -66,9 +66,14 @@ jobs:
         id: keys
         run: echo "week=$(date -u +%Y-%U)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache builder image
+      # restore/save rather than actions/cache, throughout. actions/cache only
+      # writes in its post step, and post steps do not run when the job fails --
+      # so a failed publish at the very end discards an hour of compilation and
+      # the retry starts cold. Publishing talks to an external service and is by
+      # far the likeliest step to fail, which makes that exactly backwards.
+      - name: Restore builder image
         id: imgcache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/builder-image.tar
           key: builder-${{ hashFiles('Dockerfile') }}-${{ steps.keys.outputs.week }}
@@ -84,6 +89,14 @@ jobs:
             docker save linux-handheld-builder:latest -o ~/.cache/builder-image.tar
           fi
 
+      - name: Save builder image
+        if: always() && steps.imgcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/builder-image.tar
+          key: builder-${{ hashFiles('Dockerfile') }}-${{ steps.keys.outputs.week }}
+
       - name: Install host tools
         run: |
           set -euo pipefail
@@ -97,8 +110,9 @@ jobs:
 
       # The kernel tarball is 150 MB and identical across every build of one
       # base; caching it turns a base bump into the only run that downloads it.
-      - name: Cache kernel tarball
-        uses: actions/cache@v4
+      - name: Restore kernel tarball
+        id: tarcache
+        uses: actions/cache/restore@v4
         with:
           path: .cache
           key: tarball-${{ hashFiles('sources.env') }}
@@ -110,6 +124,14 @@ jobs:
           OGC_REF_OVERRIDE: ${{ inputs.ogc_ref }}
           BASE_VERSION_OVERRIDE: ${{ inputs.base_version }}
         run: ./scripts/fetch-patches.sh
+
+      - name: Save kernel tarball
+        if: always() && steps.tarcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .cache
+          key: tarball-${{ hashFiles('sources.env') }}
 
       - name: Decide pkgrel
         id: ver
@@ -123,8 +145,8 @@ jobs:
       # Keyed on pkgver so a base bump starts clean rather than inheriting a
       # cache full of objects for a different kernel; restore-keys still lets an
       # armada-only rebuild reuse almost everything.
-      - name: Cache ccache
-        uses: actions/cache@v4
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
         with:
           path: .ccache
           key: ccache-${{ steps.ver.outputs.pkgver }}-${{ github.sha }}
@@ -133,7 +155,27 @@ jobs:
             ccache-
 
       - name: Build packages
+        env:
+          # build.sh defaults to 8G, which is right locally and wrong here.
+          # GitHub allows 10 GB of Actions cache PER REPOSITORY, evicted LRU, and
+          # the ccache key includes the commit sha -- so every push writes a new
+          # entry rather than updating one. At 8G, the builder image (630 MB) and
+          # kernel tarball (150 MB) plus a single ccache generation already fill
+          # the budget, so the next push evicts the cache it was about to reuse
+          # and every build stays cold. 2G holds a full kernel's objects with
+          # room for several generations to coexist.
+          CCACHE_MAXSIZE: 2G
         run: ./scripts/build.sh
+
+      # Immediately after the build and before anything that can fail, because
+      # this is the hour of work worth protecting.
+      - name: Save ccache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ steps.ver.outputs.pkgver }}-${{ github.sha }}
 
       - name: Job summary
         if: always()

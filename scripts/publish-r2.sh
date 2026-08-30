@@ -33,7 +33,33 @@ for v in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
 done
 
 command -v rclone >/dev/null || { echo "!! rclone not found" >&2; exit 1; }
-command -v repo-add >/dev/null || { echo "!! repo-add not found (pacman)" >&2; exit 1; }
+
+# ── which repo-add ──────────────────────────────────────────────────────────
+# Prefer the builder image's, because its pacman is the one that built these
+# packages. The host's is whatever the platform ships, and on GitHub's Ubuntu
+# runners `pacman-package-manager` is 6.0.2 while Arch is on 7.1.0 -- old enough
+# not to know --include-sigs, and old repo-add does not reject unknown options,
+# it treats them as the database filename:
+#     ERROR: '--include-sigs' does not have a valid database archive extension.
+# Pinning to the container removes the whole class of version-skew bugs here,
+# not just that flag.
+#
+# No signing happens in the container: repo-add is called without --sign and the
+# key is never mounted. The database is signed afterwards, on the host.
+IMAGE="${IMAGE:-linux-handheld-builder:latest}"
+if command -v docker >/dev/null 2>&1 && docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+    REPO_ADD_IN_CONTAINER=1
+elif command -v repo-add >/dev/null; then
+    REPO_ADD_IN_CONTAINER=
+    if ! repo-add --help 2>&1 | grep -q -- '--include-sigs'; then
+        echo "==> note: host $(repo-add --version 2>&1 | head -1) has no --include-sigs." >&2
+        echo "    Signatures will not be embedded in the database, so clients fetch" >&2
+        echo "    each .sig separately -- correct, just one extra request per install." >&2
+    fi
+else
+    echo "!! neither the ${IMAGE} container nor a host repo-add is available" >&2
+    exit 1
+fi
 
 CHECK_ONLY="${CHECK_ONLY:-}"
 PKGS=(out/*.pkg.tar.zst)
@@ -154,7 +180,14 @@ for p in "${PKGS[@]}"; do cp "${p}.sig" "${DB}/"; done
   # SigLevel=...DatabaseOptional accepts it without complaint -- a silent
   # downgrade of exactly the thing signing was meant to guarantee. We sign it
   # below with the same loopback path that already works for the packages.
-  repo-add --quiet --include-sigs "${REPO_NAME}.db.tar.gz" ./*.pkg.tar.zst
+  if [ -n "${REPO_ADD_IN_CONTAINER}" ]; then
+      docker run --rm -v "${DB}:/db" -w /db \
+          --user "$(id -u):$(id -g)" -e HOME=/tmp \
+          "${IMAGE}" repo-add --quiet --include-sigs "${REPO_NAME}.db.tar.gz" ./*.pkg.tar.zst
+  else
+      inc=(); repo-add --help 2>&1 | grep -q -- '--include-sigs' && inc=(--include-sigs)
+      repo-add --quiet "${inc[@]}" "${REPO_NAME}.db.tar.gz" ./*.pkg.tar.zst
+  fi
 
   # repo-add leaves handheld.db and handheld.files as SYMLINKS to the .tar.gz
   # files, and those are the names pacman actually fetches. rclone skips symlinks
