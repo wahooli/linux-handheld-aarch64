@@ -1,0 +1,193 @@
+name: build
+
+# Triggers, and what each is for:
+#
+#   workflow_dispatch  manual, plus the poller's `gh workflow run` -- a push made
+#                      with GITHUB_TOKEN does not trigger other workflows, so the
+#                      poller commits sources.env and then dispatches explicitly.
+#   push               anything that changes what gets built: the pinned refs,
+#                      the manifests, the config, the PKGBUILD, the scripts.
+#                      Docs and READMEs deliberately do not trigger a kernel build.
+on:
+  workflow_dispatch:
+    inputs:
+      ogc_ref:
+        description: 'OGC release tag to build (blank = use sources.env)'
+        type: string
+        default: ''
+      base_version:
+        description: 'Pin the mainline base (blank = derive from the OGC tag)'
+        type: string
+        default: ''
+      skip_publish:
+        description: 'Build only; do not touch R2, do not tag'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - 'sources.env'
+      - 'PKGBUILD'
+      - 'Dockerfile'
+      - 'config/**'
+      - 'devices/**'
+      - 'patches/series.d/**'
+      - 'patches/ogc.select'
+      - 'patches/ogc.select.deny'
+      - 'patches/ogc.keyfpr'
+      - 'patches/local/**'
+      - 'scripts/**'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: write   # push tags, create releases
+  issues: write     # open the build-failure issue
+
+# One publisher at a time. cancel-in-progress is false on purpose: cancelling a
+# job mid-publish could leave R2 holding packages with no database entry, or a
+# database referencing a package whose upload was killed.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Native aarch64. Free for public repositories, and it means no qemu, no
+    # binfmt, and no cross-compilation tax on a kernel build.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Weekly rotation of the builder image so its toolchain does not drift a
+      # year behind the target, without rebuilding a rootfs on every run.
+      - name: Cache key inputs
+        id: keys
+        run: echo "week=$(date -u +%Y-%U)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache builder image
+        id: imgcache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/builder-image.tar
+          key: builder-${{ hashFiles('Dockerfile') }}-${{ steps.keys.outputs.week }}
+
+      - name: Load or build the builder image
+        run: |
+          set -euo pipefail
+          if [ -f ~/.cache/builder-image.tar ]; then
+            docker load -i ~/.cache/builder-image.tar
+          else
+            docker build -t linux-handheld-builder:latest .
+            mkdir -p ~/.cache
+            docker save linux-handheld-builder:latest -o ~/.cache/builder-image.tar
+          fi
+
+      - name: Install host tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # pacman-package-manager gives us repo-add and vercmp on the runner, so
+          # the database is assembled outside the build container and the signing
+          # key never enters it.
+          sudo apt-get install -y -qq rclone pacman-package-manager libarchive-tools jq
+          repo-add --version | head -1
+          vercmp 1.0 1.1 >/dev/null && echo "vercmp ok"
+
+      # The kernel tarball is 150 MB and identical across every build of one
+      # base; caching it turns a base bump into the only run that downloads it.
+      - name: Cache kernel tarball
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: tarball-${{ hashFiles('sources.env') }}
+          restore-keys: tarball-
+
+      - name: Resolve the patch stack
+        id: fetch
+        env:
+          OGC_REF_OVERRIDE: ${{ inputs.ogc_ref }}
+          BASE_VERSION_OVERRIDE: ${{ inputs.base_version }}
+        run: ./scripts/fetch-patches.sh
+
+      - name: Decide pkgrel
+        id: ver
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: ./scripts/next-pkgrel.sh
+
+      # Keyed on pkgver so a base bump starts clean rather than inheriting a
+      # cache full of objects for a different kernel; restore-keys still lets an
+      # armada-only rebuild reuse almost everything.
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ steps.ver.outputs.pkgver }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ steps.ver.outputs.pkgver }}-
+            ccache-
+
+      - name: Build packages
+        run: ./scripts/build.sh
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          [ -f .fetch-report.md ]  && cat .fetch-report.md  >> "$GITHUB_STEP_SUMMARY" || true
+          [ -f .staged-report.md ] && cat .staged-report.md >> "$GITHUB_STEP_SUMMARY" || true
+          if compgen -G 'out/*.pkg.tar.zst' > /dev/null; then
+            {
+              echo
+              echo "### Packages"
+              echo
+              echo "| package | size |"
+              echo "|---|---|"
+              for f in out/*.pkg.tar.zst; do
+                echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"
+              done
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: packages-${{ steps.ver.outputs.pkgver }}-${{ steps.ver.outputs.pkgrel }}
+          path: |
+            out/*.pkg.tar.zst
+            version.env
+            patches/series.generated
+          retention-days: 14
+
+      # ---- publish ---------------------------------------------------------
+      - name: Publish to R2
+        if: ${{ !inputs.skip_publish }}
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          REPO_SIGNING_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+          REPO_SIGNING_KEY_PASSPHRASE: ${{ secrets.REPO_SIGNING_KEY_PASSPHRASE }}
+        run: ./scripts/publish-r2.sh
+
+      # Only after the packages are actually live. A tag that exists but was
+      # never published would be the worst kind of provenance record: one that
+      # looks authoritative and is not.
+      - name: Tag and release
+        if: ${{ !inputs.skip_publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/tag-release.sh
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: ./scripts/report-failure.sh

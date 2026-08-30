@@ -1,0 +1,128 @@
+# AYN Odin 3 patch series -- applied top-to-bottom, before the OGC block and
+# before patches/local/. `#` lines and anything after a `#` are ignored.
+#
+# This is the Odin-3-relevant subset of armada's 158-line series. Armada carries
+# every device it supports (SM8250 + SM8550 + SM8650 + SM8750); we only need the
+# CQ8725S/SM8750 path plus the shared msm/qcom fixes.
+#
+# Every entry here is fetched verbatim from armada-packages at ARMADA_REF, with
+# ROCKNIX as a fallback source. Nothing in this file is locally rebased -- if a
+# patch ever needs local changes it moves to patches/local/ and gets an entry in
+# the "Local divergence" section of docs/PATCHES.md.
+#
+# Provenance lives in docs/PATCHES.md. Keep them in sync: an unattributed patch
+# is one nobody can rebase. Fetch with scripts/fetch-patches.sh.
+# ============== SoC identification ==============
+# CQ8725S is the Dragonwing part in the Odin 3. Mainline doesn't know the ID.
+0026-dt-bindings-arm-qcom-ids-Add-SoC-ID-for-CQ8725S.patch
+0027-soc-qcom-socinfo-Add-CQ8725S-SoC-ID.patch
+
+# ============== SM8750 SoC DT enablement ==============
+0033-arm64-dts-qcom-sm8750-gpu-clock-controllers.patch
+0034-arm64-dts-qcom-sm8750-Add-UART15.patch
+0035-arm64-dts-qcom-sm8750-set-CPU-capacity-dmips-mhz.patch
+0037-arm64-dts-qcom-sm8750-add-CPU-thermal-cooling.patch
+0038-arm64-dts-qcom-sm8750-add-GPU-nodes.patch
+0038a-arm64-dts-qcom-sm8750-map-A8xx-RSCC-registers.patch
+20260424_neil_armstrong_arm64_dts_qcom_sm8_456_50_add_missing_cx_power_domain_to_gcc.patch
+
+# ============== GPU — Adreno 830 (A8xx) ==============
+# Not in mainline. Without this there is no GPU at all.
+#
+# Load-bearing for userspace too: this declares ADRENO_CHIP_IDS(0x44050000), and
+# ALARM's stock turnip has the DRM/msm form of exactly that id (0xffff44050000)
+# but NOT the rev-0001 variants. So on this kernel stock Mesa is expected to
+# work. If the id here ever moves to 0x44050001, turnip stops matching the GPU
+# and packages/README.md ("Mesa: probably stock, decided by one chip-id") is the
+# two-line fix.
+0049-drm-msm-a8xx-add-adreno-830-catalog.patch
+0050-clk-qcom-gxclkctl-kaanapali-fix-gx-gdsc-collapse.patch
+0120-20250728_konradybcio_gpu_cc_power_requirements_reality_check.patch
+0121-pmdomain-qcom-rpmhpd-presync-floor-gmu-rails.patch
+
+# ============== Display / DRM ==============
+0010-msm-resource-cleanup.patch
+0048-drm-msm-dsi-reparent-byte-pixel-src-to-xo-on-disable.patch
+
+# The Odin 3 panel is compatible = "chipone,icna3520" (see dts/), so 0028 is
+# load-bearing: without it there is no display.
+#
+# 0028's Kconfig hunk needs both of its alphabetical neighbours present:
+#   DRM_PANEL_BOE_XM91080G          above  -> NOT in 7.2-rc7, so 0056 is required
+#   DRM_PANEL_CHIPWEALTH_CH13726A   below  -> already upstream in 7.2-rc7
+# So 0056 stays purely as context (an unused tristate driver, ~nothing), and
+# Armada's 0057 is dropped — see below.
+0056_Xm-Plus-XM91080G-panel.patch
+0028-drm-panel-Add-panel-driver-for-Chipone-ICNA35XX-base.patch
+
+# DROPPED: 0057_DDIC-CH13726A-panel.patch
+# Landed upstream. 7.2-rc7 ships drivers/gpu/drm/panel/panel-chipwealth-ch13726a.c;
+# Armada still carries the older pre-upstream version as panel-ddic-ch13726a.c,
+# which would install a duplicate driver for the same panel. Not our device
+# anyway — we only ever wanted it as Kconfig context, and upstream provides that.
+
+0505-msm_gem-lock-before-put_iova_spaces.patch
+
+# ============== Storage ==============
+0066-scsi-ufs-ufs-qcom-add-sm8750-compatible.patch
+0510-soc-qcom-ice-unwind-clocks-on-resume-failure.patch
+0511-scsi-ufs-qcom-reenable-irq-on-host-reset-failure.patch
+
+# ============== WiFi / BT — WCN7860 ==============
+0039-wifi-ath12k-add-initial-hardware-definition-for-WCN7.patch
+0040-wifi-ath12k-send-QDSS-config-when-CNSS_QDSS_CFG_MISS.patch
+0041-wifi-ath12k-disable-CNSS_QDSS_CFG_MISS_V01-for-the-W.patch
+0042-PCI-pwrctrl-pwrseq-add-support-for-WCN7860.patch
+0043-power-sequencing-qcom-wcn-add-support-for-WCN7860.patch
+0044-clk-qcom-gcc-sm8750-Do-not-turn-off-PCIe-GDSCs-durin.patch
+0045-Bluetooth-qca-add-WCN7860-support.patch
+
+# ============== LEDs ==============
+# The Odin 3 DTS declares compatible = "heroic,htr3212" for its RGB controller.
+# Without this the node never probes and there is no RGB at all -- it was simply
+# missing from this series, not deliberately dropped.
+0030-leds-Add-driver-for-HEROIC-HTR3212.patch
+
+# ============== Input — gamepad + haptics ==============
+0031_input--Add-driver-for-RSInput-Gamepad.patch
+0508-input-rsinput-add-pm-resume-to-reinit-mcu-after-suspend.patch
+1002-input-rsinput-sm8750-ff.patch
+1300-input-rsinput-axis-deadzone.patch
+1000-input-misc-qcom-hv-haptics-sm8750.patch
+1001-haptics-driver-support-periodic-sine-and-fixes.patch
+1003-input-haptics-fix-rumble-bridge-atomic-sleep.patch
+1004-input-haptics-stop-zero-amplitude-immediately.patch
+0504-Enable-64-bit-processes-to-use-compat-input-syscalls.patch
+
+# DROPPED: 0013-add-force-feedback.patch
+# Adds rumble to the RETROID RP5 gamepad — it patches drivers/input/joystick/
+# retroid.c and drivers/input/misc/qcom-spmi-haptics.c, neither of which exists
+# unless you also carry the SM8250 patches 0008-retroid-gamepad and
+# 0009-qcom-spmi-haptics. The Odin 3 uses the RSInput gamepad (0031) and
+# qcom-hv-haptics (1000) instead, so this is dead weight for a different device.
+
+# ============== Audio ==============
+0032-ASoC-codecs-aw88166-AYN-Products-Specific-modificati.patch
+0612-ROCKNIX-odin3-q6apm-start-mi2s-port-at-prepare.patch
+0613-ASoC-q6apm-scope-prepare-start-to-MI2S.patch
+0063-ASoC-wcd939x-route-usbss-on-integrated-jack-insert.patch
+0064-ASoC-wcd-mbhc-clear-stale-jack-report-on-mechanical-removal.patch
+0603-ASoC-codecs-wcd939x-keep-the-codec-resumed-while-a-ja.patch
+
+# ============== Power / suspend / USB ==============
+0204-thermal-qcom-tsens-mask-lower-threshold-irqs-across-suspend.patch
+0504-mailbox-qcom-ipcc-mask-summary-irq-for-suspend-to-ram.patch
+0509-soc-qcom-pmic_glink_altmode-defer-until-mux-switch-ready.patch
+0517-usb-typec-mux-dont-swallow-EPROBE_DEFER.patch
+0519-usb-typec-ucsi-clear-USB-role.patch
+0900-power-supply-qcom-battmgr-log-usb-adapter-type.patch
+
+# ============== ROCKNIX platform quirks ==============
+# 0500/0501/0503 are ROCKNIX-image-specific (fan curve, MAC handling, battery
+# naming). Evaluate individually — some assume ROCKNIX's userland.
+# 0500-ROCKNIX-set-boot-fanspeed.patch
+# 0501-ROCKNIX-fix-wifi-and-bt-mac.patch
+# 0503-ROCKNIX-battery-name.patch
+
+# 0071 is a HACK per its own filename. Enable only if you hit the USB boot hang.
+# 0071-HACK-fix-usb-boot-hang.patch

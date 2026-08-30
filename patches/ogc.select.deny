@@ -1,0 +1,8 @@
+# Patches the contiguity guard would otherwise flag, which we have looked at and
+# decided against. One regex per line, same matching rules as ogc.select.
+#
+# This file exists so that "we reviewed it and said no" is distinguishable from
+# "nobody has looked at it yet". The guard fails on the latter, not the former.
+#
+# Empty at v7.2.1-ogc3: nothing sits inside the selected numeric span that we
+# do not take.

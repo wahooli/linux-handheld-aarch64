@@ -1,0 +1,45 @@
+# Which of OpenGamingCollective's ~153 patches we take, as extended regexes
+# matched against the patch name with its leading number stripped.
+#
+# WHY NOT NUMERIC RANGES. The arch-arm64 package used OGC_RANGES="0006 0028-0060".
+# That is safe only within one mainline base: when OGC rebases onto a new kernel,
+# patches that landed upstream are dropped and everything after them renumbers,
+# so a fixed range silently selects a different, wrong set. Names are stable
+# across a rebase because they are derived from the commit subject.
+#
+# Verified at v7.2.1-ogc3: these three lines select exactly the 34 patches that
+# "0006 0028-0060" selected -- 32 sched-*, one stop_machine, one usbhid.
+#
+# See also patches/ogc.select.deny and the contiguity guard in fetch-patches.sh,
+# which fails the build if an unselected patch appears *inside* the numeric span
+# of what we did select. That guard is the real protection: a regex cannot know
+# that a new mm/ patch was inserted as a dependency of the scheduler series.
+
+# The scheduler block, in full: Zijlstra's EEVDF single-runqueue rework plus the
+# load-balancer and topology series that follows it.
+#
+# Taken whole, deliberately. It is contiguous, it is what OGC tests as a unit,
+# and its internal Fixes: edges make subsets actively wrong:
+#
+#   "sched/fair: Fix flat hierarchy"      Fixes: "sched/eevdf: Move to a single
+#                                         runqueue" -- so the tempting cut before
+#                                         the load-balancer work ships the rework
+#                                         without its fix.
+#   "sched/eevdf: Delayed dequeue ..."    Fixes: "sched/eevdf: Cancel slice
+#                                         protection if short..."
+#
+# Patches that read as x86-only are NOT dropped. The SMT ones compile in because
+# CONFIG_SCHED_SMT=y in our config; they are simply no-ops on a topology that
+# reports no SMT siblings. Carrying them costs a few unreachable branches;
+# cutting them costs a rebase decision on every -ogcN bump. Conversely the
+# asymmetric-capacity and misfit work matters *more* on SM8750 big.LITTLE than
+# on OGC's own x86 targets.
+^FROM-ML-sched-
+^FROM-ML-stop_machine-
+
+# HID: usbhid: skip interrupt IN polling for devices with no input reports.
+# Generic despite the ASUS ROG framing -- there is no VID/PID match in it. Any
+# composite device with an input-less interface drops reports on its sibling
+# interface once something opens the hidraw node, and Steam Input opens every
+# hidraw node it finds.
+^FROM-ML-HID-usbhid-skip-interrupt-IN-polling

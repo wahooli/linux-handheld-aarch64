@@ -1,0 +1,68 @@
+name: poll upstreams
+
+# Watches the three sources and, when any moved, commits the new refs to
+# sources.env and kicks off a build.
+#
+# Why a poller at all: GitHub Actions cannot receive events from a repository
+# you do not own, so there is no way to be *notified* of an OGC release. Polling
+# is the only mechanism available.
+#
+# Why it commits rather than passing refs to the build: sources.env in git
+# history is then the complete record of what was built when, and a bad bump is
+# a `git revert` rather than an archaeology exercise across workflow logs.
+on:
+  schedule:
+    # Every 6 hours, off the hour -- scheduled workflows on the hour queue behind
+    # everyone else's cron and can be delayed by 20+ minutes.
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write     # to dispatch build.yml
+
+concurrency:
+  group: poll
+  cancel-in-progress: true
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check upstreams
+        id: poll
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/poll-sources.sh
+
+      - name: Commit new refs
+        if: steps.poll.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sources.env
+          git commit -m "chore(sources): ${{ steps.poll.outputs.summary }}"
+          git push
+
+      # A push made with GITHUB_TOKEN does not trigger other workflows, so the
+      # build has to be dispatched explicitly. This is a documented GitHub
+      # behaviour and not something a path filter can work around.
+      - name: Trigger build
+        if: steps.poll.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml --ref "${{ github.ref_name }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.poll.outputs.changed }}" = "true" ]; then
+            echo "Bumped: ${{ steps.poll.outputs.summary }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Build dispatched." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No upstream movement." >> "$GITHUB_STEP_SUMMARY"
+          fi

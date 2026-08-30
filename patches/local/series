@@ -1,0 +1,26 @@
+# Patches authored in this repo, applied LAST -- after the device stack and
+# after the OGC block.
+#
+# This is the one place where .patch files are committed rather than fetched,
+# because a patch written here has no upstream to be fetched from. Everything
+# else in patches/ is gitignored.
+#
+# Rules of the road:
+#
+#   - Applied last on purpose. A local patch almost always adjusts something an
+#     upstream patch already put in the tree, so it has to sit on top. If one
+#     genuinely must land earlier, that is a signal it belongs in the device
+#     series instead -- or that it should be sent to armada.
+#
+#   - Every entry needs a matching note in the "Local divergence" section of
+#     docs/PATCHES.md saying why it is not upstreamable and what would let us
+#     drop it. Without that note this directory quietly becomes a vendor fork
+#     over a few kernel bumps, which is exactly what the rest of this repo is
+#     built to avoid.
+#
+#   - These break first on a mainline bump, because nobody upstream is rebasing
+#     them for you. The build reports local failures separately from upstream
+#     ones for that reason.
+#
+# Empty today: the arch-arm64 stack this repo replaces had zero local
+# divergence, verified byte-for-byte against armada.
