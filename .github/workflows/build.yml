@@ -108,7 +108,7 @@ jobs:
           fi
 
       - name: Save builder image
-        if: ${{ !cancelled() }} && steps.imgcache.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() && steps.imgcache.outputs.cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@v6
         with:
@@ -166,7 +166,7 @@ jobs:
         run: ./scripts/fetch-patches.sh
 
       - name: Save kernel tarball
-        if: ${{ !cancelled() }} && steps.tarcache.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() && steps.tarcache.outputs.cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@v6
         with:

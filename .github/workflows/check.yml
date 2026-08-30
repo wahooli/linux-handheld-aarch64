@@ -51,19 +51,16 @@ jobs:
             -e SC1090,SC1091,SC2086,SC2016,SC2181,SC2012,SC2154 scripts/*.sh
           echo "shellcheck v0.11.0: clean" 
 
-      - name: Workflow YAML
+      # Both the YAML validity check and the mixed-conditional check live in
+      # scripts/lint-workflows.py. They cannot be inline: GitHub scans the whole
+      # workflow file for expression sequences, including inside run: blocks, so
+      # a linter that searches for those sequences makes the workflow invalid
+      # just by containing them.
+      - name: Workflows
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import yaml, glob, sys
-          for f in sorted(glob.glob('.github/workflows/*.yml')):
-              try:
-                  yaml.safe_load(open(f))
-                  print(f"ok   {f}")
-              except Exception as e:
-                  print(f"::error file={f}::{e}")
-                  sys.exit(1)
-          PY
+          python3 -m pip install --quiet pyyaml 2>/dev/null || true
+          python3 scripts/lint-workflows.py
 
       - name: PKGBUILD parses
         run: |
