@@ -79,6 +79,23 @@ export RCLONE_CONFIG_R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.
 export RCLONE_CONFIG_R2_ACL=private
 # R2 does not implement multipart ETags the way rclone's default checksum
 # handling expects; without this, every upload is followed by a failed verify.
+# no-check-bucket, set BOTH ways on purpose.
+#
+# Without it rclone issues `PUT /<bucket>` -- a CreateBucket call -- before every
+# upload, and R2 does not implement CreateBucket:
+#     ERROR : <file>: Failed to copy: NotImplemented: Not Implemented
+#     status code: 501
+# Each file is a separate rclone process, so the bucket check is not cached
+# between them: every object failed once and succeeded on the retry. Verified
+# against a fake S3 that logs requests -- unset, rclone sends the bucket-level
+# PUT; set, it goes straight to PUT /<bucket>/<key>?x-id=PutObject.
+#
+# The backend-wide RCLONE_S3_* form alone did not take on the rclone 1.60.1 that
+# Ubuntu 24.04 ships, when the remote is defined entirely by RCLONE_CONFIG_R2_*
+# env vars rather than a config file. The remote-scoped form binds to this
+# specific remote and is the one that matters; the other is kept because it costs
+# nothing and covers any rclone that prefers it.
+export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
 export RCLONE_S3_NO_CHECK_BUCKET=true
 export RCLONE_S3_UPLOAD_CUTOFF=5G
 # Fail fast on an unreachable or misconfigured endpoint. rclone's defaults retry
@@ -250,28 +267,52 @@ rclone_ copyto "${WORK}/${REPO_NAME}.gpg" "R2:${R2_BUCKET}/${REPO_NAME}.gpg" \
 # The retained packages exist purely as direct-URL rollback targets. That is why
 # pruning must not touch the current build, and why RETAIN below 2 would leave
 # nothing to roll back to.
-# Sort pacman versions oldest-first. vercmp is the only authority on pacman's
-# ordering rules and `sort -V` is not a substitute -- it places 7.2.ogc9 AFTER
-# 7.2.1.ogc10, while pacman considers 7.2.ogc9 the older of the two. Pruning
-# with sort -V would therefore delete the newest package and keep the oldest the
-# first time OGC moves to a new mainline base. (pacsort would do this in one
-# call, but pacman 7.x no longer ships it.)
+# Sort pacman versions oldest-first.
+vercmp_sort() {
+    local -a a=(); mapfile -t a
+    [ ${#a[@]} -gt 0 ] || return 0
+
+    # Run the whole sort inside the builder container when it is available, for
+    # the same reason repo-add does: its pacman is the one that built these
+    # packages. Version-comparison semantics between pacman 6.0.2 (what Ubuntu
+    # ships) and 7.1.0 are exactly the sort of thing that differs quietly, and
+    # this decides what gets DELETED.
+    #
+    # One container invocation for the entire sort, not one per comparison --
+    # the insertion sort below is O(n^2) and a docker call per comparison would
+    # turn a millisecond into a minute.
+    if [ -n "${REPO_ADD_IN_CONTAINER}" ]; then
+        printf '%s\n' "${a[@]}" | docker run --rm -i "${IMAGE}" bash -c "$(_vercmp_sort_body)"
+    else
+        printf '%s\n' "${a[@]}" | bash -c "$(_vercmp_sort_body)"
+    fi
+}
+
+# The sort itself, as a string so it can run here or in the container unchanged.
+#
+# vercmp is the authority on pacman's ordering and `sort -V` is not a substitute:
+# it places 7.2.ogc9 AFTER 7.2.1.ogc10, while pacman considers 7.2.ogc9 the older
+# of the two. Pruning with sort -V would delete the newest package and keep the
+# oldest the first time OGC moved to a new mainline base. (pacsort would do this
+# in one call, but pacman 7.x no longer ships it.)
 #
 # Insertion sort: n is a handful of versions, so O(n^2) with a subprocess per
 # comparison is still instant, and it is obviously correct at a glance.
-vercmp_sort() {
-    local -a a=(); local x i j
-    mapfile -t a
-    [ ${#a[@]} -gt 0 ] || return 0
-    for ((i = 1; i < ${#a[@]}; i++)); do
-        x="${a[i]}"
-        for ((j = i - 1; j >= 0; j--)); do
-            [ "$(vercmp "${a[j]}" "${x}")" -gt 0 ] || break
-            a[j+1]="${a[j]}"
-        done
-        a[j+1]="${x}"
+_vercmp_sort_body() {
+cat <<'BODY'
+set -euo pipefail
+mapfile -t a
+[ ${#a[@]} -gt 0 ] || exit 0
+for ((i = 1; i < ${#a[@]}; i++)); do
+    x="${a[i]}"
+    for ((j = i - 1; j >= 0; j--)); do
+        [ "$(vercmp "${a[j]}" "${x}")" -gt 0 ] || break
+        a[j+1]="${a[j]}"
     done
-    printf '%s\n' "${a[@]}"
+    a[j+1]="${x}"
+done
+printf '%s\n' "${a[@]}"
+BODY
 }
 
 echo "==> pruning to the newest ${RETAIN} version(s) per package"

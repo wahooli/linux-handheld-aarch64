@@ -104,9 +104,34 @@ jobs:
           # pacman-package-manager gives us repo-add and vercmp on the runner, so
           # the database is assembled outside the build container and the signing
           # key never enters it.
-          sudo apt-get install -y -qq rclone pacman-package-manager libarchive-tools jq
-          repo-add --version | head -1
-          vercmp 1.0 1.1 >/dev/null && echo "vercmp ok"
+          # No pacman on the runner any more. Both tools that needed it --
+          # repo-add and vercmp -- now run inside the builder container, whose
+          # pacman is the one that built these packages. Ubuntu ships 6.0.2
+          # against Arch's 7.1.0, and that gap already cost one failed publish:
+          # 6.0.2 does not know --include-sigs and treated the unknown option as
+          # the database filename. vercmp is the same risk with worse
+          # consequences, since it decides what gets deleted.
+          #
+          # bsdtar (libarchive-tools) is for fetch-patches.sh unpacking
+          # series.zip; it falls back to unzip, which rclone needs anyway.
+          sudo apt-get install -y -qq libarchive-tools unzip
+
+          # rclone from upstream, pinned, NOT from apt. Ubuntu 24.04 ships
+          # 1.60.1 -- an October 2022 build, four years behind, from before much
+          # of the R2 compatibility work. The CreateBucket 501 is handled by
+          # no-check-bucket in publish-r2.sh either way, but there is no reason
+          # to talk to R2 through a client that old.
+          #
+          # Checksum-verified rather than piped from install.sh: this runs with
+          # the repo signing key and R2 credentials in the environment.
+          RCLONE_VER=v1.75.0
+          RCLONE_SHA=d0ad88ba4c8e285b7c9efa591e0ab643280a91741e13c27f3a9c0957ccfa5203
+          curl -fsSL --retry 3 -o /tmp/rclone.zip \
+            "https://github.com/rclone/rclone/releases/download/${RCLONE_VER}/rclone-${RCLONE_VER}-linux-arm64.zip"
+          echo "${RCLONE_SHA}  /tmp/rclone.zip" | sha256sum -c -
+          unzip -q -j /tmp/rclone.zip "*/rclone" -d /tmp
+          sudo install -m755 /tmp/rclone /usr/local/bin/rclone
+          rclone version | head -1
 
       # The kernel tarball is 150 MB and identical across every build of one
       # base; caching it turns a base bump into the only run that downloads it.
