@@ -29,7 +29,7 @@ jobs:
   poll:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check upstreams
         id: poll
@@ -57,7 +57,7 @@ jobs:
         run: gh workflow run build.yml --ref "${{ github.ref_name }}"
 
       - name: Summary
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           if [ "${{ steps.poll.outputs.changed }}" = "true" ]; then
             echo "Bumped: ${{ steps.poll.outputs.summary }}" >> "$GITHUB_STEP_SUMMARY"

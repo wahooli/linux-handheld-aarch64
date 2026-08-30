@@ -282,7 +282,7 @@ if [ -d "${OGC_SRC:-}" ]; then
             for entry in "${ogc_unselected[@]}"; do
                 num="$(cut -d' ' -f1 <<< "${entry}")"; num=$((10#${num}))
                 name="${entry#* }"
-                [ ${num} -gt ${a} ] && [ ${num} -lt ${b} ] || continue
+                if [ "${num}" -le "${a}" ] || [ "${num}" -ge "${b}" ]; then continue; fi
                 if [ ${#OGC_DENY_RE[@]} -gt 0 ] && matches_any "${name}" "${OGC_DENY_RE[@]}"; then
                     note "OGC $(printf '%04d' ${num}) sits inside a selected block but is listed in ogc.select.deny: ${name}"
                     continue

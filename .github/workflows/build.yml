@@ -36,8 +36,26 @@ on:
       - 'patches/ogc.select.deny'
       - 'patches/ogc.keyfpr'
       - 'patches/local/**'
-      - 'scripts/**'
-      - '.github/workflows/build.yml'
+      # Only the scripts that change WHAT gets built. `scripts/**` was too broad:
+      # editing publish-r2.sh to fix an upload bug rebuilt a byte-identical
+      # kernel for fifty minutes before republishing it.
+      #
+      #   fetch-patches.sh       picks the base version and the patch stack
+      #   build*.sh, makepkg-*   how it is compiled and packaged
+      #   next-pkgrel.sh         sets pkgrel, which is baked into the package
+      #
+      # Deliberately absent: publish-r2.sh, tag-release.sh, report-failure.sh,
+      # verify-repo.sh, setup-signing-key.sh, poll-sources.sh. Those act on a
+      # package that already exists, or never run here at all.
+      - 'scripts/fetch-patches.sh'
+      - 'scripts/build.sh'
+      - 'scripts/build-in-container.sh'
+      - 'scripts/makepkg-and-report.sh'
+      - 'scripts/next-pkgrel.sh'
+      # NOT '.github/workflows/build.yml'. Editing this file changes how the
+      # build is orchestrated, not what comes out of it, and most edits here are
+      # to the publish half. check.yml validates every push cheaply; use
+      # `gh workflow run build.yml` when a change genuinely needs a real build.
 
 permissions:
   contents: write   # push tags, create releases
@@ -58,7 +76,7 @@ jobs:
     timeout-minutes: 180
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Weekly rotation of the builder image so its toolchain does not drift a
       # year behind the target, without rebuilding a rootfs on every run.
@@ -73,7 +91,7 @@ jobs:
       # far the likeliest step to fail, which makes that exactly backwards.
       - name: Restore builder image
         id: imgcache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cache/builder-image.tar
           key: builder-${{ hashFiles('Dockerfile') }}-${{ steps.keys.outputs.week }}
@@ -90,9 +108,9 @@ jobs:
           fi
 
       - name: Save builder image
-        if: always() && steps.imgcache.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() }} && steps.imgcache.outputs.cache-hit != 'true'
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ~/.cache/builder-image.tar
           key: builder-${{ hashFiles('Dockerfile') }}-${{ steps.keys.outputs.week }}
@@ -101,10 +119,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          # pacman-package-manager gives us repo-add and vercmp on the runner, so
-          # the database is assembled outside the build container and the signing
-          # key never enters it.
-          # No pacman on the runner any more. Both tools that needed it --
+          # No pacman on the runner. Both tools that needed it --
           # repo-add and vercmp -- now run inside the builder container, whose
           # pacman is the one that built these packages. Ubuntu ships 6.0.2
           # against Arch's 7.1.0, and that gap already cost one failed publish:
@@ -137,7 +152,7 @@ jobs:
       # base; caching it turns a base bump into the only run that downloads it.
       - name: Restore kernel tarball
         id: tarcache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .cache
           key: tarball-${{ hashFiles('sources.env') }}
@@ -151,9 +166,9 @@ jobs:
         run: ./scripts/fetch-patches.sh
 
       - name: Save kernel tarball
-        if: always() && steps.tarcache.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() }} && steps.tarcache.outputs.cache-hit != 'true'
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .cache
           key: tarball-${{ hashFiles('sources.env') }}
@@ -171,7 +186,7 @@ jobs:
       # cache full of objects for a different kernel; restore-keys still lets an
       # armada-only rebuild reuse almost everything.
       - name: Restore ccache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .ccache
           key: ccache-${{ steps.ver.outputs.pkgver }}-${{ github.sha }}
@@ -194,16 +209,23 @@ jobs:
 
       # Immediately after the build and before anything that can fail, because
       # this is the hour of work worth protecting.
+      # !cancelled(), not always(). The point is still to save on FAILURE -- a
+      # failed publish must not discard an hour of compilation -- but saving on
+      # CANCELLATION is actively harmful here: restore-keys resolves to the most
+      # recently created matching entry, so a build cancelled two minutes in
+      # would store a near-empty ccache that then shadows the complete one from
+      # the last successful build. It also makes a cancel wait for a 2 GB upload,
+      # which GitHub warns about for always().
       - name: Save ccache
-        if: always()
+        if: ${{ !cancelled() }}
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .ccache
           key: ccache-${{ steps.ver.outputs.pkgver }}-${{ github.sha }}
 
       - name: Job summary
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           [ -f .fetch-report.md ]  && cat .fetch-report.md  >> "$GITHUB_STEP_SUMMARY" || true
@@ -221,8 +243,8 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
         with:
           name: packages-${{ steps.ver.outputs.pkgver }}-${{ steps.ver.outputs.pkgrel }}
           path: |

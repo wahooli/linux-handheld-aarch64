@@ -32,10 +32,10 @@ FETCH="${FETCH:-}"
 if [ -n "${FETCH}" ]; then
     ./scripts/fetch-patches.sh
 fi
-[ -f version.env ] && [ -f patches/series.generated ] || {
+if [ ! -f version.env ] || [ ! -f patches/series.generated ]; then
     echo "!! no version.env / patches/series.generated -- run scripts/fetch-patches.sh" >&2
     exit 1
-}
+fi
 
 # shellcheck source=/dev/null
 source ./version.env
