@@ -35,6 +35,15 @@ fi
 # /ccache and /work/out are created by the host and by earlier runs; makepkg
 # aborts on either being unwritable, and the message names only one of them at a
 # time. Fix both up front rather than discovering them one build at a time.
+# Sync the package database before makepkg --syncdeps goes looking for
+# makedepends. The builder image is cached and rebuilt weekly, so by the end of
+# that week its database names versions the mirror has already replaced:
+#     error: failed retrieving file 'simdjson-1:4.6.8-1-aarch64.pkg.tar.xz' ...
+#     The requested URL returned error: 404
+# -Syu rather than -Sy: a partial sync installs new packages against old
+# dependencies, which is the classic way to break an Arch system quietly.
+pacman -Syu --noconfirm >/dev/null 2>&1 || pacman -Syu --noconfirm
+
 chown build:build /ccache 2>/dev/null || true
 # Split, and that is a fix rather than tidying: as `mkdir && chown || true` the
 # `|| true` swallowed a FAILED MKDIR too, so an unwritable /work would sail past

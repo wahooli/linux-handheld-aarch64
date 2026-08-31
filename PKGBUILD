@@ -1,4 +1,4 @@
-# Maintainer: Waltteri Hooli <wahooli@pm.me>
+# Maintainer: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 #
 # Mainline Linux + a handheld patch stack, packaged for Arch Linux ARM.
 #

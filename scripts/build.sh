@@ -60,7 +60,7 @@ echo "==> makepkg in ${IMAGE}"
     --user root \
     -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
     -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-8G}" \
-    -e PACKAGER="${PACKAGER:-Waltteri Hooli <wahooli@pm.me>}" \
+    -e PACKAGER="${PACKAGER:-Waltteri Hooli <1420194+wahooli@users.noreply.github.com>}" \
     -e SRCNAME="${_srcname}" \
     -w /work \
     "${IMAGE}" \
