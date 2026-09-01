@@ -89,6 +89,7 @@ jobs:
           _initramfs=/boot/initramfs-linux-check-aarch64.img
           _initramfsfallback=/boot/initramfs-linux-check-aarch64-fallback.img
           _dtbdest=/boot/dtb/qcom
+          _installvmlinuz=no
           _useogc=no
           _cachysched=
           _fuzzallow=""

@@ -273,10 +273,21 @@ _package() {
     pkgdesc="${_pkgdesc} -- ${_srcname}"
     # NOT depends=('initramfs'). Arch's own linux package requires it, but the
     # Odin 3 builds its storage stack in and never installs mkinitcpio; forcing
-    # it would drag a generator onto a device that has nothing to generate. The
-    # preset below is written regardless, so a profile that DOES want an
-    # initramfs (qemu-virt, where virtio-blk may be modular) gets one by
-    # installing mkinitcpio and nothing else.
+    # it would drag a generator onto a device that has nothing to generate.
+    #
+    # The preset below is written regardless -- but writing it is NOT enough to
+    # get an initramfs built automatically. mkinitcpio's install hook triggers on
+    # `usr/lib/modules/*/vmlinuz` (see 90-mkinitcpio-install.hook), not on
+    # `pkgbase`, so a package that keeps its image only in /boot never fires it.
+    # ALARM's own linux-aarch64 does the same and its hook has never fired
+    # either. Two ways out, and INSTALL_VMLINUZ picks:
+    #
+    #   no  (default)  run it by hand: `mkinitcpio -p <pkgbase>`. The preset is
+    #                  what makes that one argument enough.
+    #   yes            also install the image as usr/lib/modules/<kver>/vmlinuz,
+    #                  the way Arch's linux package does, and the hook fires on
+    #                  every install. Costs a second copy of the image -- 53 MiB
+    #                  uncompressed for el2, roughly +30 MiB per package.
     depends=('coreutils' 'kmod')
     optdepends=('linux-firmware: firmware for most devices'
                 'mkinitcpio: to generate an initramfs from the shipped preset'
@@ -311,6 +322,12 @@ _package() {
     # gzips it itself and appends the DTBs; a product booting through UEFI or a
     # different loader sets KERNEL_IMAGE/KERNEL_IMAGE_DEST instead.
     install -Dm644 "arch/arm64/boot/${_kernelimage}" "${pkgdir}${_kernelimagedest}"
+
+    # The hook's trigger path, when this product asked for it.
+    if [ "${_installvmlinuz}" = yes ]; then
+        install -Dm644 "arch/arm64/boot/${_kernelimage}" \
+            "${pkgdir}/usr/lib/modules/${kver}/vmlinuz"
+    fi
 
     # DTB comes from the product conf, not from version.env: version.env records
     # what was resolved, the conf is where the list is edited, and this is the

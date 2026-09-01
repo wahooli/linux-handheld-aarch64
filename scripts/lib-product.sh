@@ -58,7 +58,7 @@ lp_load() {
     REPLACE_STOCK_KERNEL=; CACHY_SCHED=
     USE_OGC=; USE_ARMADA=; USE_ROCKNIX=; TAG_PREFIX=
     KERNEL_IMAGE=; KERNEL_IMAGE_DEST=; INITRAMFS_IMAGE=; INITRAMFS_FALLBACK=
-    DTB_DEST=
+    DTB_DEST=; INSTALL_VMLINUZ=
     # Board device trees and the staged set. Arrays, so they are reset rather
     # than blanked -- a leftover DTS from an earlier lp_load in the same shell
     # would be copied into the tree and registered in the qcom Makefile.
@@ -195,6 +195,14 @@ lp_load() {
     done
     [ "${INITRAMFS_IMAGE}" != "${INITRAMFS_FALLBACK}" ] \
         || { echo "!! ${conf}: INITRAMFS_IMAGE and INITRAMFS_FALLBACK are the same path" >&2; return 1; }
+
+    # Whether to ALSO install the image as usr/lib/modules/<kver>/vmlinuz, which
+    # is what makes mkinitcpio's pacman hook fire. See products/handheld.conf.
+    INSTALL_VMLINUZ="${INSTALL_VMLINUZ:-no}"
+    case "${INSTALL_VMLINUZ}" in
+        yes|no) ;;
+        *) echo "!! ${conf}: INSTALL_VMLINUZ must be yes or no" >&2; return 1 ;;
+    esac
 
     export PRODUCT
     return 0

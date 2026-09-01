@@ -630,6 +630,7 @@ _kernelimagedest=${KERNEL_IMAGE_DEST}
 _initramfs=${INITRAMFS_IMAGE}
 _initramfsfallback=${INITRAMFS_FALLBACK}
 _dtbdest=${DTB_DEST}
+_installvmlinuz=${INSTALL_VMLINUZ}
 _useogc=${USE_OGC}
 _ogcref=${OGC_REF}
 _armadaref=${ARMADA_REF}
