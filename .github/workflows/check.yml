@@ -69,38 +69,100 @@ jobs:
           # it at parse time, so a stand-in is needed to check the syntax without
           # resolving the whole stack. The values are irrelevant here.
           cat > version.env <<'EOF'
+          _product=handheld
+          _pkgbase=linux-check-aarch64
+          _pkgdesc="stand-in"
+          _kernelsource=cachyos
+          _kernelref=cachyos-0.0.0-0
           _base=0.0.0
-          _ogcrev=0
-          _srcname=linux-0.0.0
-          _srcurl=https://example.invalid/linux-0.0.0.tar.xz
+          _srcname=cachyos-0.0.0-0
+          _srcurl=https://example.invalid/cachyos-0.0.0-0.tar.gz
           _srcsha256=0000000000000000000000000000000000000000000000000000000000000000
-          pkgver=0.0.0.ogc0
+          pkgver=0.0.0.cachy0
           pkgrel=1
+          _configbase=defconfig
+          _configdirs="common handheld"
+          _replacestock=yes
+          _dtbs="stand-in.dtb"
+          _kernelimage=Image
+          _kernelimagedest=/boot/Image
+          _initramfs=/boot/initramfs-linux-check-aarch64.img
+          _initramfsfallback=/boot/initramfs-linux-check-aarch64-fallback.img
+          _dtbdest=/boot/dtb/qcom
+          _useogc=no
+          _cachysched=
+          _fuzzallow=""
           _ogcref=v0.0.0-ogc0
           _armadaref=0000000000000000000000000000000000000000
           _rocknixref=00000000
-          _devices="odin3"
           EOF
           bash -n PKGBUILD
           bash -n keyring/PKGBUILD 2>/dev/null || true
-          echo "PKGBUILDs parse"
+
+          # The split-package glue builds package_<pkgname>() with eval at parse
+          # time, so "parses" is not enough -- a broken suffix expansion would
+          # leave makepkg with no package function and fail only at the very end
+          # of a build. Source it and check the functions actually exist.
+          ( set -e
+            # shellcheck disable=SC1091
+            . ./PKGBUILD >/dev/null 2>&1 || . ./PKGBUILD
+            for want in "${pkgname[@]}"; do
+              declare -F "package_${want}" >/dev/null \
+                || { echo "::error file=PKGBUILD::no package_${want}() after the eval glue"; exit 1; }
+            done
+            echo "PKGBUILDs parse; ${#pkgname[@]} package function(s) defined" )
 
       - name: Manifests are readable
         run: |
           set -euo pipefail
           # Cheap guards against the kind of edit that only fails an hour later,
           # inside the build, on a runner.
-          # Mainline stable only. '-lts' bases have no tarball on cdn.kernel.org
-          # and '-rc' bases sort after the release they precede, so both fail an
-          # hour later inside the build rather than here.
+          . ./sources.env
+
+          # Mainline stable only, for both kernel sources. An '-lts' base has no
+          # tarball on cdn.kernel.org and an '-rc' base sorts AFTER the release
+          # it precedes, so either one fails an hour later inside the build
+          # rather than here.
+          grep -qE '^CACHYOS_REF=cachyos-[0-9]+\.[0-9]+(\.[0-9]+)?-[0-9]+$' sources.env \
+            || { echo "::error file=sources.env::CACHYOS_REF is not a stable cachyos-X.Y[.Z]-<N> tag"; exit 1; }
           grep -qE '^OGC_REF=v[0-9]+\.[0-9]+(\.[0-9]+)?-ogc[0-9]+$' sources.env \
             || { echo "::error file=sources.env::OGC_REF is not a mainline-stable vX.Y[.Z]-ogc<N> tag"; exit 1; }
-          for d in $(grep -oE '^DEVICES="[^"]*"' sources.env | cut -d'"' -f2); do
-            [ -f "devices/${d}.conf" ] || { echo "::error::DEVICES lists ${d} but devices/${d}.conf is missing"; exit 1; }
-            # shellcheck disable=SC1090
-            ( SERIES=; . "devices/${d}.conf"; [ -f "${SERIES}" ] ) \
-              || { echo "::error::devices/${d}.conf points at a SERIES file that does not exist"; exit 1; }
-          done
           grep -qE '^[0-9a-fA-F]{40}$' patches/ogc.keyfpr \
             || { echo "::error file=patches/ogc.keyfpr::not a 40-character fingerprint"; exit 1; }
-          echo "sources.env, device configs and the pinned OGC key all look sane"
+
+          # Every product resolves: lp_load does the real validation (pkgbase,
+          # kernel source, config dirs, series file), and lp_config_fragments
+          # proves the merge order can be computed -- it is the only thing that
+          # catches the same fragment basename existing in two CONFIG_DIRS, which
+          # would otherwise silently drop one of them.
+          [ -n "${PRODUCTS}" ] || { echo "::error file=sources.env::PRODUCTS is empty"; exit 1; }
+          prefixes=""
+          for prod in ${PRODUCTS}; do
+            out="$(PRODUCT="${prod}" bash -c '. scripts/lib-product.sh
+                     lp_load "$PWD" >/dev/null || exit 1
+                     lp_config_fragments >/dev/null || exit 1
+                     if [ "${SERIES}" != armada ]; then
+                       grep -qvE "^[[:space:]]*(#|$)" "${SERIES}" \
+                         || { echo "${SERIES} names no patches" >&2; exit 1; }
+                       # A duplicate entry only fails at fetch time otherwise,
+                       # which is a container pull and a tarball away.
+                       dup="$(grep -vE "^[[:space:]]*(#|$)" "${SERIES}" | sort | uniq -d)"
+                       [ -z "${dup}" ] \
+                         || { echo "${SERIES} lists these twice: ${dup}" >&2; exit 1; }
+                     fi
+                     echo "${TAG_PREFIX}"' 2>&1)" \
+              || { echo "::error::product ${prod}: ${out}"; exit 1; }
+            tag_prefix="$(tail -1 <<<"${out}")"
+
+            # Distinct tag prefixes: two products on the same base produce the
+            # same pkgver, so a shared prefix collides on the tag name --
+            # tag-release.sh refuses to move one, and next-pkgrel.sh would read
+            # the other product's tags as its own pkgrel floor.
+            case " ${prefixes} " in
+              *" ${tag_prefix} "*)
+                echo "::error file=products/${prod}.conf::TAG_PREFIX '${tag_prefix}' is already used by another product"; exit 1 ;;
+            esac
+            prefixes="${prefixes} ${tag_prefix}"
+            echo "ok   ${prod}  (tags ${tag_prefix}...)"
+          done
+          echo "sources.env, ${PRODUCTS// /, } and the pinned OGC key all look sane"

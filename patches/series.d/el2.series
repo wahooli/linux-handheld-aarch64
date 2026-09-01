@@ -1,0 +1,48 @@
+# el2 -- Lenovo Yoga Slim 7x (X1E80100) booting at EL2, for KVM.
+#
+# Committed in patches/el2/, not fetched: 0003-0029 are Stephan Gerhold's
+# wip/qcom-laptops-6.17-el2 series, whose codelinaro branch is dead (mirror:
+# github.com/jglathe/linux_ms_dev_kit), and 0001, 0002, 0030 and the 'local:'
+# patches were written locally. There is no manifest upstream to take.
+#
+# Order is the series order and it matters -- these are git format-patch
+# commits with Fixes: edges between them. Provenance: docs/PATCHES.md.
+
+0001-arm_scmi-perf-audit-firmware-perf-limits.patch
+0002-ASoC-qcom-x1e80100-lift-speaker-volume-caps.patch
+0003-soc-qcom-smp2p-Kick-after-requesting-interrupt.patch
+0004-soc-qcom-smp2p-Ensure-there-is-enough-space-for-outb.patch
+0005-soc-qcom-smp2p-Use-length-limited-strncmp-for-compar.patch
+0006-soc-qcom-smp2p-Drop-redundant-stack-copies-of-entry-.patch
+0007-soc-qcom-smp2p-Take-over-outgoing-SMEM-items-from-bo.patch
+0008-remoteproc-core-Allow-restarting-detached-remoteproc.patch
+0009-remoteproc-qcom_q6v5-Allow-detecting-detached-state-.patch
+0010-remoteproc-qcom_q6v5-Add-qcom_q6v5_attach.patch
+0011-remoteproc-qcom_q6v5-Send-SMP2P-stop-signal-in-attac.patch
+0012-remoteproc-qcom_q6v5_pas-Attach-running-remoteproc-i.patch
+0013-wip-remoteproc-qcom_q6v5_pas-Avoid-using-broken-rese.patch
+0014-arm64-dts-qcom-x1-el2-Add-qcom-broken-reset-for-remo.patch
+0015-rpmsg-core-Call-announce_destroy-only-after-announce.patch
+0016-rpmsg-core-Make-it-easier-to-manually-create-endpoin.patch
+0017-net-qrtr-smd-Fix-race-conditions-while-opening-closi.patch
+0018-local-arm64-dts-qcom-x1-el2-drop-top-level-remotepro.patch
+0019-local-arm64-dts-qcom-x1-el2-store-RTC-offset-in-SDAM.patch
+0020-media-iris-Port-firmware-loading-without-TZ-PAS-from.patch
+0021-arm64-dts-qcom-x1-el2-Add-iris-video-firmware-node.patch
+0022-fixup-iris-qcom_mdt_load_no_init-dropped-pas_id-in-7.patch
+0023-wip-firmware-qcom-tzmem-self-owner-SHM-bridge-via-qc.patch
+0024-dt-bindings-firmware-qcom-scm-Add-qcom-shm-bridge-vm.patch
+0025-local-arm64-dts-qcom-x1-el2-request-self-owner-SHM-b.patch
+0026-local-arm64-dts-qcom-x1-el2-add-ramoops-region-to-ca.patch
+0027-arm64-dts-qcom-hamoa-add-system-power-domain-SS3-sta.patch
+0028-platform-arm64-add-Yoga-Slim-7x-IT8987-EC-driver-DT-.patch
+0029-drm-msm-a6xx-Fix-stale-rpmh-votes-after-suspend.patch
+0030-local-remoteproc-qcom_q6v5_pas-Disable-recovery-for-.patch
+
+# Copied byte-for-byte from armada (kernel/patches/<name> at ARMADA_REF
+# eb63d011a3a9) so el2 keeps USE_ARMADA=no and an armada rebase cannot break
+# this build. Generic fixes, not SoC-gated: 0204 stops tsens lower-threshold
+# irqs aborting s2idle, 0517 fixes typec mux/switch EPROBE_DEFER swallowing
+# (silently missing DP-alt). Details in docs.local/PATCHES.md.
+0204-thermal-qcom-tsens-mask-lower-threshold-irqs-across-suspend.patch
+0517-usb-typec-mux-dont-swallow-EPROBE_DEFER.patch

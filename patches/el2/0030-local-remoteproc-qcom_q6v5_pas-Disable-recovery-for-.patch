@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Tue, 1 Sep 2026 21:00:00 +0300
+Subject: [PATCH 30/30] local: remoteproc: qcom_q6v5_pas: Disable recovery for
+ attach-only remoteprocs
+
+A remoteproc using qcom_pas_ops_no_reset (selected by qcom,broken-reset,
+added in patch 0013) has no .start op: without a working reset sequence
+we cannot boot the remote processor, only attach to one the bootloader
+already started. But the remoteproc core's crash recovery does not know
+that. Unless RPROC_FEAT_ATTACH_ON_RECOVERY is set (only imx_rproc sets
+it), rproc_trigger_recovery() takes the boot path, and rproc_start()
+calls rproc->ops->start unconditionally -- a NULL indirect call. An
+unprompted DSP crash then oopses the recovery worker and leaves the DSP
+offline until reboot, with a dead kworker on top.
+
+Reported against this exact series on an X1P42100 at EL2 (the same
+attach + broken-reset stack this kernel runs on x1e80100):
+
+  https://lore.kernel.org/all/20260811171546.188660-1-info@humanlearning.ch/
+
+Fix it the way Stephan Gerhold (author of the series) said he would in
+his reply (<anx6j8UX3BzvZ7JN@linaro.org>): mark recovery disabled. We
+cannot restart the processor, and attaching to a crashed one makes no
+sense, so recovery must fail gracefully -- the crash is still logged and
+the remoteproc stays cleanly offline, exactly what happens today minus
+the oops.
+
+Drop this patch together with 0013/0014 if the broken-reset approach is
+ever replaced (upstream late-attach, or firmware gaining a real reset).
+---
+ drivers/remoteproc/qcom_q6v5_pas.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+--- a/drivers/remoteproc/qcom_q6v5_pas.c
++++ b/drivers/remoteproc/qcom_q6v5_pas.c
+@@ -816,6 +816,16 @@
+ 		return -ENOMEM;
+ 	}
+ 
++	/*
++	 * Without a working reset the remote processor cannot be booted
++	 * again after it crashes: qcom_pas_ops_no_reset has no .start, so
++	 * boot-based recovery would oops in rproc_start() calling it, and
++	 * attaching to a crashed processor makes no sense either. Leave the
++	 * crashed remoteproc offline instead of attempting recovery.
++	 */
++	if (ops == &qcom_pas_ops_no_reset)
++		rproc->recovery_disabled = true;
++
+ 	rproc->has_iommu = of_property_present(pdev->dev.of_node, "iommus");
+ 	if (desc->auto_boot) {
+ 		if (ops->start)
+-- 
+2.51.0

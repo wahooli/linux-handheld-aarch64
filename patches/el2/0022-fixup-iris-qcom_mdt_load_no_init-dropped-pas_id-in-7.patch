@@ -1,0 +1,26 @@
+From 4fe558e0177b214f22f37b766d11d7075892f754 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Fri, 14 Aug 2026 15:08:42 +0300
+Subject: [PATCH 22/28] fixup: iris: qcom_mdt_load_no_init dropped pas_id in
+ 7.1
+
+Still absent in 7.2: qcom_mdt_load_no_init() takes no pas_id (see
+include/linux/soc/qcom/mdt_loader.h). Drop the argument from the non-TZ
+call introduced by the previous iris patch.
+---
+ drivers/media/platform/qcom/iris/iris_firmware.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/qcom/iris/iris_firmware.c b/drivers/media/platform/qcom/iris/iris_firmware.c
+index 2ce392ef2..08cdbda1a 100644
+--- a/drivers/media/platform/qcom/iris/iris_firmware.c
++++ b/drivers/media/platform/qcom/iris/iris_firmware.c
+@@ -99,7 +99,7 @@ static int iris_load_fw_to_memory(struct iris_core *core, const char *fw_name)
+ 				    IRIS_PAS_ID, mem_virt, mem_phys, res_size, NULL);
+ 	else
+ 		ret = qcom_mdt_load_no_init(dev, firmware, fw_name,
+-					    IRIS_PAS_ID, mem_virt, mem_phys, res_size, NULL);
++					    mem_virt, mem_phys, res_size, NULL);
+ 
+ 	/* Unmap memory on our side before we give firmware access to it */
+ 	memunmap(mem_virt);

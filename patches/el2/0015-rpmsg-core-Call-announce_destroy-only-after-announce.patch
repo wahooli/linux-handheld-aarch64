@@ -1,0 +1,31 @@
+From 9b1d2a0118dd6f239ffda9783c21e92c86a14b8d Mon Sep 17 00:00:00 2001
+From: Stephan Gerhold <stephan.gerhold@linaro.org>
+Date: Sat, 1 Nov 2025 18:32:25 +0100
+Subject: [PATCH 15/28] rpmsg: core: Call announce_destroy() only after
+ announce_create()
+
+rpmsg_dev_probe() calls rpdev->ops->announce_create() only when the driver
+specifies a callback and an endpoint was opened, but rpmsg_dev_remove()
+calls announce_destroy() unconditionally. Fix this by adding the missing
+check.
+
+Cc: stable@vger.kernel.org
+Fixes: 7586516ca043 ("rpmsg: Only invoke announce_create for rpdev with endpoints")
+Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
+---
+ drivers/rpmsg/rpmsg_core.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/rpmsg/rpmsg_core.c b/drivers/rpmsg/rpmsg_core.c
+index c56f69c22..654d461bd 100644
+--- a/drivers/rpmsg/rpmsg_core.c
++++ b/drivers/rpmsg/rpmsg_core.c
+@@ -495,7 +495,7 @@ static void rpmsg_dev_remove(struct device *dev)
+ 	struct rpmsg_device *rpdev = to_rpmsg_device(dev);
+ 	struct rpmsg_driver *rpdrv = to_rpmsg_driver(rpdev->dev.driver);
+ 
+-	if (rpdev->ops->announce_destroy)
++	if (rpdev->ept && rpdev->ops->announce_destroy)
+ 		rpdev->ops->announce_destroy(rpdev);
+ 
+ 	if (rpdrv->remove)

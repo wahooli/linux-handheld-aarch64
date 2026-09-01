@@ -1,0 +1,64 @@
+Subject: [PATCH] ASoC: qcom: x1e80100: lift the speaker volume caps
+
+Upstream commit "ASoC: qcom: x1e80100: limit speaker volumes" (2026-04-22, in
+v7.1 but not v7.0) clamps Digital Volume to -3 dB and PA Volume to 0 dB "to
+reduce the risk of speaker damage until we have active speaker protection in
+place".
+
+On the Lenovo Yoga Slim 7x that leaves the speakers ~18 dB quieter than the
+same hardware running v7.0 (measured on an Ubuntu 26.04 live USB with
+7.0.0-14-generic: PA Volume 16/31 = +15 dB, Digital Volume 84/124 = 0 dB),
+which is quiet enough to be unusable at full volume.
+
+Raise both limits to the hardware maximum. The kernel then stops clamping and
+the actual levels stay under userspace control, so volume can be lowered again
+instantly with amixer/UCM if it distorts -- no rebuild required.
+
+DELIBERATE LOCAL DEVIATION: this discards the protection upstream added. There
+is still no excursion/thermal speaker protection on Linux for the WSA884x, so
+sustained high-level playback can physically damage the speakers. The chosen
+levels are the ones v7.0 shipped with and that this machine ran without
+incident, but that is empirical, not a guarantee.
+
+--- a/sound/soc/qcom/x1e80100.c
++++ b/sound/soc/qcom/x1e80100.c
+@@ -35,20 +35,26 @@
+ 	case WSA_CODEC_DMA_RX_0:
+ 	case WSA_CODEC_DMA_RX_1:
+ 		/*
+-		 * Set limit of -3 dB on Digital Volume and 0 dB on PA Volume
+-		 * to reduce the risk of speaker damage until we have active
+-		 * speaker protection in place.
++		 * Local: upstream limits Digital Volume to -3 dB (81) and PA
++		 * Volume to 0 dB (6) to reduce the risk of speaker damage until
++		 * active speaker protection exists.  That is ~18 dB quieter than
++		 * v7.0 on this machine, so lift both to the hardware maximum and
++		 * leave the actual level to userspace.
++		 *
++		 * WARNING: there is still no excursion/thermal protection for the
++		 * WSA884x on Linux.  Sustained loud playback can damage the
++		 * speakers.  Lower "PA Volume" with amixer if it distorts.
+ 		 */
+-		snd_soc_limit_volume(card, "WSA WSA_RX0 Digital Volume", 81);
+-		snd_soc_limit_volume(card, "WSA WSA_RX1 Digital Volume", 81);
+-		snd_soc_limit_volume(card, "WSA2 WSA_RX0 Digital Volume", 81);
+-		snd_soc_limit_volume(card, "WSA2 WSA_RX1 Digital Volume", 81);
+-		snd_soc_limit_volume(card, "SpkrLeft PA Volume", 6);
+-		snd_soc_limit_volume(card, "SpkrRight PA Volume", 6);
+-		snd_soc_limit_volume(card, "WooferLeft PA Volume", 6);
+-		snd_soc_limit_volume(card, "TweeterLeft PA Volume", 6);
+-		snd_soc_limit_volume(card, "WooferRight PA Volume", 6);
+-		snd_soc_limit_volume(card, "TweeterRight PA Volume", 6);
++		snd_soc_limit_volume(card, "WSA WSA_RX0 Digital Volume", 124);
++		snd_soc_limit_volume(card, "WSA WSA_RX1 Digital Volume", 124);
++		snd_soc_limit_volume(card, "WSA2 WSA_RX0 Digital Volume", 124);
++		snd_soc_limit_volume(card, "WSA2 WSA_RX1 Digital Volume", 124);
++		snd_soc_limit_volume(card, "SpkrLeft PA Volume", 31);
++		snd_soc_limit_volume(card, "SpkrRight PA Volume", 31);
++		snd_soc_limit_volume(card, "WooferLeft PA Volume", 31);
++		snd_soc_limit_volume(card, "TweeterLeft PA Volume", 31);
++		snd_soc_limit_volume(card, "WooferRight PA Volume", 31);
++		snd_soc_limit_volume(card, "TweeterRight PA Volume", 31);
+ 		break;
+ 	case DISPLAY_PORT_RX_0:
+ 		dp_pcm_id = 0;

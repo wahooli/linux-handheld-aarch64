@@ -1,0 +1,34 @@
+From 73d9f9e9465626e8339d616c88f0fab3f81fafc9 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Fri, 14 Aug 2026 15:36:42 +0300
+Subject: [PATCH 25/28] local: arm64: dts: qcom: x1-el2: request self-owner SHM
+ bridge VMID for scm
+
+---
+ arch/arm64/boot/dts/qcom/x1-el2.dtso | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/x1-el2.dtso b/arch/arm64/boot/dts/qcom/x1-el2.dtso
+index 9c31031d1..283d88761 100644
+--- a/arch/arm64/boot/dts/qcom/x1-el2.dtso
++++ b/arch/arm64/boot/dts/qcom/x1-el2.dtso
+@@ -1,4 +1,5 @@
+ // SPDX-License-Identifier: BSD-3-Clause
++#include <dt-bindings/firmware/qcom,scm.h>
+ 
+ /*
+  * x1 specific modifications required to boot in EL2.
+@@ -102,3 +103,13 @@ rtc_offset: rtc-offset@7c {
+ 		reg = <0x7c 0x4>;
+ 	};
+ };
++
++/*
++ * Without Gunyah, TZ only accepts SCM shared-memory buffers registered as
++ * SHM bridges with the "self owner" bits (msm-5.4 vendor kernel behavior).
++ * This makes qseecom probe at EL2 → uefisecapp → working efivars.
++ * Requires CONFIG_QCOM_TZMEM_MODE_SHMBRIDGE=y.
++ */
++&scm {
++	qcom,shm-bridge-vmid = <QCOM_SCM_VMID_SELF_OWNER>;
++};

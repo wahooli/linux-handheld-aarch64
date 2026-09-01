@@ -23,6 +23,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${HERE}"
 
+# One pacman database serves every product: different pkgbase, no collisions, and
+# a device adds one [handheld] section whichever kernel it installs. RETAIN is
+# per PACKAGE NAME, not per repository.
 REPO_NAME="${REPO_NAME:-handheld}"
 RETAIN="${RETAIN:-5}"
 ARCH_DIR="aarch64"
@@ -160,7 +163,76 @@ done
 gpg --batch --yes --export --output "${WORK}/${REPO_NAME}.gpg" "${GPGKEY}"
 
 # --------------------------------------------------------------------------
-# 2. Pull the current database, fold the new packages in
+# 2. Refuse to overwrite a filename that is already published
+# --------------------------------------------------------------------------
+# Objects are served `Cache-Control: immutable`, so a filename is a promise that
+# its bytes never change. Overwrite one and the edge keeps serving the previous
+# build while the database (max-age=60) already carries the new sha256 and
+# signature; the device then reports "invalid or corrupted package (PGP
+# signature)" and cannot clear it, because the staleness is at the edge.
+#
+# next-pkgrel.sh is the primary defence. This is the backstop for the paths that
+# bypass it: a hand-written version.env, a re-run whose pkgrel step was skipped,
+# a deliberately pinned pkgrel.
+#
+# Identical bytes pass, so re-running a half-failed publish stays idempotent.
+# Hashes come from ONE rclone listing rather than a HEAD per package; R2 returns
+# the md5 as the etag for the single-part uploads this script makes
+# (UPLOAD_CUTOFF=5G), so it is comparable to md5sum here.
+if [ -z "${DRY_RUN}" ]; then
+    echo "==> checking that no published filename is being overwritten"
+    declare -A REMOTE_MD5=()
+    if ! _listing="$(rclone lsf "${REMOTE}" --include '*.pkg.tar.zst' \
+                        --hash MD5 --format ph --separator '|' 2>&1)"; then
+        while IFS= read -r _l; do printf '    %s\n' "${_l}"; done <<< "${_listing}" >&2
+        echo "!! could not list ${REMOTE}; refusing to publish blind" >&2
+        exit 1
+    fi
+    while IFS='|' read -r rname rhash; do
+        [ -n "${rname}" ] && REMOTE_MD5["${rname}"]="${rhash}"
+    done <<< "${_listing}"
+
+    clash=()
+    for p in "${PKGS[@]}"; do
+        b="$(basename "${p}")"
+        [ -n "${REMOTE_MD5[${b}]+x}" ] || continue          # not published yet
+        local_md5="$(md5sum "${p}" | cut -d' ' -f1)"
+        # An empty remote hash means the object exists but R2 gave no md5 for it
+        # (a multipart upload from some other tool). Unknown is not "the same":
+        # treat it as a clash, because the cost of being wrong is a device that
+        # cannot install anything.
+        [ -n "${REMOTE_MD5[${b}]}" ] && [ "${REMOTE_MD5[${b}]}" = "${local_md5}" ] && {
+            echo "    ${b} is already published, byte-identical -- fine"
+            continue
+        }
+        clash+=("${b}")
+    done
+
+    if [ ${#clash[@]} -gt 0 ]; then
+        cat >&2 <<EOM
+!!
+!! These filenames are ALREADY PUBLISHED with different bytes:
+$(printf '!!   %s\n' "${clash[@]}")
+!!
+!! Publishing them would overwrite objects served as immutable, so devices would
+!! keep getting the old bytes with the new signature -- which reads as
+!! "signature is invalid / package is corrupted" and cannot be fixed on the
+!! device.
+!!
+!! Bump pkgrel and rebuild: new bytes need a new filename, and a new filename is
+!! the only thing that invalidates the edge. scripts/next-pkgrel.sh does that
+!! automatically when it can see R2 and the git tags; if it ran without either,
+!! that is the actual bug to fix.
+EOM
+        exit 1
+    fi
+    echo "    ok -- nothing published is being rewritten"
+else
+    echo "==> [dry-run] skipping the already-published check (needs the network)"
+fi
+
+# --------------------------------------------------------------------------
+# 3. Pull the current database, fold the new packages in
 # --------------------------------------------------------------------------
 DB="${WORK}/db"; mkdir -p "${DB}"
 # A dry run must not need the network: it exists to check the signing and
@@ -226,7 +298,7 @@ done
 echo "==> database signed"
 
 # --------------------------------------------------------------------------
-# 3. Upload -- ORDER MATTERS
+# 4. Upload -- ORDER MATTERS
 # --------------------------------------------------------------------------
 # Packages first, database last. A client that runs `pacman -Sy` in the middle
 # of a publish must never receive a database that references a package which is
@@ -256,17 +328,20 @@ rclone_ copyto "${WORK}/${REPO_NAME}.gpg" "R2:${R2_BUCKET}/${REPO_NAME}.gpg" \
     --header-upload "Cache-Control: public, max-age=300"
 
 # --------------------------------------------------------------------------
-# 4. Prune -- last, and never below what the database references
+# 5. Prune -- last, and never below what the database references
 # --------------------------------------------------------------------------
 # Keep the newest RETAIN versions per package name so a bad kernel can be rolled
 # back on-device with `pacman -U <url>`. Pruning happens after the database is
 # live, so a client mid-sync never loses a file the index still points at.
 #
-# Note what retention is FOR: repo-add keeps only the newest version of each
-# package name in the database, so `pacman -S` can never reach an older one.
-# The retained packages exist purely as direct-URL rollback targets. That is why
-# pruning must not touch the current build, and why RETAIN below 2 would leave
-# nothing to roll back to.
+# repo-add keeps only the newest version of each name in the database, so
+# `pacman -S` cannot reach an older one; retained packages are direct-URL
+# rollback targets only. Hence pruning must not touch the current build, and
+# RETAIN below 2 leaves nothing to roll back to.
+#
+# Deleting an object does not free its NAME -- the URL was served immutable, so
+# the edge can still answer for it. A pruned pkgrel must never be reissued, which
+# is why next-pkgrel.sh floors on git tags rather than on this listing.
 # Sort pacman versions oldest-first.
 vercmp_sort() {
     local -a a=(); mapfile -t a

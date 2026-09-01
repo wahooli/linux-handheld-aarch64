@@ -1,17 +1,45 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034  # DTB/DTS arrays are consumed by the PKGBUILD
 #
-# Resolve the whole patch stack, the board device trees, and the mainline base,
-# from the refs pinned in sources.env. Nothing this script downloads is
-# committed -- that is the point. What IS committed is the manifests it reads:
+# Resolve one product's kernel base, patch stack and board device trees from the
+# refs pinned in sources.env and products/<product>.conf. Nothing this script
+# downloads is committed -- that is the point. What IS committed is the manifests
+# it reads:
 #
-#   patches/series.d/<device>.series   which armada patches, in what order
-#   patches/ogc.select                 which OGC patches, by name regex
-#   patches/local/series               patches authored here, applied last
+#   products/<product>.conf           base, config, series, boards, dtbs
+#   patches/series.d/<product>.series a LOCAL series, for a product whose patches
+#                                     have no upstream manifest (SERIES=<path>)
+#   patches/<product>/*.patch         committed patches, for a series entry that
+#                                     cannot be fetched from anywhere. This is
+#                                     the only place .patch files are committed.
+#   patches/ogc.select                which OGC patches, by name regex
+#   patches/local/series              patches authored here, applied last
+#
+#   PRODUCT=handheld ./scripts/fetch-patches.sh
+#
+# PRODUCT may be omitted while sources.env names exactly one product.
 #
 # ---------------------------------------------------------------------------
-# Why three sources, in this order
+# Where the kernel comes from
 #
+# KERNEL_SOURCE in the product conf picks one of two bases, and they are not
+# interchangeable in what they already contain:
+#
+#   cachyos      CachyOS/linux release tarball -- mainline stable with CachyOS's
+#                own branches merged (bbr3, cachy, gaming-sched, ksm,
+#                preempt-ipi, amd-pstate...). One signed asset; there is no
+#                patch series to resolve for the base itself. Note that
+#                7.2/gaming-sched already carries the EEVDF mailing-list series
+#                that patches/ogc.select selects, which is why USE_OGC is off
+#                for a cachyos product.
+#   kernel.org   pristine mainline, PGP-verified against the release signers.
+#
+# ---------------------------------------------------------------------------
+# Where the patches come from
+#
+#   CachyOS/kernel-patches     The one scheduler patch a product may ask for on
+#                              top of the CachyOS tarball (CACHY_SCHED). Pinned
+#                              to a commit; that repo has no tags or signatures.
 #   armada-os/armada-packages  Device support, already rebased onto our base.
 #                              PRIMARY. ROCKNIX authors most of it, but armada
 #                              does the rebase, and the rebase is the expensive
@@ -20,8 +48,8 @@
 #                              7.1.3. Fallback source for patches armada lacks,
 #                              and the source for the staged-not-applied set.
 #   OpenGamingCollective/linux An x86 handheld tree with nothing to say about
-#                              Qualcomm. We take only the arch-independent
-#                              parts -- currently the scheduler block.
+#                              Qualcomm. Optional (USE_OGC); we take only the
+#                              arch-independent parts -- the scheduler block.
 #
 # OGC ships two release assets. We use series.zip (individual git format-patch
 # files, each with authorship, commit message and a GPG .sig) rather than
@@ -34,24 +62,23 @@
 #   patches/rocknix-staged/      fetched, gitignored, never applied
 #   dts/                         fetched, gitignored
 #   patches/series.generated     the single ordered list the PKGBUILD applies
-#   version.env                  base version, tarball URL + sha256, pkgver
+#   version.env                  product, base, tarball URL + sha256, pkgver
 #   .fetch-report.md             job summary fragment for CI
 #
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${HERE}"
+# shellcheck source=scripts/lib-product.sh
+source "${HERE}/scripts/lib-product.sh"
+lp_load "${HERE}"
+lp_lock "${HERE}"
 
-# shellcheck source=/dev/null
-source ./sources.env
-
-# Env overrides win over sources.env, so CI and one-off experiments do not need
-# to dirty the tree.
-OGC_REF="${OGC_REF_OVERRIDE:-${OGC_REF}}"
-ARMADA_REF="${ARMADA_REF_OVERRIDE:-${ARMADA_REF}}"
-ROCKNIX_REF="${ROCKNIX_REF_OVERRIDE:-${ROCKNIX_REF}}"
-BASE_VERSION="${BASE_VERSION_OVERRIDE:-${BASE_VERSION}}"
-DEVICES="${DEVICES_OVERRIDE:-${DEVICES}}"
+# version.env existing means "the LAST resolve succeeded, and the tree matches
+# it". Drop the previous one now (under the lock), so a run that dies partway
+# -- set -e, not just the failure gate at the bottom -- cannot leave a stale
+# file describing a stack this tree no longer holds. It is rewritten at the
+# end, on success only.
+rm -f version.env
 
 ARMADA_RAW="https://raw.githubusercontent.com/armada-os/armada-packages/${ARMADA_REF}/kernel"
 ROCKNIX_RAW="https://raw.githubusercontent.com/ROCKNIX/distribution/${ROCKNIX_REF}"
@@ -66,11 +93,12 @@ ROCKNIX_RAW="https://raw.githubusercontent.com/ROCKNIX/distribution/${ROCKNIX_RE
 ROCKNIX_STAGED_REF="${ROCKNIX_STAGED_REF:-next}"
 ROCKNIX_STAGED_RAW="https://raw.githubusercontent.com/ROCKNIX/distribution/${ROCKNIX_STAGED_REF}"
 OGC_REL="https://github.com/OpenGamingCollective/linux/releases/download/${OGC_REF}"
+CACHY_RAW="https://raw.githubusercontent.com/CachyOS/kernel-patches/${CACHY_PATCHES_REF:-master}"
 
 # Verify OGC's per-patch signatures. On by default: it is cheap, and the pinned
 # ref alone is not integrity when the patches are no longer committed.
 OGC_VERIFY="${OGC_VERIFY:-1}"
-# Verify the kernel tarball's PGP signature against the kernel.org release keys.
+# Verify the kernel tarball's PGP signature against the pinned release keys.
 KERNEL_VERIFY="${KERNEL_VERIFY:-1}"
 # Re-download things already present.
 FORCE="${FORCE:-}"
@@ -92,61 +120,43 @@ fail()  { FAILURES+=("$1"); echo "${RED}  !! $1${OFF}" >&2; }
 note()  { NOTES+=("$1"); }
 
 # ===========================================================================
-# 1. Base kernel version, derived from the OGC tag
+# 1. Kernel base, from whichever source this product selected
 # ===========================================================================
-# v7.2.1-ogc3  -> base 7.2.1, ogc rev 3
-# v7.2-ogc9    -> base 7.2,   ogc rev 9
-# v7.2-rc7-ogc7-> base 7.2-rc7, ogc rev 7
-[[ "${OGC_REF}" =~ ^v?(.+)-ogc([0-9]+)$ ]] || {
-    echo "${RED}OGC_REF='${OGC_REF}' is not a <version>-ogc<N> tag${OFF}" >&2
-    exit 1
-}
-_derived_base="${BASH_REMATCH[1]}"
-OGC_REV="${BASH_REMATCH[2]}"
-
-if [ -n "${BASE_VERSION}" ]; then
-    BASE="${BASE_VERSION}"
-    [ "${BASE}" = "${_derived_base}" ] || note \
-        "base PINNED to ${BASE}; OGC_REF ${OGC_REF} targets ${_derived_base}. The OGC patches were not written against this tree."
-else
-    BASE="${_derived_base}"
+# The OGC revision is parsed FIRST because it feeds the pkgver tail of a
+# kernel.org+OGC product -- and only then. With USE_OGC=no it is not read at all,
+# so a stale OGC_REF in sources.env cannot influence what gets built.
+OGC_REV=
+if [ "${USE_OGC}" = yes ]; then
+    [[ "${OGC_REF}" =~ ^v?(.+)-ogc([0-9]+)$ ]] || {
+        echo "${RED}OGC_REF='${OGC_REF}' is not a <version>-ogc<N> tag${OFF}" >&2
+        exit 1
+    }
+    OGC_REV="${BASH_REMATCH[2]}"
 fi
 
-KMAJOR="${BASE%%.*}"
-if [[ "${BASE}" == *-rc* ]]; then
-    IS_RC=1
-    SRC_URL="https://git.kernel.org/torvalds/t/linux-${BASE}.tar.gz"
-    SRC_TAR="linux-${BASE}.tar.gz"
-else
-    IS_RC=
-    SRC_URL="https://cdn.kernel.org/pub/linux/kernel/v${KMAJOR}.x/linux-${BASE}.tar.xz"
-    SRC_TAR="linux-${BASE}.tar.xz"
+lp_resolve_kernel_source "${OGC_REV}"
+[ ${#LP_NOTES[@]} -eq 0 ] || NOTES+=("${LP_NOTES[@]}")
+
+if [ "${KERNEL_SOURCE}" = cachyos ] && [ "${USE_OGC}" = yes ]; then
+    note "USE_OGC=yes on a cachyos base. Its 7.2/gaming-sched branch already carries the EEVDF series patches/ogc.select selects; expect the PKGBUILD to report most of them as ALREADY APPLIED. Read that table rather than trusting this note."
 fi
 
-# pkgver must not contain '-'. Release bases never do; rc bases do.
-PKGVER="${BASE//-/}.ogc${OGC_REV}"
-[ -n "${IS_RC}" ] && note \
-    "base is an -rc. pkgver is ${PKGVER}; pacman sorts '7.2rc7.ogcN' AFTER '7.2.ogcN', so an rc-to-release move needs an epoch bump in the PKGBUILD."
-
-echo "==> base       linux-${BASE}   (from ${OGC_REF})"
+echo "==> product    ${PRODUCT}  (${PKGBASE})"
+echo "==> base       ${SRC_TOPDIR}   ${DIM}(${KERNEL_SOURCE} ${KERNEL_REF})${OFF}"
 echo "==> armada     ${ARMADA_REF:0:12}"
 echo "==> ROCKNIX    ${ROCKNIX_REF}   ${DIM}(staged set: ${ROCKNIX_STAGED_REF})${OFF}"
-echo "==> devices    ${DEVICES}"
+echo "==> boards     ${PRODUCT_BOARDS:-(none named)}"
 echo
 
 # ===========================================================================
 # 2. Kernel tarball: fetch, verify, record the checksum
 # ===========================================================================
 # This is what closes the sha256sums=('SKIP') TODO the old package carried. The
-# PKGBUILD gets a real checksum written into version.env, and in the normal
-# (release) case that checksum is anchored to a kernel.org PGP signature rather
-# than to whatever the CDN happened to serve us.
-KERNEL_SIGNERS=(
-    647F28654894E3BD457199BE38DBBDC86092693E   # Greg Kroah-Hartman <gregkh@kernel.org>
-    ABAF11C65A2970B130ABE3C479BE3E4300411886   # Linus Torvalds <torvalds@kernel.org>
-    E27E5D8A3403A2EF66873BBCDEA66FF797772CDC   # Sasha Levin <sashal@kernel.org>
-)
-
+# PKGBUILD gets a real checksum written into version.env, and in the normal case
+# that checksum is anchored to an upstream PGP signature rather than to whatever
+# the CDN happened to serve us. What is signed differs per source, which
+# lp_verify_tarball knows about -- kernel.org signs the uncompressed tar,
+# CachyOS signs the .tar.gz as shipped.
 mkdir -p .cache
 CACHED=".cache/${SRC_TAR}"
 if [ ! -f "${CACHED}" ] || [ -n "${FORCE}" ]; then
@@ -158,34 +168,15 @@ else
 fi
 SRC_SHA="$(sha256sum "${CACHED}" | cut -d' ' -f1)"
 
-if [ -n "${KERNEL_VERIFY}" ] && [ -z "${IS_RC}" ]; then
-    # kernel.org signs the UNCOMPRESSED tar, so decompress to verify.
-    export GNUPGHOME="${TMP}/kgnupg"; mkdir -p "${GNUPGHOME}"; chmod 700 "${GNUPGHOME}"
-    if curl -fsSL --retry 3 -o "${TMP}/linux.tar.sign" \
-         "https://cdn.kernel.org/pub/linux/kernel/v${KMAJOR}.x/linux-${BASE}.tar.sign" \
-       && gpg --batch --quiet --auto-key-locate wkd \
-            --locate-keys gregkh@kernel.org torvalds@kernel.org sashal@kernel.org >/dev/null 2>&1
-    then
-        # Only trust the three fingerprints above; WKD alone proves nothing.
-        for fpr in "${KERNEL_SIGNERS[@]}"; do
-            gpg --batch --quiet --import-ownertrust <<< "${fpr}:6:" 2>/dev/null || true
-        done
-        xz -dc "${CACHED}" > "${TMP}/linux.tar"
-        if gpg --batch --status-fd 3 --verify "${TMP}/linux.tar.sign" "${TMP}/linux.tar" 3>"${TMP}/gpgstatus" 2>/dev/null \
-           && grep -qE "^\[GNUPG:\] VALIDSIG ($(IFS='|'; echo "${KERNEL_SIGNERS[*]}"))" "${TMP}/gpgstatus"
-        then
-            signer="$(awk '/VALIDSIG/{print $3}' "${TMP}/gpgstatus")"
-            echo "  ${GRN}verified${OFF} linux-${BASE}.tar  signed by ${signer:0:16}..."
-        else
-            fail "upstream: linux-${BASE}.tar PGP signature did not verify against a known kernel.org signer"
-        fi
-        rm -f "${TMP}/linux.tar"
-    else
-        fail "upstream: could not fetch linux-${BASE}.tar.sign or the kernel.org keys (set KERNEL_VERIFY= to skip)"
-    fi
-    unset GNUPGHOME
-elif [ -n "${IS_RC}" ]; then
-    note "base is an -rc: git.kernel.org snapshots are unsigned, so the tarball is trust-on-first-use at sha256 ${SRC_SHA:0:16}..."
+if [ -n "${KERNEL_VERIFY}" ]; then
+    verdict="$(lp_verify_tarball "${CACHED}" "${TMP}")" && rc=0 || rc=$?
+    case "${rc}" in
+        0) echo "  ${GRN}${verdict}${OFF}" ;;
+        2) note "${verdict} -- trust-on-first-use at sha256 ${SRC_SHA:0:16}..." ;;
+        *) fail "upstream: ${verdict}" ;;
+    esac
+else
+    note "KERNEL_VERIFY is off: ${SRC_TAR} is trusted at sha256 ${SRC_SHA:0:16}... and nothing else."
 fi
 echo "  sha256  ${SRC_SHA}"
 echo
@@ -194,6 +185,27 @@ echo
 # 3. OGC: select by name, guard contiguity, fetch
 # ===========================================================================
 mkdir -p patches dts
+
+# Initialised unconditionally. These are read in sections 6 and 7 whatever
+# happens above, and under `set -u` an unbound array there turns a clean
+# "upstream is down" failure into an unbound-variable error twenty lines later.
+OGC_SERIES=()
+ogc_selected=()       # "0028 0028-FROM-ML-....patch"
+ogc_unselected=()
+ogc_names=()
+OGC_SRC=
+
+# Whether OGC patches are wanted at all is the product's decision. When it says
+# no, any previously fetched ogc-*.patch is pruned rather than left on disk --
+# an orphan in patches/ is how a series file starts referring to something
+# nothing fetches.
+if [ "${USE_OGC}" != yes ]; then
+    echo "==> OGC        ${DIM}off for this product (USE_OGC=${USE_OGC:-no})${OFF}"
+    for f in patches/ogc-*.patch; do
+        [ -e "${f}" ] || continue
+        echo "  ${DIM}prune   $(basename "${f}")${OFF}"; rm -f "${f}"
+    done
+else
 
 echo "==> OGC series.zip @ ${OGC_REF}"
 if ! curl -fsSL --retry 3 -o "${TMP}/series.zip" "${OGC_REL}/series.zip"; then
@@ -205,10 +217,6 @@ else
     OGC_SRC="$(dirname "$(find "${TMP}/ogc" -name '0001-*.patch' -print -quit)")"
     [ -d "${OGC_SRC}" ] || fail "upstream: series.zip at ${OGC_REF} has no 0001-*.patch"
 fi
-
-ogc_selected=()       # "0028 0028-FROM-ML-....patch"
-ogc_unselected=()
-ogc_names=()
 
 if [ -d "${OGC_SRC:-}" ]; then
     # ---- key pinning -------------------------------------------------------
@@ -301,7 +309,7 @@ if [ -d "${OGC_SRC:-}" ]; then
         echo "  ${DIM}prune   $(basename "${f}")${OFF}"; rm -f "${f}"
     done
 
-    OGC_SERIES=(); n_new=0; n_bad=0
+    n_new=0; n_bad=0
     for entry in "${ogc_selected[@]}"; do
         src_base="${entry#* }"
         src="${OGC_SRC}/${src_base}"
@@ -320,103 +328,236 @@ if [ -d "${OGC_SRC:-}" ]; then
     unset GNUPGHOME
     echo "  selected ${#OGC_SERIES[@]} of ${#ogc_names[@]} patches (${n_new} newly fetched$([ -n "${OGC_VERIFY}" ] && echo ", signatures verified"))"
 fi
+
+fi   # USE_OGC
 echo
 
 # ===========================================================================
-# 4. Device patches and device trees
+# 4. Device patches and board device trees
 # ===========================================================================
-try_armada() { curl -fsSL --retry 3 -o "$2" "${ARMADA_RAW}/$1"; }
+# ONE series for the product, covering every board it supports. A patch for a
+# board this kernel never boots is unreachable code, so there is nothing to gain
+# from splitting it per device.
+try_armada() {
+    [ "${USE_ARMADA}" = yes ] || return 1
+    curl -fsSL --retry 3 -o "$2" "${ARMADA_RAW}/$1"
+}
 # ROCKNIX spreads patches over several directories, so most probes are expected
 # to 404. No --retry (a 404 is not transient) and stderr is dropped, or every
 # lookup narrates four failures before the one that works.
 try_rocknix() {
     local name="$1" out="$2" d root="${3:-${ROCKNIX_RAW}}"
+    [ "${USE_ROCKNIX}" = yes ] || return 1
     for d in "${ROCKNIX_DIRS[@]}"; do
         curl -fsSL -o "${out}" "${root}/${d}/${name}" 2>/dev/null && return 0
     done
     return 1
 }
 
-DEVICE_SERIES=(); seen_patch=" "
+# ---- resolve the ordered list ------------------------------------------------
+# SERIES=armada takes armada's own manifest whole; same format as a local one.
+# Fetched into TMP rather than the tree, so no copy on disk can disagree with
+# ARMADA_REF.
+SERIES_SRC=
+SERIES_TOTAL=0
+denied=()
+if [ "${SERIES}" = armada ]; then
+    SERIES_SRC="${TMP}/armada.series"
+    echo "==> series armada@${ARMADA_REF:0:12}  ${DIM}(kernel/patches/series)${OFF}"
+    try_armada "patches/series" "${SERIES_SRC}" \
+        || { fail "upstream: armada@${ARMADA_REF:0:12} has no kernel/patches/series"; SERIES_SRC=; }
+else
+    SERIES_SRC="${SERIES}"
+    echo "==> series ${SERIES}   ${DIM}(local)${OFF}"
+fi
+
+SERIES_PATCHES=(); seen_patch=" "
 n_armada=0; n_rocknix=0
 
-for dev in ${DEVICES}; do
-    conf="devices/${dev}.conf"
-    [ -f "${conf}" ] || { fail "upstream: no ${conf} for device '${dev}' listed in DEVICES"; continue; }
-    # shellcheck source=/dev/null
-    # Reset before sourcing so a previous device's arrays cannot leak into this
-    # one. DTB is unused here on purpose -- only the PKGBUILD installs dtbs --
-    # but it still has to be cleared, or device N+1 inherits device N's list.
-    # shellcheck disable=SC2034
-    DTS=(); DTS_DELTA=(); DTB=(); ROCKNIX_STAGED=(); ROCKNIX_DIRS=(); source "${conf}"
-    echo "==> device ${dev} -- ${DEVICE_DESC}"
-
+if [ -n "${SERIES_SRC}" ]; then
+    # Read the whole list first, then fetch. Two reasons: the deny rules have to
+    # be checked against the FULL upstream list (a rule for a patch that is no
+    # longer there is stale and must fail rather than rot), and SERIES_EXTRA has
+    # to be appended after it.
+    upstream_entries=()
+    # Line numbers are tracked so a duplicate can be reported as a location
+    # rather than a riddle: a hand-edited series plus a regenerated one is an
+    # easy way to list the same patch twice, and "lists X twice" alone does not
+    # say where either copy is.
+    declare -A first_line=()
+    lineno=0
     while IFS= read -r line; do
+        lineno=$((lineno + 1))
         line="${line%%#*}"; line="${line//[[:space:]]/}"
         [ -n "${line}" ] || continue
-        [[ "${seen_patch}" == *" ${line} "* ]] && continue   # shared across devices
-        seen_patch+="${line} "
-        DEVICE_SERIES+=("${line}")
-        out="patches/${line}"
-        if [ -f "${out}" ] && [ -z "${FORCE}" ]; then continue; fi
-        if try_armada "patches/${line}" "${out}"; then
-            n_armada=$((n_armada+1))
-        elif try_rocknix "${line}" "${out}"; then
-            n_rocknix=$((n_rocknix+1))
-            note "${line} came from ROCKNIX (7.1.3-based), not armada -- verify it applies"
-        else
-            rm -f "${out}"
-            fail "upstream: ${line} not found in armada@${ARMADA_REF:0:12} or ROCKNIX@${ROCKNIX_REF}"
+        if [ -n "${first_line[${line}]:-}" ]; then
+            fail "local: ${SERIES_SRC} lists ${line} twice -- lines ${first_line[${line}]} and ${lineno}"
+            continue
         fi
-    done < "${SERIES}"
+        first_line["${line}"]="${lineno}"
+        upstream_entries+=("${line}")
+    done < "${SERIES_SRC}"
+    SERIES_TOTAL=${#upstream_entries[@]}
 
-    for f in "${DTS[@]}" "${DTS_DELTA[@]}"; do
-        [ -f "dts/${f}" ] && [ -z "${FORCE}" ] && continue
-        try_armada "dts/${f}" "dts/${f}" || { rm -f "dts/${f}"; fail "upstream: dts/${f} not in armada@${ARMADA_REF:0:12}"; }
+    deny_list=" ${SERIES_DENY[*]-} "
+    for entry in "${upstream_entries[@]}"; do
+        if [[ "${deny_list}" == *" ${entry} "* ]]; then
+            denied+=("${entry}")
+            echo "  ${YLW}deny    ${entry}${OFF}"
+            continue
+        fi
+        SERIES_PATCHES+=("${entry}")
     done
 
-    # Staged, never applied. The dry-run report lives in scripts/build.sh.
-    if [ ${#ROCKNIX_STAGED[@]} -gt 0 ]; then
-        mkdir -p patches/rocknix-staged
-        for f in "${ROCKNIX_STAGED[@]}"; do
-            [ -f "patches/rocknix-staged/${f}" ] && [ -z "${FORCE}" ] && continue
-            try_rocknix "${f}" "patches/rocknix-staged/${f}" "${ROCKNIX_STAGED_RAW}" \
-                || { rm -f "patches/rocknix-staged/${f}"; note "ROCKNIX-staged ${f} not found at ${ROCKNIX_STAGED_REF} (upstream may have renamed or dropped it)"; }
-        done
+    # A deny rule that matched nothing is a rule for a patch upstream has already
+    # dropped. Left alone it looks like protection and is not -- exactly the
+    # failure mode patches/ogc.select.deny's guard exists to prevent.
+    for entry in ${SERIES_DENY[@]+"${SERIES_DENY[@]}"}; do
+        [[ " ${denied[*]-} " == *" ${entry} "* ]] \
+            || fail "local: SERIES_DENY names ${entry}, which is not in the series any more -- remove the rule"
+    done
+
+    # Appended, not inserted. Anything order-sensitive belongs in a local series.
+    for entry in ${SERIES_EXTRA[@]+"${SERIES_EXTRA[@]}"}; do
+        if [[ " ${SERIES_PATCHES[*]} " == *" ${entry} "* ]]; then
+            fail "local: SERIES_EXTRA names ${entry}, which is already in the series"
+            continue
+        fi
+        SERIES_PATCHES+=("${entry}")
+    done
+fi
+
+# ---- fetch --------------------------------------------------------------------
+# Resolution order per entry:
+#
+#   patches/<product>/<name>   committed in this repo. For a patch with nothing
+#                              to fetch it from -- a WIP branch, a dead
+#                              codelinaro tree, something written here.
+#   armada                     kernel/patches/<name> at ARMADA_REF
+#   ROCKNIX                    ROCKNIX_DIRS at ROCKNIX_REF, 7.1.3-based
+#
+# A committed entry keeps its <product>/ prefix in series.generated, so the
+# PKGBUILD finds it and the source of every patch is visible in the list.
+SERIES_ENTRIES=(); n_committed=0
+for line in ${SERIES_PATCHES[@]+"${SERIES_PATCHES[@]}"}; do
+    # A repeated entry is a mistake in whichever list it came from -- and `patch`
+    # would refuse the second application anyway, fifty minutes later.
+    if [[ "${seen_patch}" == *" ${line} "* ]]; then
+        fail "upstream: the series lists ${line} twice"
+        continue
     fi
-    echo "  ${#DEVICE_SERIES[@]} patches, ${#DTS[@]} device trees"
+    seen_patch+="${line} "
+
+    if [ -f "patches/${PRODUCT}/${line}" ]; then
+        SERIES_ENTRIES+=("${PRODUCT}/${line}")
+        n_committed=$((n_committed+1))
+        continue
+    fi
+
+    SERIES_ENTRIES+=("${line}")
+    out="patches/${line}"
+    if [ -f "${out}" ] && [ -z "${FORCE}" ]; then continue; fi
+    if try_armada "patches/${line}" "${out}"; then
+        n_armada=$((n_armada+1))
+    elif try_rocknix "${line}" "${out}"; then
+        n_rocknix=$((n_rocknix+1))
+        note "${line} came from ROCKNIX (7.1.3-based), not armada -- verify it applies"
+    else
+        rm -f "${out}"
+        fail "upstream: ${line} not found in patches/${PRODUCT}/, armada@${ARMADA_REF:0:12} or ROCKNIX@${ROCKNIX_REF}"
+    fi
 done
+
+for f in "${DTS[@]}" "${DTS_DELTA[@]}"; do
+    [ -f "dts/${f}" ] && [ -z "${FORCE}" ] && continue
+    try_armada "dts/${f}" "dts/${f}" || { rm -f "dts/${f}"; fail "upstream: dts/${f} not in armada@${ARMADA_REF:0:12}"; }
+done
+
+# Staged, never applied. The dry-run report lives in scripts/makepkg-and-report.sh.
+if [ ${#ROCKNIX_STAGED[@]} -gt 0 ] && [ "${USE_ROCKNIX}" = yes ]; then
+    mkdir -p patches/rocknix-staged
+    for f in "${ROCKNIX_STAGED[@]}"; do
+        [ -f "patches/rocknix-staged/${f}" ] && [ -z "${FORCE}" ] && continue
+        try_rocknix "${f}" "patches/rocknix-staged/${f}" "${ROCKNIX_STAGED_RAW}" \
+            || { rm -f "patches/rocknix-staged/${f}"; note "ROCKNIX-staged ${f} not found at ${ROCKNIX_STAGED_REF} (upstream may have renamed or dropped it)"; }
+    done
+fi
+printf '  %d patches' "${#SERIES_PATCHES[@]}"
+[ "${SERIES}" = armada ] && printf ' (%d upstream - %d denied + %d extra)' \
+    "${SERIES_TOTAL}" "${#denied[@]}" "${#SERIES_EXTRA[@]}"
+[ "${n_committed}" -gt 0 ] && printf ', %d committed here' "${n_committed}"
+printf ', %d vendored device tree(s), %d dtb(s)\n' "${#DTS[@]}" "${#DTB[@]}"
 echo
 
 # ===========================================================================
-# 5. Local patches
+# 5. CachyOS scheduler patch
 # ===========================================================================
-# Never fetched -- they are committed, because they have no upstream.
-LOCAL_SERIES=()
-while IFS= read -r line; do
-    line="${line%%#*}"; line="${line//[[:space:]]/}"
-    [ -n "${line}" ] || continue
-    if [ -f "patches/local/${line}" ]; then
-        LOCAL_SERIES+=("local/${line}")
-    else
-        fail "local: patches/local/${line} is named in patches/local/series but does not exist"
+# One patch, on top of their tarball, for a product that asked for a scheduler
+# their default package does not ship. Their kernel-patches layout is
+# <major.minor>/sched/<name>, so the directory follows the base -- a base bump to
+# a version they have not published patches for fails here rather than mid-build.
+CACHY_SERIES=(); FUZZ_ALLOW=()
+if [ -n "${CACHY_SCHED:-}" ]; then
+    [[ "${BASE}" =~ ^([0-9]+\.[0-9]+) ]] && cachy_major="${BASH_REMATCH[1]}"
+    case "${CACHY_SCHED}" in
+        bore) cachy_patch="0001-bore-cachy.patch" ;;
+    esac
+    dst="patches/cachy-${cachy_patch}"
+    echo "==> cachy sched  ${CACHY_SCHED}  ${DIM}(${cachy_major}/sched/${cachy_patch} @ ${CACHY_PATCHES_REF:0:12})${OFF}"
+    if [ ! -f "${dst}" ] || [ -n "${FORCE}" ]; then
+        if curl -fsSL --retry 3 -o "${dst}.part" "${CACHY_RAW}/${cachy_major}/sched/${cachy_patch}"; then
+            mv "${dst}.part" "${dst}"
+        else
+            rm -f "${dst}.part"
+            fail "upstream: no ${cachy_major}/sched/${cachy_patch} at CachyOS/kernel-patches@${CACHY_PATCHES_REF:0:12}"
+        fi
     fi
-done < patches/local/series
-[ ${#LOCAL_SERIES[@]} -gt 0 ] \
-    && echo "==> local   ${#LOCAL_SERIES[@]} repo-specific patches" \
-    || echo "==> local   none"
+    if [ -f "${dst}" ]; then
+        CACHY_SERIES+=("cachy-${cachy_patch}")
+        echo "  $(wc -c < "${dst}") bytes, sha256 $(sha256sum "${dst}" | cut -c1-16)..."
+        # This one entry may apply with fuzz. CachyOS rebases their scheduler
+        # patch against whichever tree they were last on, which is not
+        # necessarily the release tarball we pin -- at cachyos-7.2.2-1 the BORE
+        # patch predates their own preempt-ipi merge, so its first sched.h hunk
+        # anchors 11 lines above where that block now sits:
+        #
+        #   Hunk #1 FAILED at 824.                    -F0
+        #   Hunk #1 succeeded at 835 with fuzz 2      GNU patch's default
+        #
+        # Their own builds succeed because makepkg applies with fuzz 2. We match
+        # that HERE ONLY, and never silently: the PKGBUILD prints every placement
+        # patch chose, and config/bore/ asserts CONFIG_SCHED_BORE, so a patch
+        # that landed somewhere useless fails the build rather than shipping.
+        FUZZ_ALLOW+=("cachy-${cachy_patch}")
+    fi
+else
+    for f in patches/cachy-*.patch; do
+        [ -e "${f}" ] || continue
+        echo "  ${DIM}prune   $(basename "${f}")${OFF}"; rm -f "${f}"
+    done
+fi
 echo
 
 # ===========================================================================
 # 6. Generated outputs
 # ===========================================================================
+# A patch authored here is not a separate stage: it is a series entry resolved
+# from patches/<product>/, placed wherever the series puts it. For a product on
+# armada's series that means naming it in SERIES_EXTRA, which appends it last.
 {
     echo "# GENERATED by scripts/fetch-patches.sh -- do not edit, do not commit."
-    echo "# base ${BASE} | ogc ${OGC_REF} | armada ${ARMADA_REF:0:12} | rocknix ${ROCKNIX_REF}"
-    echo "# devices: ${DEVICES}"
+    echo "# product ${PRODUCT} | base ${SRC_TOPDIR} (${KERNEL_SOURCE} ${KERNEL_REF})"
+    echo "# armada ${ARMADA_REF:0:12} | rocknix ${ROCKNIX_REF} | ogc ${USE_OGC:-no}${OGC_REV:+ ${OGC_REF}}"
+    echo "# series ${SERIES}: ${#SERIES_PATCHES[@]} patches${SERIES_TOTAL:+ (${SERIES_TOTAL} upstream, ${#denied[@]} denied, ${#SERIES_EXTRA[@]} extra)} | boards: ${PRODUCT_BOARDS:-unnamed}"
     echo
     echo "# --- device stack -------------------------------------------------"
-    printf '%s\n' "${DEVICE_SERIES[@]}"
+    printf '%s\n' "${SERIES_ENTRIES[@]}"
+    if [ ${#CACHY_SERIES[@]} -gt 0 ]; then
+        echo
+        echo "# --- CachyOS scheduler (${CACHY_SCHED}) ----------------------------"
+        echo "# Applies after the device stack: it touches kernel/sched only."
+        printf '%s\n' "${CACHY_SERIES[@]}"
+    fi
     if [ ${#OGC_SERIES[@]} -gt 0 ]; then
         echo
         echo "# --- OGC, arch-independent ----------------------------------------"
@@ -424,37 +565,75 @@ echo
         echo "# so the relative ordering is irrelevant."
         printf '%s\n' "${OGC_SERIES[@]}"
     fi
-    if [ ${#LOCAL_SERIES[@]} -gt 0 ]; then
-        echo
-        echo "# --- local, authored in this repo ---------------------------------"
-        printf '%s\n' "${LOCAL_SERIES[@]}"
-    fi
 } > patches/series.generated
 
-# Drop any fetched patch the generated series no longer references, so the
-# directory cannot accumulate orphans across a series edit.
-refs=" $(grep -vE '^\s*(#|$)' patches/series.generated | tr '\n' ' ') "
+# Drop any fetched patch no product's series references, so patches/ cannot
+# accumulate orphans across a series edit.
+#
+# patches/ is flat and shared between products, so the union of every product's
+# manifest is what protects it: pruning against this product's series alone would
+# delete the other product's fetched patches every time you switch, and (worse)
+# do it to a tree someone is building in.
+printf '%s\n' ${SERIES_ENTRIES[@]+"${SERIES_ENTRIES[@]}"} \
+    ${CACHY_SERIES[@]+"${CACHY_SERIES[@]}"} \
+    ${OGC_SERIES[@]+"${OGC_SERIES[@]}"} > "patches/.fetched.${PRODUCT}"
+refs=" $(cat patches/.fetched.* 2>/dev/null | tr '\n' ' ') "
 for f in patches/*.patch; do
     [ -e "${f}" ] || continue
     b="$(basename "${f}")"
     [[ "${refs}" == *" ${b} "* ]] || { echo "  ${DIM}prune   ${b}${OFF}"; rm -f "${f}"; }
 done
 
-cat > version.env <<EOF
-# GENERATED by scripts/fetch-patches.sh from sources.env -- do not edit.
-# The PKGBUILD sources this, so there is exactly one place that decides which
-# kernel gets built.
+# version.env is the ONE place that decides what gets built. Everything
+# downstream -- the PKGBUILD, next-pkgrel.sh, publish-r2.sh, tag-release.sh --
+# reads it rather than re-deriving anything from sources.env, so a product can
+# never be half-switched.
+#
+# Staged in TMP and moved into place only after the failure gate at the bottom:
+# downstream gates on the file's EXISTENCE, so a resolve that recorded hard
+# failures must not leave behind a version.env that looks fully resolved -- in
+# CI it would ride the failure artifact into the publish job and describe
+# packages that were never built.
+cat > "${TMP}/version.env" <<EOF
+# GENERATED by scripts/fetch-patches.sh from sources.env + products/${PRODUCT}.conf
+# -- do not edit. The PKGBUILD sources this, so there is exactly one place that
+# decides which kernel gets built.
+_product=${PRODUCT}
+_pkgbase=${PKGBASE}
+_pkgdesc="${PRODUCT_DESC}"
+_kernelsource=${KERNEL_SOURCE}
+_kernelref=${KERNEL_REF}
 _base=${BASE}
-_ogcrev=${OGC_REV}
-_srcname=linux-${BASE}
+# _srcname is the directory the tarball EXTRACTS TO, not a name we choose:
+# mainline gives linux-7.2.2, a CachyOS release gives cachyos-7.2.2-1.
+_srcname=${SRC_TOPDIR}
 _srcurl=${SRC_URL}
 _srcsha256=${SRC_SHA}
 pkgver=${PKGVER}
 pkgrel=${PKGREL:-1}
+_configbase=${CONFIG_BASE}
+_configdirs="${CONFIG_DIRS[*]}"
+_replacestock=${REPLACE_STOCK_KERNEL}
+# The dtbs this package ships. Recorded here purely so the tag message and the
+# failure report can name them without sourcing the product conf -- the PKGBUILD
+# reads the real list from products/${PRODUCT}.conf, which is where it is edited.
+_cachysched=${CACHY_SCHED:-}
+# Series entries allowed to apply with fuzz. Only ever the CachyOS scheduler
+# patch; everything else is -F0.
+_fuzzallow="${FUZZ_ALLOW[*]-}"
+_series=${SERIES}
+_npatches=${#SERIES_PATCHES[@]}
+_dtbs="${DTB[*]}"
+# Installed layout. The make target and the paths the package writes to.
+_kernelimage=${KERNEL_IMAGE}
+_kernelimagedest=${KERNEL_IMAGE_DEST}
+_initramfs=${INITRAMFS_IMAGE}
+_initramfsfallback=${INITRAMFS_FALLBACK}
+_dtbdest=${DTB_DEST}
+_useogc=${USE_OGC}
 _ogcref=${OGC_REF}
 _armadaref=${ARMADA_REF}
 _rocknixref=${ROCKNIX_REF}
-_devices="${DEVICES}"
 EOF
 
 # ===========================================================================
@@ -465,11 +644,27 @@ EOF
     echo
     echo "| | |"
     echo "|---|---|"
-    echo "| base | \`linux-${BASE}\` (from \`${OGC_REF}\`) |"
+    echo "| product | \`${PRODUCT}\` -> \`${PKGBASE}\` |"
+    echo "| kernel source | \`${KERNEL_SOURCE}\` \`${KERNEL_REF}\` |"
+    echo "| base | \`${SRC_TOPDIR}\` |"
     echo "| pkgver | \`${PKGVER}-${PKGREL:-1}\` |"
-    echo "| device patches | ${#DEVICE_SERIES[@]} (armada \`${ARMADA_REF:0:12}\`) |"
-    echo "| OGC patches | ${#OGC_SERIES[@]} of ${#ogc_names[@]} |"
-    echo "| local patches | ${#LOCAL_SERIES[@]} |"
+    if [ "${SERIES}" = armada ]; then
+        echo "| series | armada \`${ARMADA_REF:0:12}\`, taken whole: ${SERIES_TOTAL} upstream − ${#denied[@]} denied + ${#SERIES_EXTRA[@]} extra = **${#SERIES_PATCHES[@]} applied** |"
+        [ ${#denied[@]} -eq 0 ] || printf '| denied | `%s` |\n' "${denied[@]}"
+    else
+        echo "| series | \`${SERIES}\` (local) -- ${#SERIES_PATCHES[@]} patches |"
+    fi
+    echo "| boards | ${PRODUCT_BOARDS:-unnamed} -- ${#DTB[@]} dtb(s) |"
+    if [ -n "${CACHY_SCHED:-}" ]; then
+        echo "| cachy scheduler | \`${CACHY_SCHED}\` -- ${cachy_major}/sched/${cachy_patch} @ \`${CACHY_PATCHES_REF:0:12}\`, fuzz allowed |"
+    else
+        echo "| cachy scheduler | the tree's own (EEVDF + gaming-sched) |"
+    fi
+    if [ "${USE_OGC}" = yes ]; then
+        echo "| OGC patches | ${#OGC_SERIES[@]} of ${#ogc_names[@]} |"
+    else
+        echo "| OGC patches | off for this product |"
+    fi
     echo "| tarball sha256 | \`${SRC_SHA}\` |"
     if [ ${#NOTES[@]} -gt 0 ]; then
         echo; echo "#### Notes"; echo
@@ -483,9 +678,8 @@ EOF
 } > .fetch-report.md
 
 echo "──────────────────────────────────────────────"
-printf ' device patches : %d  (armada %d new, ROCKNIX %d)\n' "${#DEVICE_SERIES[@]}" "${n_armada}" "${n_rocknix}"
-printf ' OGC patches    : %d of %d\n' "${#OGC_SERIES[@]}" "${#ogc_names[@]}"
-printf ' local patches  : %d\n' "${#LOCAL_SERIES[@]}"
+printf ' device patches : %d  (armada %d new, ROCKNIX %d)\n' "${#SERIES_PATCHES[@]}" "${n_armada}" "${n_rocknix}"
+printf ' OGC patches    : %d of %d%s\n' "${#OGC_SERIES[@]}" "${#ogc_names[@]}" "$([ "${USE_OGC}" = yes ] || echo "  (off)")"
 printf ' staged (unused): %d\n' "$(ls -1 patches/rocknix-staged 2>/dev/null | wc -l)"
 echo "──────────────────────────────────────────────"
 [ ${#NOTES[@]} -gt 0 ] && printf "${YLW}  ~ %s${OFF}\n" "${NOTES[@]}"
@@ -496,4 +690,8 @@ if [ ${#FAILURES[@]} -gt 0 ]; then
     printf "${RED}  !! %s${OFF}\n" "${FAILURES[@]}" >&2
     exit 1
 fi
+
+# Success, and only success: this is what lets everything downstream treat the
+# file's existence as "the resolve is good".
+mv "${TMP}/version.env" version.env
 echo "${GRN}ok${OFF}  -> patches/series.generated, version.env"

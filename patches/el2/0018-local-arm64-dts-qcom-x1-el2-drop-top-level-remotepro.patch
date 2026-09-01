@@ -1,0 +1,34 @@
+From 86d0b321e58836afd58478170fc9ac9a19ebeb15 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Fri, 14 Aug 2026 13:23:02 +0300
+Subject: [PATCH 18/28] local: arm64: dts: qcom: x1-el2: drop top-level
+ remoteproc iommus (X1E SMMU bypass)
+
+---
+ arch/arm64/boot/dts/qcom/x1-el2.dtso | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/x1-el2.dtso b/arch/arm64/boot/dts/qcom/x1-el2.dtso
+index 848ac3284..0886951bc 100644
+--- a/arch/arm64/boot/dts/qcom/x1-el2.dtso
++++ b/arch/arm64/boot/dts/qcom/x1-el2.dtso
+@@ -52,13 +52,12 @@ &pcie_smmu {
+ 	status = "okay";
+ };
+ 
+-&remoteproc_adsp {
+-	iommus = <&apps_smmu 0x1000 0x80>;
+-};
+-
+-&remoteproc_cdsp {
+-	iommus = <&apps_smmu 0x0c00 0x0>;
+-};
++/*
++ * local: no top-level iommus for the remoteprocs. On this firmware the
++ * boot-configured SMMU bypass covers the DSP stream IDs; adding iommus
++ * replaces bypass with an unconfigured translated context and the
++ * UEFI-started ADSP faults immediately (fsr=0x402), soft-locking the boot.
++ */
+ 
+ &remoteproc_adsp {
+ 	qcom,broken-reset;

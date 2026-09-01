@@ -1,0 +1,97 @@
+--- a/drivers/firmware/arm_scmi/perf.c
++++ b/drivers/firmware/arm_scmi/perf.c
+@@ -1266,6 +1266,78 @@
+ 	.num_events = ARRAY_SIZE(perf_events),
+ };
+ 
++/*
++ * Some platforms (notably Qualcomm x1e80100) boot with per-domain performance
++ * limits already applied by firmware.  The SCMI stack never queries the
++ * initial limits -- it only subscribes to LIMITS_CHANGED notifications -- so a
++ * pre-existing cap is invisible to cpufreq, which keeps requesting (and
++ * reporting) the top OPP while firmware silently clamps it.
++ *
++ * Audit the limits at probe and log any cap.  When scmi_perf_raise_limits is
++ * set, additionally attempt to raise the max limit to the top OPP -- permitted
++ * only when firmware advertises SUPPORTS_SET_LIMITS.  The existing minimum
++ * limit is passed back unchanged.
++ *
++ * Note this runs once at protocol init: a limit re-imposed later (e.g. by
++ * firmware on resume) is only surfaced through the LIMITS_CHANGED notifier.
++ */
++static bool scmi_perf_raise_limits;
++core_param(scmi_perf_raise_limits, scmi_perf_raise_limits, bool, 0444);
++
++static void scmi_perf_limits_audit(const struct scmi_protocol_handle *ph,
++				   struct scmi_perf_info *pinfo)
++{
++	int domain;
++
++	for (domain = 0; domain < pinfo->num_domains; domain++) {
++		struct perf_dom_info *dom = pinfo->dom_info + domain;
++		u32 lmax, lmin, top, bot;
++		int ret;
++
++		if (!dom->opp_count)
++			continue;
++
++		/* opp[] is sorted ascending by perf level */
++		bot = dom->opp[0].perf;
++		top = dom->opp[dom->opp_count - 1].perf;
++
++		ret = scmi_perf_limits_get(ph, domain, &lmax, &lmin);
++		if (ret) {
++			dev_info(ph->dev, "perf domain %d: LIMITS_GET failed (%d)\n",
++				 domain, ret);
++			continue;
++		}
++
++		dev_info(ph->dev,
++			 "perf domain %d: limits max=%u min=%u, opp range %u..%u%s%s\n",
++			 domain, lmax, lmin, bot, top,
++			 lmax < top ? " [CAPPED]" : "",
++			 dom->set_limits ? "" : " [SET_LIMITS unsupported]");
++
++		if (lmax >= top || !scmi_perf_raise_limits)
++			continue;
++
++		if (!dom->set_limits) {
++			dev_warn(ph->dev,
++				 "perf domain %d: capped at %u but firmware forbids SET_LIMITS\n",
++				 domain, lmax);
++			continue;
++		}
++
++		/* raise only the ceiling; hand the current floor back as-is */
++		ret = scmi_perf_limits_set(ph, domain, top, lmin);
++		dev_info(ph->dev, "perf domain %d: raise limits to %u: %s (%d)\n",
++			 domain, top, ret ? "REJECTED" : "accepted", ret);
++		if (ret)
++			continue;
++
++		if (!scmi_perf_limits_get(ph, domain, &lmax, &lmin))
++			dev_info(ph->dev, "perf domain %d: limits now max=%u min=%u%s\n",
++				 domain, lmax, lmin,
++				 lmax >= top ? " [UNCAPPED]" : " [still capped]");
++	}
++}
++
+ static int scmi_perf_protocol_init(const struct scmi_protocol_handle *ph)
+ {
+ 	int domain, ret;
+@@ -1303,7 +1375,14 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	return ph->set_priv(ph, pinfo);
++	ret = ph->set_priv(ph, pinfo);
++	if (ret)
++		return ret;
++
++	/* priv must be live: the limits helpers use scmi_perf_domain_lookup() */
++	scmi_perf_limits_audit(ph, pinfo);
++
++	return 0;
+ }
+ 
+ static const struct scmi_protocol scmi_perf = {

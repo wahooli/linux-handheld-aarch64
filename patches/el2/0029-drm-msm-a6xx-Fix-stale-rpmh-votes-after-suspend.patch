@@ -1,0 +1,42 @@
+From 15ec8352ae34c4fc1990536d27c52a6c725a4361 Mon Sep 17 00:00:00 2001
+From: Shivam Rawat <shivam.rawat@oss.qualcomm.com>
+Date: Tue, 18 Aug 2026 16:01:43 +0300
+Subject: [PATCH] drm/msm/a6xx: Fix stale rpmh votes after suspend
+
+a6xx_rpmh_stop() bails out precisely when GMU_STATUS_FW_START is set --
+that is, whenever the GMU firmware was actually started and the RPMh
+sleep sequence therefore needs to run. Conversely it runs the sequence
+only when the bit was already clear and there is nothing to stop.
+
+The condition is inverted. Note the neighbouring a6xx_rpmh_start() uses
+the negated form for GMU_STATUS_PDC_SLEEP; restore the symmetry.
+
+Consequence is that the GPU RSC is never told to sleep on the way down,
+leaving RPMh votes behind after GPU suspend and holding SoC power
+resources up.
+
+Backported for 7.2 from Rob Clark's drm-msm-next-2026-08-01 pull request
+for v7.3 (shortlog: "drm/msm/a6xx: Fix stale rpmh votes after suspend").
+Verified identical in 7.1 and 7.2, i.e. this is long-standing rather than
+a 7.2 regression. The upstream commit message and SHA were unavailable --
+the tag was obtained as a source snapshot without git history -- so this
+text is reconstructed; only the one-character code change is upstream's.
+
+Signed-off-by: Shivam Rawat <shivam.rawat@oss.qualcomm.com>
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index 2e5d7b53a..51010d46a 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -642,7 +642,7 @@ static void a6xx_rpmh_stop(struct a6xx_gmu *gmu)
+ 	int ret;
+ 	u32 val;
+ 
+-	if (test_and_clear_bit(GMU_STATUS_FW_START, &gmu->status))
++	if (!test_and_clear_bit(GMU_STATUS_FW_START, &gmu->status))
+ 		return;
+ 
+ 	if (adreno_is_a840(adreno_gpu))

@@ -1,12 +1,14 @@
 # Maintainer: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 #
-# Mainline Linux + a handheld patch stack, packaged for Arch Linux ARM.
+# One kernel PRODUCT, packaged for Arch Linux ARM. Which product -- pkgbase,
+# kernel source, config fragments, devices, patch stack -- is decided by
+# products/<name>.conf, not here; this file is the same for every product.
 #
 # Nothing here is self-contained on purpose. Run scripts/fetch-patches.sh first:
-# it resolves the patch stack from the refs in sources.env and writes the two
-# files this PKGBUILD reads.
+# it resolves the base and the patch stack from sources.env plus the product conf
+# and writes the two files this PKGBUILD reads.
 #
-#   version.env              which kernel, from where, with what checksum
+#   version.env              which product, which kernel, from where, checksum
 #   patches/series.generated the single ordered list of patches to apply
 #
 # The old arch-arm64 package kept the kernel version in BASE.env *and* in the
@@ -17,8 +19,10 @@
 # shellcheck source=/dev/null
 source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/version.env"
 
-pkgbase=linux-handheld-aarch64
-pkgname=('linux-handheld-aarch64' 'linux-handheld-aarch64-headers')
+# From version.env, which got it from the product conf: every product builds from
+# this one file.
+pkgbase="${_pkgbase}"
+pkgname=("${_pkgbase}" "${_pkgbase}-headers")
 # pkgver / pkgrel come from version.env:
 #   pkgver=7.2.1.ogc3   base version + OGC patchset revision
 #   pkgrel              build counter, set by CI from what is already in R2
@@ -26,7 +30,7 @@ pkgname=('linux-handheld-aarch64' 'linux-handheld-aarch64-headers')
 # vercmp orders this correctly across every transition we care about:
 #   7.2.1.ogc3 < 7.2.1.ogc4 < 7.2.1.ogc10 < 7.2.2.ogc1
 #   7.2.ogc9   < 7.2.1.ogc1
-pkgdesc='Linux kernel for ARM handhelds (mainline + handheld patch stack)'
+pkgdesc="${_pkgdesc}"
 arch=('aarch64')
 url='https://github.com/wahooli/linux-handheld-aarch64'
 license=('GPL-2.0-only')
@@ -62,7 +66,7 @@ prepare() {
     # differs: an upstream patch that stopped applying means waiting for armada
     # or OGC to rebase, a local one means rebasing it yourself.
     local p f n=0 kind
-    local -a failed_upstream=() failed_local=()
+    local -a failed_upstream=() failed_local=() already=()
 
     while read -r p; do
         p="${p%%#*}"; p="${p//[[:space:]]/}"
@@ -70,14 +74,45 @@ prepare() {
         f="${repo}/patches/${p}"
         [ -f "${f}" ] || { echo "::  missing patch: ${p} (run scripts/fetch-patches.sh)"; return 1; }
 
-        case "${p}" in local/*) kind=local ;; *) kind=upstream ;; esac
+        # Committed patches live in patches/<product>/ and are OURS: nobody
+        # upstream rebases them, so they are reported separately and the advice
+        # differs. Anything else was fetched.
+        case "${p}" in "${_product}"/*) kind=local ;; *) kind=upstream ;; esac
 
-        if ! patch -p1 --batch --forward -F0 --dry-run --quiet < "${f}"; then
+        # -F0 for everything except the entries version.env names. See the
+        # comment fetch-patches.sh writes next to _fuzzallow.
+        local fuzz=0
+        case " ${_fuzzallow} " in
+            *" ${p} "*) fuzz=2 ;;
+        esac
+
+        if ! patch -p1 --batch --forward -F"${fuzz}" --dry-run --quiet < "${f}"; then
+            # Three outcomes, not two: a patch that will not apply may already BE
+            # in the tree. A reverse dry-run tells "already there" from "no longer
+            # applies", and only the second is a failure. Reported and counted per
+            # patch -- a patch that vanishes silently is how a kernel loses a fix.
+            # One that is only PARTLY applied fails both directions and is
+            # reported as a failure, which is correct.
+            if patch -p1 -R --batch -F0 --dry-run --quiet < "${f}"; then
+                echo "::  already in the base (${kind}), skipped: ${p}"
+                already+=("${p}")
+                continue
+            fi
             echo "::  FAILED (${kind}): ${p}"
             [ "${kind}" = local ] && failed_local+=("${p}") || failed_upstream+=("${p}")
             continue
         fi
-        patch -p1 --batch --forward -F0 --no-backup-if-mismatch --quiet < "${f}"
+        if [ "${fuzz}" = 0 ]; then
+            patch -p1 --batch --forward -F0 --no-backup-if-mismatch --quiet < "${f}"
+        else
+            # Not --quiet: every hunk patch had to place by fuzz or offset is
+            # printed, so an upstream rebase that moves it somewhere new shows up
+            # in the build log instead of passing as "applied".
+            local out
+            out="$(patch -p1 --batch --forward -F"${fuzz}" --no-backup-if-mismatch < "${f}")"
+            echo "::  applied with fuzz ${fuzz} (allowed): ${p}"
+            echo "${out}" | grep -E 'with fuzz|offset' | sed 's/^/::    /' || true
+        fi
         n=$((n + 1))
     done < "${repo}/patches/series.generated"
 
@@ -99,62 +134,117 @@ prepare() {
         fi
         return 1
     fi
-    echo "::  applied ${n} patches to ${_base}"
+    if [ ${#already[@]} -gt 0 ]; then
+        echo "::  ${#already[@]} patch(es) were already in ${_srcname} -- see the lines above."
+        echo "::  On a cachyos base that is expected for the OGC scheduler block. If it"
+        echo "::  covers the whole selection, narrow patches/ogc.select or set USE_OGC=no."
+    fi
+    echo "::  applied ${n} patches to ${_srcname}, ${#already[@]} already present"
 
     # ---- device trees ------------------------------------------------------
-    # Board DTS do not exist in mainline, so armada vendors them verbatim and
-    # ships a delta patch alongside. They are copied in after the series rather
-    # than being part of it, because the copy has to happen before the delta.
-    local dev dts dtsbase
-    install -d arch/arm64/boot/dts/qcom
-    for dev in ${_devices}; do
-        DTS=(); DTS_DELTA=(); DTB=()
-        # shellcheck source=/dev/null
-        source "${repo}/devices/${dev}.conf"
+    # Board DTS that are not in mainline: armada vendors them verbatim plus a
+    # delta patch. Copied in after the series, because the copy has to precede
+    # the delta. Lists come from the product conf; a board whose .dts is already
+    # in the tree appears in DTB and not in DTS.
+    local dts dtsbase
+    # shellcheck source=/dev/null
+    DTS=(); DTS_DELTA=(); DTB=(); source "${repo}/products/${_product}.conf"
 
-        for dts in "${DTS[@]}"; do
-            install -Dm644 "${repo}/dts/${dts}" "arch/arm64/boot/dts/qcom/${dts}"
-        done
-        for dts in "${DTS_DELTA[@]}"; do
-            patch -p1 -F0 --no-backup-if-mismatch -s < "${repo}/dts/${dts}"
-        done
-        # Register the boards so `make dtbs` builds them.
-        for dts in "${DTS[@]}"; do
-            [[ "${dts}" == *.dts ]] || continue     # .dtsi are included, not built
-            dtsbase="${dts%.dts}"
-            grep -q "${dtsbase}.dtb" arch/arm64/boot/dts/qcom/Makefile \
-                || echo "dtb-\$(CONFIG_ARCH_QCOM) += ${dtsbase}.dtb" >> arch/arm64/boot/dts/qcom/Makefile
-        done
-        echo "::  ${dev}: ${#DTS[@]} device tree source(s), ${#DTB[@]} dtb(s)"
+    install -d arch/arm64/boot/dts/qcom
+    for dts in "${DTS[@]}"; do
+        install -Dm644 "${repo}/dts/${dts}" "arch/arm64/boot/dts/qcom/${dts}"
     done
+    for dts in "${DTS_DELTA[@]}"; do
+        patch -p1 -F0 --no-backup-if-mismatch -s < "${repo}/dts/${dts}"
+    done
+    # Register the vendored boards so `make dtbs` builds them. Anything already
+    # in the tree is already in this Makefile, which is what the grep guards.
+    for dts in "${DTS[@]}"; do
+        [[ "${dts}" == *.dts ]] || continue     # .dtsi are included, not built
+        dtsbase="${dts%.dts}"
+        grep -q "${dtsbase}.dtb" arch/arm64/boot/dts/qcom/Makefile \
+            || echo "dtb-\$(CONFIG_ARCH_QCOM) += ${dtsbase}.dtb" >> arch/arm64/boot/dts/qcom/Makefile
+    done
+    echo "::  ${#DTS[@]} vendored device tree source(s), ${#DTB[@]} dtb(s) to ship"
 
     # ---- config ------------------------------------------------------------
-    # defconfig, then fragments in filename order: identity first, hardware
+    # A base, then fragments in filename order: identity first, hardware
     # enablement next, Arch userland last so it wins any collision.
-    make ARCH=arm64 defconfig > /dev/null
-    local frags=("${repo}"/config/*.config)
+    #
+    # _configbase is `defconfig` or a full .config committed in the repo. The
+    # second is for a product replacing a distro kernel: arm64 defconfig is
+    # thousands of symbols short of one, and olddefconfig is what resolves the
+    # symbols a full config from an older kernel does not mention yet
+    # (syncconfig, which `make prepare` would run, does not).
+    if [ "${_configbase}" = defconfig ]; then
+        make ARCH=arm64 defconfig > /dev/null
+    else
+        [ -f "${repo}/${_configbase}" ] \
+            || { echo "::  _configbase names ${_configbase}, which does not exist"; return 1; }
+        install -Dm644 "${repo}/${_configbase}" .config
+        make ARCH=arm64 olddefconfig > /dev/null
+        echo "::  base config: ${_configbase} ($(grep -c '^CONFIG_' .config) symbols after olddefconfig)"
+    fi
+    # Fragments come from the product's CONFIG_DIRS (via _configdirs), sorted by
+    # BASENAME across all of them -- so the numeric prefix keeps deciding merge
+    # order now that the files live in config/common/ and config/<product>/.
+    #
+    # Sorted explicitly rather than trusting the shell's glob order, which would
+    # merge all of common/ before all of handheld/ and silently invert the
+    # convention that 20-arch-userland gets the last word over 10-qcom-platform.
+    local -a frags=()
+    local cdir frag
+    for cdir in ${_configdirs}; do
+        [ -d "${repo}/config/${cdir}" ] \
+            || { echo "::  _configdirs names config/${cdir}, which does not exist"; return 1; }
+    done
+    while read -r frag; do frags+=("${frag}"); done < <(
+        for cdir in ${_configdirs}; do
+            for frag in "${repo}/config/${cdir}"/*.config; do
+                printf '%s\t%s\n' "$(basename "${frag}")" "${frag}"
+            done
+        done | LC_ALL=C sort -k1,1 | cut -f2-
+    )
+    [ ${#frags[@]} -gt 0 ] \
+        || { echo "::  no config fragments for _configdirs='${_configdirs}'"; return 1; }
+    echo "::  ${#frags[@]} config fragment(s) from: ${_configdirs}"
     ARCH=arm64 bash scripts/kconfig/merge_config.sh -m .config "${frags[@]}"
     make ARCH=arm64 olddefconfig > /dev/null
 
     # Verify every explicitly requested symbol actually survived.
     # merge_config.sh warns about overrides but exits 0, and a silently dropped
-    # CONFIG_DRM_MSM=y is a black screen you debug on the device instead of in
-    # CI. =m is checked as well as =y: an earlier version of this loop matched
-    # only '=y', so every module request went unverified and a fragment full of
-    # misspelled symbols could ship a handheld with no gamepad support and a
-    # clean build log. A =m request is satisfied by =y too -- something else may
-    # `select` it builtin, and "enabled, one way or the other" is the intent.
-    local missing=0 sym key want
-    while read -r sym; do
-        key="${sym%%=*}"
-        want="${sym#*=}"
+    # CONFIG_DRM_MSM=y is a black screen you debug on the device instead of in CI.
+    #
+    # Every FORM a fragment can request, because each one has its own way of
+    # going missing:
+    #
+    #   =y            must be y
+    #   =m            m or y -- something else may `select` it builtin, and
+    #                 "enabled either way" is the intent
+    #   ="str", =num  must match exactly. Not checking these is how an identity
+    #                 fragment asking for LOCALVERSION="-el2" can be overridden
+    #                 and still report success
+    #   is not set    must not be set to anything
+    local missing=0 line key want
+    while read -r line; do
+        case "${line}" in
+            '# CONFIG_'*' is not set')
+                key="${line#\# }"; key="${key%% is not set}"
+                ! grep -qE "^${key}=" .config \
+                    || { echo "::  STILL SET: ${key}=$(grep -E "^${key}=" .config | cut -d= -f2-)"; missing=1; }
+                continue ;;
+        esac
+        key="${line%%=*}"
+        want="${line#*=}"
         case "${want}" in
             y) grep -qx "${key}=y" .config \
-                   || { echo "::  NOT SET: ${sym}"; missing=1; } ;;
+                   || { echo "::  NOT SET: ${line}"; missing=1; } ;;
             m) grep -qE "^${key}=(y|m)$" .config \
-                   || { echo "::  NOT SET: ${sym} (neither =m nor =y)"; missing=1; } ;;
+                   || { echo "::  NOT SET: ${line} (neither =m nor =y)"; missing=1; } ;;
+            *) grep -qxF "${line}" .config \
+                   || { echo "::  NOT SET: ${line} (is: $(grep -E "^${key}=" .config || echo 'absent'))"; missing=1; } ;;
         esac
-    done < <(cat "${frags[@]}" | grep -E '^CONFIG_[A-Z0-9_]+=(y|m)$')
+    done < <(cat "${frags[@]}" | grep -E '^(CONFIG_[A-Z0-9_]+=.+|# CONFIG_[A-Z0-9_]+ is not set)$')
     [ "${missing}" = 0 ] || { echo "::  config fragments did not fully apply"; return 1; }
 
     # NOT `make kernelrelease > version` here, which is what Arch's own linux
@@ -174,13 +264,13 @@ prepare() {
 build() {
     cd "${srcdir}/${_srcdir}"
     # Explicit targets rather than `all`: on arm64 `all` resolves to KBUILD_IMAGE
-    # (Image.gz) and does not necessarily build the device trees, and the boot
-    # chain here wants an uncompressed Image anyway.
-    make ARCH=arm64 Image dtbs modules
+    # and does not necessarily build the device trees. Which image target is the
+    # product's choice (_kernelimage, default Image).
+    make ARCH=arm64 "${_kernelimage}" dtbs modules
 }
 
-package_linux-handheld-aarch64() {
-    pkgdesc="The Linux kernel for ARM handhelds (mainline ${_base} + handheld patch stack)"
+_package() {
+    pkgdesc="${_pkgdesc} -- ${_srcname}"
     # NOT depends=('initramfs'). Arch's own linux package requires it, but the
     # Odin 3 builds its storage stack in and never installs mkinitcpio; forcing
     # it would drag a generator onto a device that has nothing to generate. The
@@ -191,8 +281,10 @@ package_linux-handheld-aarch64() {
     optdepends=('linux-firmware: firmware for most devices'
                 'mkinitcpio: to generate an initramfs from the shipped preset'
                 'scx-scheds: sched_ext schedulers, incl. the latency-tuned scx_lavd')
-    # `provides` + `conflicts` on linux-aarch64 is what actually keeps ALARM's
-    # stock kernel out, and the two do different jobs:
+    provides=('KSMBD-MODULE' 'VIRTUALBOX-GUEST-MODULES' 'WIREGUARD-MODULE')
+
+    # Whether to displace ALARM's stock kernel, and the two halves do different
+    # jobs:
     #
     #   conflicts  pacman refuses to co-install the stock kernel. Without it a
     #              `pacman -Syu` that pulls linux-aarch64 in as somebody's
@@ -201,27 +293,33 @@ package_linux-handheld-aarch64() {
     #              then chooses alphabetically -- a coin flip.
     #   provides   anything that does depend on linux-aarch64 resolves to us
     #              instead of erroring out on the conflict.
-    provides=('KSMBD-MODULE' 'VIRTUALBOX-GUEST-MODULES' 'WIREGUARD-MODULE'
-              "linux-aarch64=${pkgver}" "linux=${pkgver}")
-    conflicts=('linux-aarch64')
+    #
+    # A product with _replacestock=no coexists with it instead -- which only
+    # works because its image, dtb directory and initramfs paths are all
+    # distinct; pacman refuses the install on any shared file.
+    if [ "${_replacestock}" = yes ]; then
+        provides+=("linux-aarch64=${pkgver}" "linux=${pkgver}")
+        conflicts=('linux-aarch64')
+    fi
 
     cd "${srcdir}/${_srcdir}"
     local repo; repo="$(_repo)"
     local kver; kver="$(<include/config/kernel.release)"
 
-    # The Odin 3 boot chain wants an UNCOMPRESSED Image at /boot/Image: the
-    # image builder gzips it itself and appends the DTBs, because that is what
-    # the ABL expects.
-    install -Dm644 arch/arm64/boot/Image "${pkgdir}/boot/Image"
+    # Which image and where it lands are the product's choice. The Odin 3 boot
+    # chain wants an UNCOMPRESSED Image at /boot/Image, because its image builder
+    # gzips it itself and appends the DTBs; a product booting through UEFI or a
+    # different loader sets KERNEL_IMAGE/KERNEL_IMAGE_DEST instead.
+    install -Dm644 "arch/arm64/boot/${_kernelimage}" "${pkgdir}${_kernelimagedest}"
 
-    local dev dtb
-    for dev in ${_devices}; do
-        DTB=()
-        # shellcheck source=/dev/null
-        source "${repo}/devices/${dev}.conf"
-        for dtb in "${DTB[@]}"; do
-            install -Dm644 "arch/arm64/boot/dts/qcom/${dtb}" "${pkgdir}/boot/dtb/qcom/${dtb}"
-        done
+    # DTB comes from the product conf, not from version.env: version.env records
+    # what was resolved, the conf is where the list is edited, and this is the
+    # only consumer that needs the array form.
+    local dtb
+    # shellcheck source=/dev/null
+    DTB=(); source "${repo}/products/${_product}.conf"
+    for dtb in "${DTB[@]}"; do
+        install -Dm644 "arch/arm64/boot/dts/qcom/${dtb}" "${pkgdir}${_dtbdest}/${dtb}"
     done
 
     # DEPMOD=/doesnt/exist skips running depmod at package time, which would
@@ -256,18 +354,20 @@ ALL_kver="${kver}"
 
 PRESETS=('default' 'fallback')
 
-default_image="/boot/initramfs-${pkgbase}.img"
+default_image="${_initramfs}"
 
-fallback_image="/boot/initramfs-${pkgbase}-fallback.img"
+fallback_image="${_initramfsfallback}"
 fallback_options="-S autodetect"
 PRESET
 }
 
-package_linux-handheld-aarch64-headers() {
+_package-headers() {
     pkgdesc="Headers and scripts for building modules against ${pkgbase}"
     depends=('pahole')
-    provides=("linux-aarch64-headers=${pkgver}" "linux-headers=${pkgver}")
-    conflicts=('linux-aarch64-headers')
+    if [ "${_replacestock}" = yes ]; then
+        provides=("linux-aarch64-headers=${pkgver}" "linux-headers=${pkgver}")
+        conflicts=('linux-aarch64-headers')
+    fi
 
     cd "${srcdir}/${_srcdir}"
     local kver; kver="$(<include/config/kernel.release)"
@@ -337,3 +437,19 @@ package_linux-handheld-aarch64-headers() {
         esac
     done < <(find "${builddir}" -type f -perm -u+x ! -name vmlinux -print0)
 }
+
+# ---- split-package glue -----------------------------------------------------
+# makepkg dispatches to package_<pkgname>() BY NAME, and pkgname is not known
+# until version.env is read -- so the builders above are defined under fixed
+# names (_package, _package-headers) and bound to the real ones here. Same idiom
+# as Arch's own multi-flavour kernel PKGBUILDs.
+#
+# ${_p#$pkgbase} is the suffix: empty for the kernel package, "-headers" for the
+# other, which is why the helpers are named for the suffix.
+for _p in "${pkgname[@]}"; do
+    eval "package_${_p}() {
+        $(declare -f "_package${_p#$pkgbase}")
+        _package${_p#$pkgbase}
+    }"
+done
+unset -v _p

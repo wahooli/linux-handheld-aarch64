@@ -11,7 +11,7 @@ itself invalid:
     Invalid workflow file: The expression is not closed. An unescaped ${{
     sequence was found, but the closing }} sequence was not found.
 
-Two checks:
+Three checks:
 
   1. Every workflow parses as YAML.
 
@@ -24,6 +24,7 @@ Two checks:
 """
 import glob
 import re
+import subprocess
 import sys
 
 import yaml
@@ -67,6 +68,36 @@ def main() -> int:
                     f"Put the whole condition inside a single expression."
                 )
                 bad += 1
+
+        # 3. Every bash `run:` block parses as shell. A workflow is mostly shell
+        #    pasted into YAML, and YAML validity says nothing about it: a
+        #    misquoted apostrophe cost one pushed run with
+        #    "syntax error near unexpected token `('".
+        #
+        #    ${{ }} is substituted before the shell ever sees it, so it is
+        #    replaced with a bare token here rather than left to confuse bash.
+        try:
+            doc = yaml.safe_load(open(path)) or {}
+        except Exception:
+            continue
+        for jobname, job in (doc.get("jobs") or {}).items():
+            for n, step in enumerate(job.get("steps") or []):
+                script = step.get("run")
+                if not script:
+                    continue
+                shell = step.get("shell") or (job.get("defaults", {})
+                                              .get("run", {}).get("shell")) or "bash"
+                if shell not in ("bash", "sh", "bash -e {0}"):
+                    continue
+                stub = EXPR.sub("EXPR", script)
+                proc = subprocess.run(["bash", "-n"], input=stub,
+                                      text=True, capture_output=True)
+                if proc.returncode != 0:
+                    label = step.get("name") or f"step {n}"
+                    msg = proc.stderr.strip().splitlines()[-1] if proc.stderr else "?"
+                    print(f"::error file={path}::{jobname} / {label}: "
+                          f"run block is not valid shell -- {msg}")
+                    bad += 1
 
         print(f"ok   {path}")
 

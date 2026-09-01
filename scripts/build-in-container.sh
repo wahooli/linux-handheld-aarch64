@@ -60,4 +60,5 @@ exec setpriv --reuid=build --regid=build --init-groups \
                  PKGDEST=/work/out \
                  SRCDEST=/work/.cache \
                  SRCNAME="${SRCNAME}" \
+                 NOBUILD="${NOBUILD:-}" \
     bash -euo pipefail /work/scripts/makepkg-and-report.sh
