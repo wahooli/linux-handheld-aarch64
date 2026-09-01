@@ -53,14 +53,16 @@ if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
     exit 1
 fi
 
-git config user.name  "${GIT_AUTHOR_NAME:-github-actions[bot]}"
-git config user.email "${GIT_AUTHOR_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}"
+TAGGER_NAME="${GIT_AUTHOR_NAME:-github-actions[bot]}"
+TAGGER_EMAIL="${GIT_AUTHOR_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}"
+git config user.name  "${TAGGER_NAME}"
+git config user.email "${TAGGER_EMAIL}"
 
 # The message carries the RESOLVED refs rather than whatever sources.env said at
 # checkout time. armada is tracked by moving subtree HEAD, so without this there
 # is no way to answer "which armada commit is on the kernel my device is
 # running?" once retention has pruned the package.
-git tag -a "${TAG}" -F - <<MSG
+MSG="$(cat <<MSG
 ${_pkgbase} ${pkgver}-${pkgrel}
 
 product       ${_product}
@@ -75,8 +77,48 @@ config        ${_configdirs}
 dtbs          ${_dtbs}
 committed     ${NCOMMITTED} patch(es) in patches/${_product}/
 MSG
+)"
 
-git push origin "${TAG}"
+# Created through the Git Data API, not `git push origin "${TAG}"`, and that is
+# not a style choice. GitHub diffs a pushed tag ref against the DEFAULT BRANCH
+# rather than against the tag's own history, so tagging any commit that main has
+# since moved past reads as a workflow edit and the push is rejected:
+#
+#   ! [remote rejected] el2/v7.2.2.cachy1-1 (refusing to allow a GitHub App to
+#     create or update workflow `.github/workflows/check.yml` without
+#     `workflows` permission)
+#
+# That is unfixable from the workflow: GITHUB_TOKEN has no `workflows`
+# permission to grant, and the build job pins its checkout to github.sha on
+# purpose (it must tag the tree the packages were built from, not whatever main
+# has become). The API creates the identical annotated tag object against a
+# commit that already exists server-side, so no file write is implied and
+# `contents: write` is enough.
+#
+# The git path stays for local runs, where the pusher is a human with a PAT or
+# an SSH key and none of the above applies.
+if command -v gh >/dev/null && [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
+    command -v jq >/dev/null || { echo "!! jq is required to create the tag via the API" >&2; exit 1; }
+    REPO="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
+    TAGOBJ="$(jq -n \
+        --arg tag "${TAG}" \
+        --arg message "${MSG}" \
+        --arg object "$(git rev-parse HEAD)" \
+        --arg name "${TAGGER_NAME}" \
+        --arg email "${TAGGER_EMAIL}" \
+        --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{tag:$tag, message:$message, object:$object, type:"commit",
+          tagger:{name:$name, email:$email, date:$date}}' \
+        | gh api "repos/${REPO}/git/tags" --input - --jq .sha)"
+    gh api "repos/${REPO}/git/refs" \
+        -f "ref=refs/tags/${TAG}" -f "sha=${TAGOBJ}" >/dev/null
+    # Bring the ref back so this checkout agrees with the remote -- re-creating
+    # it locally would mint a second tag object with a different timestamp.
+    git fetch -q origin "refs/tags/${TAG}:refs/tags/${TAG}" || true
+else
+    git tag -a "${TAG}" -F - <<< "${MSG}"
+    git push origin "${TAG}"
+fi
 echo "==> tagged ${TAG}"
 
 command -v gh >/dev/null || { echo "   (gh not available; skipping release)"; exit 0; }

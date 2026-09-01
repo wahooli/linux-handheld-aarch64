@@ -471,6 +471,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          rc=0
           for d in artifacts/product-*/; do
             [ -f "${d}version.env" ] || continue
             cp "${d}version.env" version.env
@@ -485,8 +486,15 @@ jobs:
               continue
             fi
             echo "==> tagging ${p}"
-            PRODUCT="${p}" ./scripts/tag-release.sh
+            # Not fatal on the spot. The products publish together but tag
+            # independently, and aborting here left the SECOND product of a
+            # two-product run untagged because the first one's push was
+            # rejected -- an unpublished-looking product whose packages are
+            # live in R2. Tag everything, then fail.
+            PRODUCT="${p}" ./scripts/tag-release.sh \
+              || { echo "::error::${p}: tag/release failed"; rc=1; }
           done
+          exit "${rc}"
 
       # No build-failure issue here: report-failure.sh reports a PRODUCT's patch
       # stack, and a publish failure is not product-specific. It is also
