@@ -59,7 +59,13 @@ jobs:
       - name: Summary
         if: ${{ !cancelled() }}
         run: |
-          if [ "${{ steps.poll.outputs.changed }}" = "true" ]; then
+          if [ "${{ steps.poll.outcome }}" = "failure" ]; then
+            # Most likely a refused bump: the poller resolves the new OGC tag to
+            # a kernel.org tarball before committing, and exits nonzero if it is
+            # not there. sources.env is untouched, so main keeps the last good
+            # pin -- do not let this read as "nothing moved".
+            echo "Poll failed; sources.env unchanged. See the log." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.poll.outputs.changed }}" = "true" ]; then
             echo "Bumped: ${{ steps.poll.outputs.summary }}" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "Build dispatched." >> "$GITHUB_STEP_SUMMARY"
