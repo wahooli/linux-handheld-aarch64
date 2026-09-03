@@ -4,11 +4,10 @@
 #
 #   REPO_URL=https://repo.wahoo.li scripts/verify-repo.sh
 #
-# Run this after the first publish. It exercises what a device does -- fetch the
-# database, fetch the key, verify a package signature -- rather than what the
-# publisher does, so it catches the things a successful upload cannot: a bucket
-# that is not actually public, a custom domain that resolves but is not bound, a
-# database that shipped unsigned, cache headers that pin a stale index.
+# Run this after the first publish. It does what a device does -- fetch the
+# database, fetch the key, verify a signature -- so it catches what a successful
+# upload cannot: a bucket that is not public, a domain that resolves but is not
+# bound, a database that shipped unsigned, cache headers pinning a stale index.
 #
 # Needs only curl and gpg. Safe to run from anywhere, including the device.
 set -euo pipefail
@@ -30,18 +29,17 @@ W="$(mktemp -d)"; trap 'rm -rf "${W}"' EXIT
 
 echo "==> ${REPO_URL}"
 
-# 1. The database, by the name pacman actually asks for. repo-add leaves this as
-#    a symlink locally; if the publish uploaded the link rather than its target
-#    this 404s while <repo>.db.tar.gz is fine -- a failure mode invisible to the
-#    publisher.
+# 1. By the name pacman asks for. repo-add leaves this as a symlink locally, so a
+#    publish that uploaded the link rather than its target 404s here while
+#    <repo>.db.tar.gz is fine.
 if curl -fsL --max-time 60 -o "${W}/db" "${REPO_URL}/${ARCH_DIR}/${REPO_NAME}.db"; then
     ok "${REPO_NAME}.db  ($(stat -c%s "${W}/db") bytes)"
 else
     bad "${REPO_NAME}.db is not reachable -- bucket not public, or domain not bound to it?"
 fi
 
-# 2. Its signature. A missing .db.sig is the silent-unsigned-database failure:
-#    a client on DatabaseOptional accepts it and never tells you.
+# 2. A missing .db.sig is the silent-unsigned-database failure: a client on
+#    DatabaseOptional accepts it and never tells you.
 if curl -fsL --max-time 60 -o "${W}/db.sig" "${REPO_URL}/${ARCH_DIR}/${REPO_NAME}.db.sig"; then
     ok "${REPO_NAME}.db.sig present"
 else
@@ -67,9 +65,8 @@ else
     bad "${REPO_NAME}.gpg missing at the bucket root -- devices cannot bootstrap trust"
 fi
 
-# 4. Cache headers. Getting these backwards is the nastiest failure here: an
-#    edge-cached database keeps pointing at packages retention has already
-#    pruned, and it self-heals only when the cache expires.
+# 4. Getting these backwards leaves an edge-cached database pointing at packages
+#    retention has already pruned, and it self-heals only when the cache expires.
 hdr="$(curl -fsI --max-time 60 "${REPO_URL}/${ARCH_DIR}/${REPO_NAME}.db" 2>/dev/null || true)"
 cc="$(grep -i '^cache-control:' <<< "${hdr}" | tr -d '\r' | cut -d' ' -f2- || true)"
 case "${cc}" in
@@ -78,15 +75,15 @@ case "${cc}" in
     *)                              ok  "database Cache-Control: ${cc}" ;;
 esac
 
-# 5. A real package, end to end: pull one name out of the database and verify
-#    that both it and its detached signature are fetchable and valid.
+# 5. Pull one package name out of the database and check that it and its
+#    detached signature are both fetchable.
 if [ -f "${W}/db" ] && command -v bsdtar >/dev/null; then
     mkdir -p "${W}/x"
     bsdtar -xf "${W}/db" -C "${W}/x" 2>/dev/null || true
     pkgfile="$(grep -rhA1 '^%FILENAME%$' "${W}/x" 2>/dev/null | grep -m1 '\.pkg\.tar\.zst$' || true)"
     if [ -n "${pkgfile}" ]; then
         ok "database indexes ${pkgfile}"
-        # HEAD only -- no reason to pull 160 MB to prove the object exists.
+        # HEAD only: no reason to pull 160 MB to prove the object exists.
         if curl -fsI --max-time 60 -o /dev/null "${REPO_URL}/${ARCH_DIR}/${pkgfile}"; then
             ok "package object reachable"
         else

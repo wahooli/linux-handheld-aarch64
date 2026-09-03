@@ -3,28 +3,22 @@
 # Check the upstreams every product depends on for movement, and rewrite
 # sources.env if any moved.
 #
-# Prints a report and exits 0 either way. Whether a build follows is the
-# workflow's decision, not this script's -- it only reports, via the lines it
-# appends to $GITHUB_OUTPUT.
+# Prints a report and exits 0 either way; whether a build follows is the
+# workflow's decision, made from the lines appended to $GITHUB_OUTPUT.
 #
-# WHICH upstreams get polled depends on what the products actually use. A source
-# nothing selects is not polled and not reported: bumping a ref no build reads
-# would produce a commit, a dispatched build, and an identical kernel. That is
-# how the OGC ref used to move the whole pipeline after the base swap made it
-# unused.
+# Only upstreams some product actually uses are polled -- bumping a ref no build
+# reads produces a commit, a dispatched build and an identical kernel:
 #
-#   CachyOS  highest stable cachyos-X.Y[.Z]-N release, by version and not by
-#            date -- LTS (6.18.x) and -rc tags are deliberately passed over
+#   CachyOS  highest stable cachyos-X.Y[.Z]-N release, by version not by date,
+#            so LTS and -rc tags are passed over
 #   OGC      highest mainline-stable vX.Y[.Z]-ogcN release, same reasoning
-#   ROCKNIX  latest release tag        (monthly cadence)
-#   armada   newest commit touching kernel/, because armada-packages publishes
-#            no tags or releases at all -- the patches only exist as commits on
-#            main. Its kernel/ subtree moves roughly two or three times a week,
-#            which is why this watches the subtree and not the branch head:
-#            watching the branch would fire on every gamescope commit too.
+#   ROCKNIX  latest release tag (monthly cadence)
+#   armada   newest commit touching kernel/ -- armada-packages publishes no tags
+#            at all, and watching the branch head would fire on every unrelated
+#            commit
 #
-# kernel.org is NOT polled: KERNELORG_REF is pinned by hand, because a product on
-# that base exists to be held still while something else is under suspicion.
+# kernel.org is not polled: KERNELORG_REF is pinned by hand, because a product on
+# that base exists to be held still.
 #
 # Auth: GH_TOKEN if set, else anonymous (60 req/h, which is plenty).
 set -euo pipefail
@@ -48,7 +42,7 @@ gh_get() {
 # ---------------------------------------------------------------------------
 # Which sources are in use, across every product
 # ---------------------------------------------------------------------------
-# Each conf is read in a SUBSHELL: they set the same variable names, so sourcing
+# Each conf is read in a subshell: they set the same variable names, so sourcing
 # two here would leave the last one's values standing.
 uses_cachyos=; uses_ogc=; uses_armada=; uses_rocknix=; product_list=()
 for _p in ${PRODUCTS}; do
@@ -75,14 +69,13 @@ new_armada="${ARMADA_REF:-}";   new_rocknix="${ROCKNIX_REF:-}"
 # ---------------------------------------------------------------------------
 # Two traps, same as OGC:
 #
-#   LTS  CachyOS tags LTS maintenance releases alongside mainline
-#        (cachyos-6.18.48-2 published after cachyos-7.2.2-1), so picking by
-#        publication date walks the base backwards.
+#   LTS  LTS maintenance releases are tagged alongside mainline, so picking by
+#        publication date walks the base backwards
 #   rc   cachyos-7.3-rc1-2 is not flagged prerelease, so the API flag does not
-#        hold it back; the numeric-only pattern excludes it instead.
+#        hold it back; the numeric-only pattern excludes it instead
 #
 # Ordered by [major, minor, patch, tagrel], so a new tag revision of the same
-# kernel (-1 -> -2, a rebase of CachyOS's branches) counts as movement.
+# kernel counts as movement.
 if [ -n "${uses_cachyos}" ]; then
     cachy_json="$(gh_get "${API}/repos/CachyOS/linux/releases?per_page=100")"
     new_cachyos="$(jq -r '
@@ -102,9 +95,8 @@ if [ -n "${uses_cachyos}" ]; then
     [ "${newest_any}" != "${new_cachyos}" ] && \
         echo "    (CachyOS's newest release ${newest_any} is not mainline stable; taking ${new_cachyos})"
 
-    # The release must actually carry the two assets the build downloads. A tag
-    # whose upload is still in flight, or that ships a different asset name,
-    # otherwise fails fifty minutes into a build instead of here.
+    # The release must carry the two assets the build downloads: a tag whose
+    # upload is still in flight otherwise fails fifty minutes into a build.
     if [ "${new_cachyos}" != "${CACHYOS_REF}" ]; then
         base_url="https://github.com/CachyOS/linux/releases/download/${new_cachyos}/${new_cachyos}.tar.gz"
         for u in "${base_url}" "${base_url}.asc"; do
@@ -142,10 +134,8 @@ if [ -n "${uses_ogc}" ]; then
     [ "${newest_ogc}" != "${new_ogc}" ] && \
         echo "    (OGC's newest release ${newest_ogc} is not mainline stable; taking ${new_ogc})"
 
-    # An OGC bump only implies a kernel.org tarball for a product that derives
-    # its base from the tag -- i.e. KERNEL_SOURCE=kernel.org with no explicit
-    # ref. On a cachyos product the tag supplies patches only, and the base is
-    # untouched, so there is nothing to resolve.
+    # An OGC bump only implies a kernel.org tarball for a product that derives its
+    # base from the tag. On a cachyos product it supplies patches only.
     if [ "${new_ogc}" != "${OGC_REF}" ] && [ -z "${KERNELORG_REF:-}" ] && [ -z "${BASE_VERSION:-}" ]; then
         if [[ "${new_ogc}" =~ ^v?(.+)-ogc[0-9]+$ ]]; then
             b="${BASH_REMATCH[1]}"; km="${b%%.*}"
@@ -203,16 +193,15 @@ if [ ${#changed[@]} -eq 0 ]; then
     exit 0
 fi
 
-# Rewrite in place, touching only the values that moved. sed rather than
-# regenerating the file, because the comments in sources.env are the
-# documentation for what each ref means and they must survive an automated edit.
+# sed rather than regenerating the file: the comments in sources.env document
+# what each ref means and have to survive an automated edit.
 [ -n "${uses_cachyos}" ] && sed -i "s|^CACHYOS_REF=.*|CACHYOS_REF=${new_cachyos}|" sources.env
 [ -n "${uses_ogc}" ]     && sed -i "s|^OGC_REF=.*|OGC_REF=${new_ogc}|"             sources.env
 [ -n "${uses_armada}" ]  && sed -i "s|^ARMADA_REF=.*|ARMADA_REF=${new_armada}|"    sources.env
 [ -n "${uses_rocknix}" ] && sed -i "s|^ROCKNIX_REF=.*|ROCKNIX_REF=${new_rocknix}|" sources.env
 
-# Re-read to prove the edits landed; a silently-failed sed would otherwise mean
-# the poller commits nothing and reports success forever.
+# Prove the edits landed: a silently failed sed means the poller commits nothing
+# and reports success forever.
 # shellcheck source=/dev/null
 ( source ./sources.env
   [ -z "${uses_cachyos}" ] || [ "${CACHYOS_REF}" = "${new_cachyos}" ] || exit 1

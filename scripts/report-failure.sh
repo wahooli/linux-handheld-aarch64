@@ -13,10 +13,9 @@ lp_load "${HERE}"
 
 command -v gh >/dev/null || { echo "!! gh not available" >&2; exit 0; }
 
-# Runs ON FAILURE, so it must survive version.env not existing -- a broken fetch
-# is a likely reason to be here. When it does exist its RESOLVED values are what
-# the build used; otherwise fall back to what the product conf asked for. An
-# unbound variable here means a build failure with no issue and no explanation.
+# Must survive version.env not existing -- a broken fetch is a likely reason to
+# be here. When it does exist, its resolved values are what the build used;
+# otherwise fall back to what the product conf asked for.
 if [ -f version.env ]; then
     # shellcheck source=/dev/null
     source ./version.env
@@ -29,15 +28,13 @@ else
     resolved="requested; version.env was never written, so the failure is at or before fetch"
 fi
 
-# Precomputed rather than expanded in the heredoc: the body is an UNQUOTED
-# heredoc, so every backtick in it has to be escaped, and a conditional built out
-# of escaped backticks is unreadable. A variable's expansion is not rescanned for
-# command substitution, so the backticks are safe in here.
+# Precomputed rather than expanded in the unquoted heredoc below, where every
+# backtick would need escaping. A variable's expansion is not rescanned for
+# command substitution, so backticks are safe here.
 if [ "${USE_OGC}" = yes ]; then ogc_cell="\`${OGC_REF}\`"; else ogc_cell="off for this product"; fi
 
-# The advice for a failed UPSTREAM patch depends on whether this product has an
-# upstream to wait for. With USE_ARMADA=no every patch is committed here, and
-# telling the reader to wait for an armada rebase would send them nowhere.
+# The advice depends on whether this product has an upstream to wait for: with
+# USE_ARMADA=no every patch is committed here.
 if [ "${USE_ARMADA}" = yes ]; then
     UPSTREAM_ADVICE="**If upstream patches stopped applying** this is a base bump the device stack has
 not caught up with. armada rebases its stack onto new mainline releases on its own
@@ -52,8 +49,7 @@ was last on. Either pin \`CACHY_PATCHES_REF\` back, or set \`CACHY_SCHED=\` in
 \`products/${PRODUCT}.conf\` to drop it -- everything else here is committed."
 fi
 
-# The product is in the title so two products' failures dedupe separately -- one
-# broken stack must not silence the other's report.
+# The product is in the title so two products' failures dedupe separately.
 title="build failed: ${PRODUCT} / base ${base_short}"
 
 body="$(cat <<BODY

@@ -4,10 +4,9 @@
 # R2 -- the build job needs it for next-pkgrel.sh's listing, the publish job for
 # the upload -- so the version and its checksum live in one place.
 #
-# NOT from apt: Ubuntu 24.04 ships 1.60.1, an October 2022 build from before much
-# of the R2 compatibility work. NOT piped from install.sh either: these jobs run
-# with the repo signing key and R2 credentials in scope, so the tarball is
-# checksum-verified before it is trusted.
+# Not from apt: Ubuntu 24.04 ships 1.60.1, from before much of the R2
+# compatibility work. Not piped from install.sh either -- these jobs run with the
+# signing key and R2 credentials in scope, so the tarball is checksum-verified.
 set -euo pipefail
 
 RCLONE_VER="${RCLONE_VER:-v1.75.0}"

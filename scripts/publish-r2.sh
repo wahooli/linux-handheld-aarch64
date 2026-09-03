@@ -13,19 +13,17 @@
 #   DRY_RUN=1                       do everything except write to R2
 #   CHECK_ONLY=1                    only prove the credentials work, then exit
 #
-# CHECK_ONLY exists because DRY_RUN deliberately touches no network, so without
-# it the first thing that ever exercises the R2 token is a real publish -- at the
-# end of a 40-minute kernel build. It does a write/read/delete round trip, which
-# is the only way to tell a working token from one created with the wrong
-# permission level or scoped to a different bucket.
+# CHECK_ONLY exists because DRY_RUN touches no network, so without it the first
+# thing to exercise the R2 token is a real publish at the end of a 40-minute
+# build. Its write/read/delete round trip is the only way to tell a working token
+# from one with the wrong permission level or scoped to another bucket.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${HERE}"
 
-# One pacman database serves every product: different pkgbase, no collisions, and
-# a device adds one [handheld] section whichever kernel it installs. RETAIN is
-# per PACKAGE NAME, not per repository.
+# One pacman database serves every product: different pkgbase, no collisions.
+# RETAIN is per package name, not per repository.
 REPO_NAME="${REPO_NAME:-handheld}"
 RETAIN="${RETAIN:-5}"
 ARCH_DIR="aarch64"
@@ -38,17 +36,14 @@ done
 command -v rclone >/dev/null || { echo "!! rclone not found" >&2; exit 1; }
 
 # ── which repo-add ──────────────────────────────────────────────────────────
-# Prefer the builder image's, because its pacman is the one that built these
-# packages. The host's is whatever the platform ships, and on GitHub's Ubuntu
-# runners `pacman-package-manager` is 6.0.2 while Arch is on 7.1.0 -- old enough
-# not to know --include-sigs, and old repo-add does not reject unknown options,
-# it treats them as the database filename:
-#     ERROR: '--include-sigs' does not have a valid database archive extension.
-# Pinning to the container removes the whole class of version-skew bugs here,
-# not just that flag.
+# Prefer the builder image's: its pacman is the one that built these packages.
+# GitHub's Ubuntu runners ship pacman 6.0.2 against Arch's 7.1.0, old enough not
+# to know --include-sigs -- and old repo-add treats an unknown option as the
+# database filename rather than rejecting it. The container removes the whole
+# class of version-skew bugs here.
 #
-# No signing happens in the container: repo-add is called without --sign and the
-# key is never mounted. The database is signed afterwards, on the host.
+# No signing happens in the container: repo-add runs without --sign and the key
+# is never mounted. The database is signed afterwards, on the host.
 IMAGE="${IMAGE:-linux-handheld-builder:latest}"
 if command -v docker >/dev/null 2>&1 && docker image inspect "${IMAGE}" >/dev/null 2>&1; then
     REPO_ADD_IN_CONTAINER=1
@@ -80,30 +75,16 @@ export RCLONE_CONFIG_R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}"
 export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}"
 export RCLONE_CONFIG_R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 export RCLONE_CONFIG_R2_ACL=private
-# R2 does not implement multipart ETags the way rclone's default checksum
-# handling expects; without this, every upload is followed by a failed verify.
-# no-check-bucket, set BOTH ways on purpose.
-#
-# Without it rclone issues `PUT /<bucket>` -- a CreateBucket call -- before every
-# upload, and R2 does not implement CreateBucket:
-#     ERROR : <file>: Failed to copy: NotImplemented: Not Implemented
-#     status code: 501
-# Each file is a separate rclone process, so the bucket check is not cached
-# between them: every object failed once and succeeded on the retry. Verified
-# against a fake S3 that logs requests -- unset, rclone sends the bucket-level
-# PUT; set, it goes straight to PUT /<bucket>/<key>?x-id=PutObject.
-#
-# The backend-wide RCLONE_S3_* form alone did not take on the rclone 1.60.1 that
-# Ubuntu 24.04 ships, when the remote is defined entirely by RCLONE_CONFIG_R2_*
-# env vars rather than a config file. The remote-scoped form binds to this
-# specific remote and is the one that matters; the other is kept because it costs
-# nothing and covers any rclone that prefers it.
+# no-check-bucket, set both ways on purpose. Without it rclone issues a
+# CreateBucket call before every upload and R2 answers 501, so every object fails
+# once and succeeds on the retry. The backend-wide RCLONE_S3_* form alone does
+# not take on the rclone 1.60.1 Ubuntu 24.04 ships when the remote is defined
+# entirely by env vars; the remote-scoped form is the one that binds.
 export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
 export RCLONE_S3_NO_CHECK_BUCKET=true
 export RCLONE_S3_UPLOAD_CUTOFF=5G
-# Fail fast on an unreachable or misconfigured endpoint. rclone's defaults retry
-# for minutes, which in CI reads as a hung publish rather than as a bad secret --
-# and the point of this job is that failures are loud and quick.
+# Fail fast: rclone's defaults retry for minutes, which in CI reads as a hung
+# publish rather than as a bad secret.
 export RCLONE_RETRIES=2
 export RCLONE_LOW_LEVEL_RETRIES=2
 export RCLONE_CONTIMEOUT=15s
@@ -158,27 +139,25 @@ for p in "${PKGS[@]}"; do
     [ -f "${p}.sig" ] || gpg_sign "${p}"
 done
 
-# The bootstrap key, published at the bucket root so a device with no keyring
-# yet can `pacman-key --add` it over https before trusting anything.
+# The bootstrap key, published at the bucket root so a device with no keyring can
+# `pacman-key --add` it over https before trusting anything.
 gpg --batch --yes --export --output "${WORK}/${REPO_NAME}.gpg" "${GPGKEY}"
 
 # --------------------------------------------------------------------------
 # 2. Refuse to overwrite a filename that is already published
 # --------------------------------------------------------------------------
-# Objects are served `Cache-Control: immutable`, so a filename is a promise that
-# its bytes never change. Overwrite one and the edge keeps serving the previous
-# build while the database (max-age=60) already carries the new sha256 and
-# signature; the device then reports "invalid or corrupted package (PGP
-# signature)" and cannot clear it, because the staleness is at the edge.
+# Objects are served `Cache-Control: immutable`, so a filename promises its bytes
+# never change. Overwrite one and the edge keeps serving the previous build while
+# the database (max-age=60) already carries the new sha256; the device reports
+# "invalid or corrupted package (PGP signature)" and cannot clear it.
 #
-# next-pkgrel.sh is the primary defence. This is the backstop for the paths that
-# bypass it: a hand-written version.env, a re-run whose pkgrel step was skipped,
-# a deliberately pinned pkgrel.
+# next-pkgrel.sh is the primary defence; this is the backstop for the paths that
+# bypass it (a hand-written version.env, a pinned pkgrel).
 #
 # Identical bytes pass, so re-running a half-failed publish stays idempotent.
-# Hashes come from ONE rclone listing rather than a HEAD per package; R2 returns
-# the md5 as the etag for the single-part uploads this script makes
-# (UPLOAD_CUTOFF=5G), so it is comparable to md5sum here.
+# Hashes come from one rclone listing rather than a HEAD per package: R2 returns
+# the md5 as the etag for single-part uploads, which is what this makes
+# (UPLOAD_CUTOFF=5G).
 if [ -z "${DRY_RUN}" ]; then
     echo "==> checking that no published filename is being overwritten"
     declare -A REMOTE_MD5=()
@@ -197,10 +176,8 @@ if [ -z "${DRY_RUN}" ]; then
         b="$(basename "${p}")"
         [ -n "${REMOTE_MD5[${b}]+x}" ] || continue          # not published yet
         local_md5="$(md5sum "${p}" | cut -d' ' -f1)"
-        # An empty remote hash means the object exists but R2 gave no md5 for it
-        # (a multipart upload from some other tool). Unknown is not "the same":
-        # treat it as a clash, because the cost of being wrong is a device that
-        # cannot install anything.
+        # An empty remote hash means the object exists but R2 gave no md5 (a
+        # multipart upload from another tool). Unknown is not "the same".
         [ -n "${REMOTE_MD5[${b}]}" ] && [ "${REMOTE_MD5[${b}]}" = "${local_md5}" ] && {
             echo "    ${b} is already published, byte-identical -- fine"
             continue
@@ -235,9 +212,9 @@ fi
 # 3. Pull the current database, fold the new packages in
 # --------------------------------------------------------------------------
 DB="${WORK}/db"; mkdir -p "${DB}"
-# A dry run must not need the network: it exists to check the signing and
-# database logic, and reaching for a bucket it will not write to only turns a
-# bad credential into a slow, confusing failure.
+# A dry run must not need the network: it checks the signing and database logic,
+# and reaching for a bucket it will not write to only turns a bad credential into
+# a slow, confusing failure.
 if [ -z "${DRY_RUN}" ]; then
     echo "==> fetching current ${REPO_NAME} database"
     rclone copy "${REMOTE}" "${DB}" \
@@ -251,24 +228,17 @@ cp "${PKGS[@]}" "${DB}/"
 for p in "${PKGS[@]}"; do cp "${p}.sig" "${DB}/"; done
 
 ( cd "${DB}"
-  # --include-sigs embeds each package's PGP signature in the database. Without
-  # it a client on SigLevel=Required has to fetch a separate .sig next to every
-  # package -- an extra request per install, and a hard failure if that object
-  # is missing for any reason. Arch's own repos include them.
+  # --include-sigs embeds each package's signature in the database, so a client
+  # on SigLevel=Required does not fetch a separate .sig per package.
   #
-  # No --remove: that deletes the superseded package FILE from disk, which here
-  # is a temp directory holding only the new packages, so it would do nothing --
-  # and retention is handled deliberately further down, against R2 rather than
-  # as a side effect. repo-add already replaces the database ENTRY for a package
-  # name regardless.
+  # No --remove: it deletes superseded package files from disk, which here is a
+  # temp directory holding only the new ones. Retention is handled against R2
+  # further down.
   #
-  # No --sign either, and that one is not cosmetic. repo-add shells out to gpg
-  # without loopback pinentry, so with a passphrase-protected key it prints
-  #     ==> WARNING: Failed to sign package database file
-  # and carries on to exit 0. The database then ships UNSIGNED, and a client on
-  # SigLevel=...DatabaseOptional accepts it without complaint -- a silent
-  # downgrade of exactly the thing signing was meant to guarantee. We sign it
-  # below with the same loopback path that already works for the packages.
+  # No --sign either, and that one is not cosmetic: repo-add shells out to gpg
+  # without loopback pinentry, so a passphrase-protected key gets a warning and
+  # exit 0 -- shipping an UNSIGNED database that DatabaseOptional clients accept
+  # without complaint. Signed below instead, via the working loopback path.
   if [ -n "${REPO_ADD_IN_CONTAINER}" ]; then
       docker run --rm -v "${DB}:/db" -w /db \
           --user "$(id -u):$(id -g)" -e HOME=/tmp \
@@ -278,10 +248,9 @@ for p in "${PKGS[@]}"; do cp "${p}.sig" "${DB}/"; done
       repo-add --quiet "${inc[@]}" "${REPO_NAME}.db.tar.gz" ./*.pkg.tar.zst
   fi
 
-  # repo-add leaves handheld.db and handheld.files as SYMLINKS to the .tar.gz
-  # files, and those are the names pacman actually fetches. rclone skips symlinks
-  # unless told otherwise, so materialise them as real files -- otherwise the
-  # upload silently omits the database a device asks for by name.
+  # repo-add leaves <repo>.db and <repo>.files as symlinks to the .tar.gz files,
+  # and those are the names pacman fetches. rclone skips symlinks, so materialise
+  # them or the upload silently omits the database a device asks for by name.
   for n in db files; do
       if [ -L "${REPO_NAME}.${n}" ]; then
           rm -f "${REPO_NAME}.${n}"
@@ -300,14 +269,13 @@ echo "==> database signed"
 # --------------------------------------------------------------------------
 # 4. Upload -- ORDER MATTERS
 # --------------------------------------------------------------------------
-# Packages first, database last. A client that runs `pacman -Sy` in the middle
-# of a publish must never receive a database that references a package which is
-# not there yet; the reverse (a package nothing points at) is harmless.
+# Packages first, database last: a `pacman -Sy` mid-publish must never get a
+# database referencing a package that is not there yet. The reverse -- a package
+# nothing points at -- is harmless.
 #
-# Cache headers matter too, because a custom domain puts Cloudflare's edge in
-# front of this. Packages are content-addressed by filename and never change,
-# so they can be cached forever. The database changes on every publish and must
-# not be, or devices get a stale index pointing at packages we have pruned.
+# Cache headers matter because a custom domain puts Cloudflare's edge in front of
+# this. Package filenames never change, so they cache forever; the database
+# changes every publish and must not, or devices get a stale index.
 echo "==> uploading packages"
 for p in "${PKGS[@]}"; do
     b="$(basename "${p}")"
@@ -331,31 +299,26 @@ rclone_ copyto "${WORK}/${REPO_NAME}.gpg" "R2:${R2_BUCKET}/${REPO_NAME}.gpg" \
 # 5. Prune -- last, and never below what the database references
 # --------------------------------------------------------------------------
 # Keep the newest RETAIN versions per package name so a bad kernel can be rolled
-# back on-device with `pacman -U <url>`. Pruning happens after the database is
-# live, so a client mid-sync never loses a file the index still points at.
+# back with `pacman -U <url>`. After the database is live, so a client mid-sync
+# never loses a file the index still points at.
 #
 # repo-add keeps only the newest version of each name in the database, so
-# `pacman -S` cannot reach an older one; retained packages are direct-URL
-# rollback targets only. Hence pruning must not touch the current build, and
-# RETAIN below 2 leaves nothing to roll back to.
+# retained packages are direct-URL rollback targets only -- which is why RETAIN
+# below 2 leaves nothing to roll back to.
 #
-# Deleting an object does not free its NAME -- the URL was served immutable, so
-# the edge can still answer for it. A pruned pkgrel must never be reissued, which
-# is why next-pkgrel.sh floors on git tags rather than on this listing.
+# Deleting an object does not free its name: the URL was served immutable, so the
+# edge can still answer for it. A pruned pkgrel must never be reissued, hence
+# next-pkgrel.sh floors on git tags rather than on this listing.
+
 # Sort pacman versions oldest-first.
 vercmp_sort() {
     local -a a=(); mapfile -t a
     [ ${#a[@]} -gt 0 ] || return 0
 
-    # Run the whole sort inside the builder container when it is available, for
-    # the same reason repo-add does: its pacman is the one that built these
-    # packages. Version-comparison semantics between pacman 6.0.2 (what Ubuntu
-    # ships) and 7.1.0 are exactly the sort of thing that differs quietly, and
-    # this decides what gets DELETED.
-    #
-    # One container invocation for the entire sort, not one per comparison --
-    # the insertion sort below is O(n^2) and a docker call per comparison would
-    # turn a millisecond into a minute.
+    # In the container when available, for the same reason repo-add is: version
+    # comparison differs quietly between pacman 6.0.2 and 7.1.0, and this decides
+    # what gets deleted. One invocation for the whole sort -- the insertion sort
+    # is O(n^2), so a docker call per comparison would take a minute.
     if [ -n "${REPO_ADD_IN_CONTAINER}" ]; then
         printf '%s\n' "${a[@]}" | docker run --rm -i "${IMAGE}" bash -c "$(_vercmp_sort_body)"
     else
@@ -363,16 +326,13 @@ vercmp_sort() {
     fi
 }
 
-# The sort itself, as a string so it can run here or in the container unchanged.
+# The sort itself, as a string so it runs here or in the container unchanged.
 #
-# vercmp is the authority on pacman's ordering and `sort -V` is not a substitute:
-# it places 7.2.ogc9 AFTER 7.2.1.ogc10, while pacman considers 7.2.ogc9 the older
-# of the two. Pruning with sort -V would delete the newest package and keep the
-# oldest the first time OGC moved to a new mainline base. (pacsort would do this
-# in one call, but pacman 7.x no longer ships it.)
-#
-# Insertion sort: n is a handful of versions, so O(n^2) with a subprocess per
-# comparison is still instant, and it is obviously correct at a glance.
+# `sort -V` is not a substitute for vercmp: it places 7.2.ogc9 after 7.2.1.ogc10,
+# while pacman considers 7.2.ogc9 the older -- so it would delete the newest
+# package the first time the base moved. (pacsort would do this in one call, but
+# pacman 7.x no longer ships it.) n is a handful of versions, so insertion sort
+# with a subprocess per comparison is still instant.
 _vercmp_sort_body() {
 cat <<'BODY'
 set -euo pipefail
@@ -392,9 +352,8 @@ BODY
 
 echo "==> pruning to the newest ${RETAIN} version(s) per package"
 if [ -n "${DRY_RUN}" ]; then
-    # Nothing was uploaded, so the only thing that could be there is what we just
-    # built. Pretend exactly that, so the grouping and the vercmp sort still get
-    # exercised without inventing remote state that does not exist.
+    # Nothing was uploaded, so pretend the remote holds exactly what was just
+    # built: the grouping and vercmp sort still get exercised.
     mapfile -t REMOTE_PKGS < <(for p in "${PKGS[@]}"; do basename "${p}"; done | sort)
 else
     mapfile -t REMOTE_PKGS < <(rclone lsf "${REMOTE}" --include '*.pkg.tar.zst' 2>/dev/null | sort)

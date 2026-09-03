@@ -1,14 +1,8 @@
 name: build
 
-# Triggers, and what each is for:
-#
-#   workflow_dispatch  manual, plus the poller's `gh workflow run` -- a push made
-#                      with GITHUB_TOKEN does not trigger other workflows, so the
-#                      poller commits sources.env and then dispatches explicitly.
-#   push               anything that changes what gets built: the pinned refs,
-#                      the product definitions, the manifests, the config, the
-#                      PKGBUILD, the scripts. Docs and READMEs deliberately do
-#                      not trigger a kernel build.
+# workflow_dispatch covers manual runs and the poller's `gh workflow run` -- a
+# push made with GITHUB_TOKEN does not trigger other workflows. The push trigger
+# covers anything that changes what gets built; docs do not.
 on:
   workflow_dispatch:
     inputs:
@@ -45,32 +39,29 @@ on:
       - 'Dockerfile'
       - 'config/**'
       - 'patches/series.d/**'
-      # Committed per-product patches. Fetched ones are gitignored, so they can
-      # never appear in a push.
+      # Fetched patches are gitignored, so only committed ones appear here.
       - 'patches/*/*.patch'
       - 'patches/ogc.select'
       - 'patches/ogc.select.deny'
       - 'patches/ogc.keyfpr'
-      # Only the scripts that change WHAT gets built. `scripts/**` was too broad:
-      # editing publish-r2.sh to fix an upload bug rebuilt a byte-identical
-      # kernel for fifty minutes before republishing it.
+      # Only the scripts that change what gets built. `scripts/**` is too broad:
+      # a publish-r2.sh fix would rebuild a byte-identical kernel for fifty
+      # minutes before republishing it.
       - 'scripts/lib-product.sh'
       - 'scripts/fetch-patches.sh'
       - 'scripts/build.sh'
       - 'scripts/build-in-container.sh'
       - 'scripts/makepkg-and-report.sh'
       - 'scripts/next-pkgrel.sh'
-      # NOT '.github/workflows/build.yml'. Editing this file changes how the
-      # build is orchestrated, not what comes out of it. check.yml validates
-      # every push cheaply; use `gh workflow run build.yml` when a change
-      # genuinely needs a real build.
+      # Not build.yml itself: editing it changes how the build is orchestrated,
+      # not what comes out. check.yml validates every push cheaply.
 
 permissions:
   contents: write   # push tags, create releases
   issues: write     # open the build-failure issue
   actions: write    # delete superseded ccache entries (see the prune step)
 
-# One publisher at a time, across runs. cancel-in-progress is false on purpose:
+# One publisher at a time, across runs. cancel-in-progress is false because
 # cancelling mid-publish could leave R2 holding packages with no database entry,
 # or a database referencing a package whose upload was killed.
 concurrency:
@@ -78,9 +69,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Which products this run builds, and which kernel ref each resolves to. Read
-  # from sources.env plus the product confs, so adding a product stays a config
-  # change -- and the ref is needed here because the tarball cache is keyed on it.
+  # Which products this run builds, and which kernel ref each resolves to. The
+  # ref is needed here because the tarball cache is keyed on it.
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -91,8 +81,8 @@ jobs:
       - name: Resolve products and their kernel refs
         id: plan
         env:
-          # Via env, never inline: a workflow input pasted into a shell command
-          # is a shell injection waiting for a typo.
+          # Via env, never inline -- a workflow input pasted into a shell
+          # command is a shell injection.
           WANT: ${{ inputs.product }}
           KERNEL_SOURCE_OVERRIDE: ${{ inputs.kernel_source }}
           KERNEL_REF_OVERRIDE: ${{ inputs.kernel_ref }}
@@ -109,13 +99,11 @@ jobs:
           fi
           [ -n "${list}" ] || { echo "::error::no products to build"; exit 1; }
 
-          # The ref comes from the same resolver the build uses, overrides
-          # included, so the cache key cannot disagree with what gets downloaded.
+          # Same resolver the build uses, overrides included, so the cache key
+          # cannot disagree with what gets downloaded.
           for p in ${list}; do
-            # set -e inside the subshell too: without it a refused lp_load (an
-            # override that contradicts the conf, say) still printed a ref from
-            # half-loaded state, and the cache key silently disagreed with the
-            # build.
+            # set -e inside the subshell too: without it a refused lp_load still
+            # prints a ref from half-loaded state.
             ref="$(PRODUCT="${p}" bash -c '
                 set -euo pipefail
                 . scripts/lib-product.sh
@@ -133,19 +121,16 @@ jobs:
 
   build:
     needs: plan
-    # Native aarch64. Free for public repositories, and it means no qemu, no
-    # binfmt, and no cross-compilation tax on a kernel build.
+    # Native aarch64: no qemu, no binfmt, no cross-compilation tax.
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
     strategy:
-      # PARALLEL. Nothing in this job writes shared state: each product has its
-      # own pkgbase, its own pkgrel floor and its own caches. The pacman database
-      # is the only shared thing, and it is written once by the publish job below
-      # after every build has finished.
+      # Nothing here writes shared state: each product has its own pkgbase,
+      # pkgrel floor and caches. The pacman database is the only shared thing,
+      # written once by the publish job after every build finishes.
       #
-      # fail-fast: false so a broken el2 stack does not cancel a handheld build
-      # that is already halfway through -- and so the publish job can still ship
-      # whichever products did build.
+      # fail-fast: false so one broken stack does not cancel another build
+      # halfway through, and the publish job can still ship what did build.
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -155,27 +140,24 @@ jobs:
 
     steps:
       # fetch-tags is required: next-pkgrel.sh floors the pkgrel on the tags,
-      # because R2 gets pruned and the tags do not. A tagless checkout drops the
-      # floor to whatever is still in the bucket.
-      # ref pinned to this run's commit, not the branch head: the publish job
-      # checks out separately, and a push landing between the two would have it
-      # tag a tree that is not the one these packages were built from.
+      # since R2 gets pruned and tags do not. ref is pinned to this run's commit
+      # rather than the branch head, so a push landing mid-run cannot make the
+      # publish job tag a tree these packages were not built from.
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           fetch-tags: true
           fetch-depth: 0
 
-      # Weekly rotation of the builder image so its toolchain does not drift a
-      # year behind the target, without rebuilding a rootfs on every run.
+      # Weekly rotation, so the builder's toolchain does not drift a year behind
+      # the target without rebuilding a rootfs every run.
       - name: Cache key inputs
         id: keys
         run: echo "week=$(date -u +%Y-%U)" >> "$GITHUB_OUTPUT"
 
-      # restore/save rather than actions/cache, throughout. actions/cache only
-      # writes in its post step, and post steps do not run when the job fails --
-      # so a failure at the very end discards an hour of compilation and the
-      # retry starts cold.
+      # restore/save rather than actions/cache throughout: actions/cache only
+      # writes in its post step, which does not run when the job fails -- so a
+      # late failure would discard an hour of compilation.
       - name: Restore builder image
         id: imgcache
         uses: actions/cache/restore@v6
@@ -206,16 +188,14 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          # bsdtar (libarchive-tools) is for fetch-patches.sh unpacking
-          # series.zip; it falls back to unzip.
+          # bsdtar for fetch-patches.sh unpacking series.zip; falls back to unzip
           sudo apt-get install -y -qq libarchive-tools unzip
-          # rclone is needed HERE too: next-pkgrel.sh lists R2 for the pkgrel
-          # floor, and with PKGREL_REQUIRE_R2 a missing client is a hard error.
+          # next-pkgrel.sh lists R2 for the pkgrel floor, and with
+          # PKGREL_REQUIRE_R2 a missing client is a hard error
           ./scripts/install-rclone.sh
 
-      # Keyed on the KERNEL REF, not the product: two products on the same
-      # CachyOS tag share one 265 MB entry instead of caching it twice against a
-      # 10 GB per-repository budget.
+      # Keyed on the kernel ref, not the product, so two products on the same tag
+      # share one 265 MB entry against the 10 GB per-repository budget.
       - name: Restore kernel tarball
         id: tarcache
         uses: actions/cache/restore@v6
@@ -241,13 +221,13 @@ jobs:
           key: tarball-${{ matrix.kernelref }}
 
       # PKGREL_REQUIRE_R2 makes a missing credential or unreadable bucket an
-      # error rather than a pkgrel guess. Publishing path only.
+      # error rather than a pkgrel guess.
       - name: Decide pkgrel
         id: ver
         env:
-          # 'true' or 'false' as a STRING. Not `skip_publish && '' || '1'`:
-          # an empty string is falsy in a GitHub expression, so the || arm always
-          # won and the flag was always on.
+          # 'true'/'false' as a string. Not `skip_publish && '' || '1'` -- an
+          # empty string is falsy in a GitHub expression, so the || arm always
+          # wins and the flag is always on.
           PKGREL_REQUIRE_R2: ${{ !inputs.skip_publish }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -269,23 +249,21 @@ jobs:
 
       - name: Build packages
         env:
-          # 10 GB of Actions cache PER REPOSITORY, evicted LRU, and cache entries
-          # are immutable -- the sha in the key means every run writes a NEW one.
+          # 10 GB of Actions cache per repository, evicted LRU, and entries are
+          # immutable -- the sha in the key means every run writes a new one.
           #
-          # One full arm64 kernel is ~4.5 GiB of ccache, so nothing here holds a
-          # complete build; 3G is about two thirds of one, and two products at 3G
-          # plus the builder image and the tarball is ~7 GB, which fits only
-          # because the prune step below keeps one generation per product. Raise
-          # this and the two products start evicting each other again.
+          # A full arm64 kernel is ~4.5 GiB of ccache, so 3G is about two thirds
+          # of one. Two products at 3G plus the image and the tarball is ~7 GB,
+          # which fits only because the prune step below keeps one generation per
+          # product. Raise this and the products evict each other again.
           CCACHE_MAXSIZE: 3G
         run: ./scripts/build.sh
 
-      # Immediately after the build and before anything that can fail, because
-      # this is the hour of work worth protecting.
-      # !cancelled(), not always(): saving on CANCELLATION is harmful, because
-      # restore-keys resolves to the most recently created matching entry, so a
-      # build cancelled two minutes in would store a near-empty ccache that then
-      # shadows the complete one from the last successful build.
+      # Immediately after the build, before anything that can fail.
+      #
+      # !cancelled(), not always(): restore-keys resolves to the most recently
+      # created matching entry, so saving on cancellation would let a build
+      # killed two minutes in shadow the last complete ccache.
       - name: Save ccache
         if: ${{ !cancelled() }}
         continue-on-error: true
@@ -296,10 +274,8 @@ jobs:
 
       # Cache entries are immutable, so every run leaves its predecessor behind.
       # Unpruned, two products fill the 10 GB budget in about two runs and LRU
-      # eviction starts picking off whichever product ran less recently -- so a
-      # parallel matrix quietly turns into cold builds. Keep the newest entry per
-      # product and delete the rest; each matrix job only ever touches its own
-      # prefix, so the jobs cannot race here.
+      # starts evicting whichever ran less recently, turning a parallel matrix
+      # into cold builds. Each job only touches its own prefix, so no race here.
       - name: Prune superseded ccache entries
         if: ${{ !cancelled() }}
         continue-on-error: true
@@ -338,8 +314,8 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      # The publish job consumes this: the packages plus the version.env that
-      # describes them, which is what tag-release.sh needs per product.
+      # For the publish job: the packages plus the version.env describing them,
+      # which is what tag-release.sh needs per product.
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
@@ -358,23 +334,19 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: ./scripts/report-failure.sh
 
-  # ONE database write per run, after every build has finished. Two products
+  # One database write per run, after every build finishes. Two products
   # publishing concurrently would each fetch the database, fold their own
-  # packages in and upload -- and the later upload would drop the earlier
-  # product's entry, leaving a package live in R2 that the index does not
-  # mention. Doing it here also means retention pruning runs once.
+  # packages in and upload -- and the later upload would drop the earlier one's
+  # entry. Retention pruning also runs once this way.
   publish:
     needs: [plan, build]
-    # The condition is fiddly on purpose, because `!cancelled()` OVERRIDES the
-    # default "only run if needs succeeded" gate -- with just that, a failed plan
-    # left build skipped and publish started anyway.
+    # Fiddly because `!cancelled()` overrides the default "only run if needs
+    # succeeded" gate -- with just that, a failed plan left build skipped and
+    # publish started anyway.
     #
     #   plan failed / cancelled      -> skipped (nothing was built)
     #   build skipped                -> skipped (same)
-    #   build failed for ONE product -> RUNS, and ships whichever products did
-    #                                   build; that is what fail-fast: false is
-    #                                   for, and the build job already went red
-    #                                   and opened the issue
+    #   build failed for one product -> runs, shipping whichever did build
     if: ${{ !cancelled() && !inputs.skip_publish && needs.plan.result == 'success' && needs.build.result != 'skipped' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
@@ -389,11 +361,9 @@ jobs:
         id: keys
         run: echo "week=$(date -u +%Y-%U)" >> "$GITHUB_OUTPUT"
 
-      # publish-r2.sh prefers the container's repo-add and vercmp, because its
-      # pacman is the one that built these packages: the runner has none, and
-      # Ubuntu's 6.0.2 against Arch's 7.1.0 already cost one failed publish
-      # (6.0.2 does not know --include-sigs and treated it as the database
-      # filename). Restored from the same cache the build job wrote.
+      # publish-r2.sh prefers the container's repo-add and vercmp: its pacman is
+      # the one that built these packages, and the runner has none. Restored from
+      # the same cache the build job wrote.
       - name: Restore builder image
         uses: actions/cache/restore@v6
         with:
@@ -416,9 +386,9 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq unzip
           ./scripts/install-rclone.sh
 
-      # continue-on-error, and the trade is deliberate: when every build failed
-      # there are no artifacts and this step errors, which would bury the real
-      # failure under a second one. The collect step's count is the actual gate.
+      # continue-on-error because with every build failed there are no artifacts
+      # and this step would bury the real failure under a second one. The collect
+      # step's count is the actual gate.
       - uses: actions/download-artifact@v7
         continue-on-error: true
         with:
@@ -426,8 +396,8 @@ jobs:
           path: artifacts
 
       # Every product's packages in one out/, so repo-add sees them all and the
-      # database is written once. Each artifact keeps its own version.env, which
-      # is what the tagging step reads back.
+      # database is written once. Each artifact keeps its own version.env for the
+      # tagging step.
       - name: Collect the packages
         id: collect
         run: |
@@ -461,10 +431,9 @@ jobs:
           REPO_SIGNING_KEY_PASSPHRASE: ${{ secrets.REPO_SIGNING_KEY_PASSPHRASE }}
         run: ./scripts/publish-r2.sh
 
-      # Per product, and only after the packages are live. A tag that exists but
-      # was never published would be the worst kind of provenance record -- and
-      # since next-pkgrel.sh treats tags as the floor of what has been published,
-      # a premature tag also burns a pkgrel.
+      # Per product, and only after the packages are live: next-pkgrel.sh treats
+      # tags as the floor of what has been published, so a premature tag is both
+      # a false record and a burned pkgrel.
       - name: Tag and release
         if: ${{ steps.collect.outputs.count != '0' }}
         env:
@@ -477,29 +446,27 @@ jobs:
             cp "${d}version.env" version.env
             p="$(. ./version.env >/dev/null 2>&1; printf '%s' "${_product}")"
             pb="$(. ./version.env >/dev/null 2>&1; printf '%s' "${_pkgbase}")"
-            # A build that failed still uploads its artifact (version.env, no
-            # packages) so the failure stays inspectable. Nothing of it is
-            # live, so a tag would be a phantom record -- skip it, and keep
-            # going so the product that DID publish gets its tag.
+            # A failed build still uploads its artifact (version.env, no
+            # packages) so it stays inspectable. Nothing of it is live, so skip
+            # the tag and keep going, to tag whichever product did publish.
             if ! ls "out/${pb}"-*.pkg.tar.zst >/dev/null 2>&1; then
               echo "==> ${p}: no packages published in this run; not tagging"
               continue
             fi
             echo "==> tagging ${p}"
-            # Not fatal on the spot. The products publish together but tag
-            # independently, and aborting here left the SECOND product of a
-            # two-product run untagged because the first one's push was
-            # rejected -- an unpublished-looking product whose packages are
-            # live in R2. Tag everything, then fail.
+            # Not fatal on the spot: products publish together but tag
+            # independently, and aborting here would leave a product's packages
+            # live in R2 with no tag because another one's push was rejected.
+            # Tag everything, then fail.
             PRODUCT="${p}" ./scripts/tag-release.sh \
               || { echo "::error::${p}: tag/release failed"; rc=1; }
           done
           exit "${rc}"
 
-      # No build-failure issue here: report-failure.sh reports a PRODUCT's patch
-      # stack, and a publish failure is not product-specific. It is also
-      # recoverable by construction -- packages upload before the database, so a
-      # failed publish leaves R2 consistent and the packages are in the artifacts.
+      # No build-failure issue here: report-failure.sh reports a product's patch
+      # stack, and a publish failure is not product-specific. It is recoverable by
+      # construction -- packages upload before the database, so R2 stays
+      # consistent and the packages are in the artifacts.
       - name: Note a publish failure
         if: failure()
         run: |

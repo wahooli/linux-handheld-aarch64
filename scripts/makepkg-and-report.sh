@@ -5,23 +5,32 @@
 set -euo pipefail
 cd /work
 
-# --nobuild stops after prepare(), which is the cheap way to find out that an
-# upstream moved: the series, the device trees and the config are all resolved,
-# nothing is compiled. The reports below still work, because they read the
-# prepared src/ tree rather than the packages.
+# --nobuild stops after prepare(): everything resolved, nothing compiled. The
+# reports below still work, because they read the prepared src/ tree.
 args=(--noconfirm --syncdeps --cleanbuild --force)
 [ -n "${NOBUILD:-}" ] && args+=(--nobuild)
 
-# tee'd so the report below can quote the build rather than re-deriving anything
-# from it. pipefail is on, so makepkg's exit status still fails this script.
+# Zeroed first, because ccache's counters live in the cache directory and
+# accumulate across every build that used it -- a cumulative hit rate cannot show
+# that THIS run missed everything.
+command -v ccache >/dev/null && ccache -z >/dev/null 2>&1 || true
+
+# tee'd so the report below can quote the build. pipefail is on, so makepkg's
+# exit status still fails this script.
 makepkg "${args[@]}" 2>&1 | tee /work/.makepkg.log
+
+# The one number that says whether this was an incremental build. A near-0% hit
+# rate on a run that restored a warm cache means the keys changed -- a new base
+# version, or a toolchain bump from the pacman -Syu above.
+if command -v ccache >/dev/null; then
+    echo "==> ccache"
+    ccache -s | sed 's/^/    /'
+fi
 
 {
     # ---- patches already in the base ------------------------------------
     # prepare() reverse-dry-runs anything that will not apply and reports
-    # "already in the base" instead of failing. Lifted into the job summary
-    # because it is the answer to whether the base already carries what we are
-    # applying on top of it.
+    # "already in the base" instead of failing. Lifted into the job summary.
     if grep -q 'already in the base' /work/.makepkg.log; then
         echo
         echo "### Patches already in the base (skipped, not applied)"
@@ -39,10 +48,9 @@ makepkg "${args[@]}" 2>&1 | tee /work/.makepkg.log
     fi
 
     # ---- ROCKNIX staged dry-run ------------------------------------------
-    # Against the fully prepared tree -- after the series AND after the vendored
-    # device trees are copied in. That ordering is what makes it useful: the
-    # DTS-add patches correctly report "no" because the files they add are
-    # already there. Never applied; see docs/PATCHES.md.
+    # Against the fully prepared tree -- after the series and after the vendored
+    # device trees are copied in, so DTS-add patches correctly report "no".
+    # Never applied; see docs/PATCHES.md.
     shopt -s nullglob
     staged=(patches/rocknix-staged/*.patch)
     if [ ${#staged[@]} -gt 0 ]; then

@@ -1,19 +1,16 @@
 name: poll upstreams
 
-# Watches the three sources and, when any moved, commits the new refs to
-# sources.env and kicks off a build.
+# Watches the upstreams and, when any moved, commits the new refs to sources.env
+# and kicks off a build.
 #
-# Why a poller at all: GitHub Actions cannot receive events from a repository
-# you do not own, so there is no way to be *notified* of an OGC release. Polling
-# is the only mechanism available.
-#
-# Why it commits rather than passing refs to the build: sources.env in git
-# history is then the complete record of what was built when, and a bad bump is
-# a `git revert` rather than an archaeology exercise across workflow logs.
+# A poller because Actions cannot receive events from a repository you do not
+# own. It commits rather than passing refs to the build so sources.env in git
+# history is the complete record of what was built when, and a bad bump is a
+# `git revert`.
 on:
   schedule:
-    # Every 6 hours, off the hour -- scheduled workflows on the hour queue behind
-    # everyone else's cron and can be delayed by 20+ minutes.
+    # Off the hour: scheduled workflows on the hour queue behind everyone else's
+    # cron and can be delayed by 20+ minutes.
     - cron: '17 */6 * * *'
   workflow_dispatch:
 
@@ -37,24 +34,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/poll-sources.sh
 
-      # Committed through the GraphQL API rather than `git commit && git push`,
-      # because GitHub signs commits made with a bot token server-side. The bump
-      # therefore lands Verified and satisfies a "require signed commits" branch
-      # rule; a plain push from the runner is unsigned and would be rejected.
-      # There is no key to manage -- GITHUB_TOKEN being a bot token is the whole
-      # mechanism.
+      # Through the GraphQL API rather than `git commit && git push`, because
+      # GitHub signs commits made with a bot token server-side -- so the bump
+      # lands Verified and satisfies a "require signed commits" rule, with no key
+      # to manage.
       #
-      # expectedHeadOid makes this a compare-and-swap. If main moved between the
-      # checkout and now, the mutation fails, the run goes red, and the next
-      # poll redoes the work against the new head -- where the old `git push`
-      # would have raced or force-resolved.
+      # expectedHeadOid makes this a compare-and-swap: if main moved since the
+      # checkout, the mutation fails and the next poll redoes the work against
+      # the new head rather than racing.
       - name: Commit new refs
         if: steps.poll.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          # Via env, not "${{ }}" inline in the script: SUMMARY is built from
-          # upstream tag names, which are third-party strings and have no
-          # business being pasted into a shell command.
+          # Via env, not inline: SUMMARY is built from upstream tag names, which
+          # are third-party strings.
           SUMMARY: ${{ steps.poll.outputs.summary }}
         run: |
           set -euo pipefail
@@ -79,8 +72,7 @@ jobs:
             --jq '.data.createCommitOnBranch.commit | "==> committed \(.oid[0:8])  \(.url)"'
 
       # A push made with GITHUB_TOKEN does not trigger other workflows, so the
-      # build has to be dispatched explicitly. This is a documented GitHub
-      # behaviour and not something a path filter can work around.
+      # build has to be dispatched explicitly.
       - name: Trigger build
         if: steps.poll.outputs.changed == 'true'
         env:
@@ -91,10 +83,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           if [ "${{ steps.poll.outcome }}" = "failure" ]; then
-            # Most likely a refused bump: the poller resolves the new OGC tag to
-            # a kernel.org tarball before committing, and exits nonzero if it is
-            # not there. sources.env is untouched, so main keeps the last good
-            # pin -- do not let this read as "nothing moved".
+            # Most likely a refused bump -- the poller verifies a new ref
+            # resolves before committing. sources.env is untouched, so this must
+            # not read as "nothing moved".
             echo "Poll failed; sources.env unchanged. See the log." >> "$GITHUB_STEP_SUMMARY"
           elif [ "${{ steps.poll.outputs.changed }}" = "true" ]; then
             echo "Bumped: ${{ steps.poll.outputs.summary }}" >> "$GITHUB_STEP_SUMMARY"
