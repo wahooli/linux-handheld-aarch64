@@ -322,6 +322,12 @@ default_image="${_initramfs}"
 fallback_image="${_initramfsfallback}"
 fallback_options="-S autodetect"
 PRESET
+
+    # Fires mkinitcpio's pacman hook, which triggers on usr/lib/initcpio/* and
+    # not on anything else this package installs. Named by kver so it cannot
+    # collide with ALARM's own marker or the other product's.
+    install -Dm644 /dev/stdin "${pkgdir}/usr/lib/initcpio/${kver}" \
+        <<< "dummy file to trigger mkinitcpio to run (${pkgbase})"
 }
 
 _package-headers() {
