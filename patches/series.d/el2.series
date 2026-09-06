@@ -2,14 +2,12 @@
 #
 # Committed in patches/el2/, not fetched: 0003-0029 are Stephan Gerhold's
 # wip/qcom-laptops-6.17-el2 series, whose codelinaro branch is dead (mirror:
-# github.com/jglathe/linux_ms_dev_kit), and 0001, 0002, 0030, 0031 and the
-# 'local:' patches were written locally, as are 0031 and 0032. There is no
-# manifest upstream to take.
+# github.com/jglathe/linux_ms_dev_kit), and 0002, 0031, 0032 and the 'local:'
+# patches were written locally. There is no manifest upstream to take.
 #
 # Order is the series order and it matters -- these are git format-patch
 # commits with Fixes: edges between them. Provenance: docs/PATCHES.md.
 
-0001-arm_scmi-perf-audit-firmware-perf-limits.patch
 0002-ASoC-qcom-x1e80100-lift-speaker-volume-caps.patch
 0003-soc-qcom-smp2p-Kick-after-requesting-interrupt.patch
 0004-soc-qcom-smp2p-Ensure-there-is-enough-space-for-outb.patch
@@ -34,7 +32,6 @@
 0023-wip-firmware-qcom-tzmem-self-owner-SHM-bridge-via-qc.patch
 0024-dt-bindings-firmware-qcom-scm-Add-qcom-shm-bridge-vm.patch
 0025-local-arm64-dts-qcom-x1-el2-request-self-owner-SHM-b.patch
-0026-local-arm64-dts-qcom-x1-el2-add-ramoops-region-to-ca.patch
 0027-arm64-dts-qcom-hamoa-add-system-power-domain-SS3-sta.patch
 0028-platform-arm64-add-Yoga-Slim-7x-IT8987-EC-driver-DT-.patch
 0029-drm-msm-a6xx-Fix-stale-rpmh-votes-after-suspend.patch
@@ -44,9 +41,11 @@
 # this series or in CachyOS's branches goes near.
 0031-drm-msm-dp-Send-HDR-static-metadata-on-eDP.patch
 
-# Debug aid, not a fix: an on-demand DPU register snapshot, for the half-screen
-# scanout corruption that never raises an interrupt for the existing triggers.
-0032-drm-msm-dpu-Add-a-debugfs-trigger-for-the-display-sna.patch
+# Half the screen was intermittently tinted because a PCC coefficient write did
+# not latch, leaving an enabled colour-correction block with a dead red channel.
+# The latching fault is untouched; an identity matrix simply never needed
+# programming, which puts it out of reach.
+0032-drm-msm-dpu-Do-not-program-PCC-for-an-identity-CTM.patch
 
 # Copied byte-for-byte from armada (kernel/patches/<name> at ARMADA_REF
 # eb63d011a3a9) so el2 keeps USE_ARMADA=no and an armada rebase cannot break

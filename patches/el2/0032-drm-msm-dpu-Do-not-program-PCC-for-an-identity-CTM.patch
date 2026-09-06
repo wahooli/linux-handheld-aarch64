@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Sat, 6 Sep 2026 04:50:00 +0300
+Subject: [PATCH 32/32] drm/msm/dpu: Do not program PCC for an identity CTM
+
+An identity CTM asks the colour correction block to compute out = in. That
+buys nothing and costs ten register writes plus a flush on every modeset and
+colour-management change.
+
+It also costs correctness. An X1E80100 laptop intermittently tints half its
+screen: layout and content stay correct, only colour is wrong, and a dpms
+cycle clears it. Register snapshots taken while glitched and while healthy
+show DSPP_1's PCC block enabled with PCC_RED_R reading zero while
+PCC_GREEN_G and PCC_BLUE_B hold 0x8000 -- a matrix whose red output is
+identically zero.
+
+Logging the coefficients as they were programmed showed the driver is not at
+fault: every programming recorded a clean identity CTM in and
+rr=8000 gg=8000 bb=8000 out, with both DSPPs written in the same commit. The
+driver writes 0x8000 to PCC_RED_R and the register reads back zero
+afterwards, so a coefficient write is not latching. dpu_crtc.c is the only
+caller of setup_pcc(), and it writes the nine coefficients before PCC_EN, so
+nothing else is overwriting it.
+
+The latching failure itself is not addressed here -- it needs hardware
+documentation this was written without. But an identity matrix never needs
+programming in the first place, and not enabling PCC makes an unlatched
+coefficient unreachable rather than merely unlikely.
+
+Disable rather than skip, since an earlier commit may have left a
+non-identity matrix programmed.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -844,6 +844,28 @@
+ 	gc_lut->flags = 0;
+ }
+ 
++/*
++ * An identity CTM asks the hardware to compute out = in, so programming PCC for
++ * it buys nothing and costs ten register writes plus a flush per modeset.
++ *
++ * It also costs correctness here. On X1E80100 a PCC coefficient write has been
++ * observed not to latch: the driver writes 0x8000 to PCC_RED_R and the register
++ * reads back zero afterwards, leaving an *enabled* PCC block with a dead red
++ * channel that tints half the screen until the next modeset. Not programming an
++ * identity matrix makes that failure unreachable rather than merely unlikely.
++ */
++static bool _dpu_crtc_ctm_is_identity(const struct drm_color_ctm *ctm)
++{
++	const u64 one = 1ULL << 32;	/* 1.0 in S31.32 */
++	int i;
++
++	for (i = 0; i < 9; i++)
++		if (ctm->matrix[i] != (i % 4 == 0 ? one : 0))
++			return false;
++
++	return true;
++}
++
+ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
+ {
+ 	struct drm_crtc_state *state = crtc->state;
+@@ -867,7 +889,14 @@
+ 			continue;
+ 
+ 		if (dspp->ops.setup_pcc) {
+-			if (!state->ctm) {
++			const struct drm_color_ctm *ctm = state->ctm ?
++				(struct drm_color_ctm *)state->ctm->data : NULL;
++
++			/*
++			 * Disable rather than skip: a previous commit may have
++			 * left a non-identity matrix programmed.
++			 */
++			if (!ctm || _dpu_crtc_ctm_is_identity(ctm)) {
+ 				dspp->ops.setup_pcc(dspp, NULL);
+ 			} else {
+ 				_dpu_crtc_get_pcc_coeff(state, &cfg);
+-- 
+2.51.0
+
