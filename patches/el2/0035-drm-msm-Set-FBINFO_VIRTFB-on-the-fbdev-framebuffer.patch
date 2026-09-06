@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Sat, 6 Sep 2026 16:10:00 +0300
+Subject: [PATCH] drm/msm: Set FBINFO_VIRTFB on the fbdev framebuffer
+
+msm_fbdev_driver_fbdev_probe() vmaps the buffer object into
+fbi->screen_buffer, and msm_fb_ops is built from
+FB_GEN_DEFAULT_DEFERRED_SYSMEM_OPS, so every draw goes through the sys_*
+helpers. Those helpers warn when FBINFO_VIRTFB is not set:
+
+  fb0: sys_fillrect: framebuffer is not in virtual address space.
+  fb0: sys_imageblit: framebuffer is not in virtual address space.
+
+The framebuffer is in virtual address space; the flag was simply never set.
+Every other driver in this shape sets it -- drm_fbdev_dma, drm_fbdev_shmem,
+omapdrm, exynos and tegra all do.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+--- a/drivers/gpu/drm/msm/msm_fbdev.c
++++ b/drivers/gpu/drm/msm/msm_fbdev.c
+@@ -144,6 +144,11 @@
+ 	fbi->fix.smem_start = paddr;
+ 	fbi->fix.smem_len = bo->size;
+ 
++	/* Vmapped system memory, drawn with the sys_* helpers, which warn once
++	 * per operation without this.
++	 */
++	fbi->flags |= FBINFO_VIRTFB;
++
+ 	DBG("par=%p, %dx%d", fbi->par, fbi->var.xres, fbi->var.yres);
+ 	DBG("allocated %dx%d fb", fb->width, fb->height);
+ 

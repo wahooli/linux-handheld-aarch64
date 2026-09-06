@@ -47,6 +47,17 @@
 # programming, which puts it out of reach.
 0032-drm-msm-dpu-Do-not-program-PCC-for-an-identity-CTM.patch
 
+# Fix: suspend zeroes both the interconnect vote and the DPU core clock, and
+# resume restores neither, so scanout restarts underprovisioned and the mixers
+# paint the underflow colour (blue) until userspace's first commit. Measured:
+# 4 of 8 resumes underran before, 0 of 7 after.
+0034-drm-msm-dpu-Restore-the-interconnect-vote-on-runtime-.patch
+
+# Silences two boot warnings: msm's fbdev vmaps its buffer and draws with the
+# sys_* helpers, which warn once each unless FBINFO_VIRTFB is set. The flag was
+# just never set; drm_fbdev_dma/shmem, omapdrm, exynos and tegra all set it.
+0035-drm-msm-Set-FBINFO_VIRTFB-on-the-fbdev-framebuffer.patch
+
 # Copied byte-for-byte from armada (kernel/patches/<name> at ARMADA_REF
 # eb63d011a3a9) so el2 keeps USE_ARMADA=no and an armada rebase cannot break
 # this build. Generic fixes, not SoC-gated: 0204 stops tsens lower-threshold

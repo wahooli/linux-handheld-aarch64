@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Sat, 6 Sep 2026 15:50:00 +0300
+Subject: [PATCH 34/34] drm/msm/dpu: Restore bandwidth and core clock on runtime
+ resume
+
+dpu_runtime_suspend() drops the interconnect vote to zero, and the crtc disable
+that precedes it drops the core clock as well: dpu_core_perf_crtc_update() takes
+its !crtc->enabled branch, which memsets the perf params and then runs both
+_dpu_core_perf_crtc_update_bus() and dev_pm_opp_set_rate(dev, 0).
+
+dpu_runtime_resume() restores neither. It enables the clocks, reinitialises VBIF
+memtypes and resumes the encoders -- which restarts scanout -- with no bandwidth
+vote and the core clock at its lowest OPP. The only code that raises either again
+is dpu_core_perf_crtc_update(), whose callers are all atomic commit paths
+(dpu_crtc_atomic_flush, dpu_crtc_complete_commit, dpu_crtc_disable).
+
+So between scanout restarting and userspace's first commit after resume, the DPU
+runs underprovisioned. On an X1E80100 laptop (2944x1840 at 90 Hz, 522 MHz pixel
+clock, one DMA pipe feeding both mixers) roughly half of all resumes produced
+exactly six underruns on INTF_5, spaced 11.1 ms apart, which is the 90 Hz frame
+period:
+
+  [  173.571680] msm pm: complete enter (restoring display)
+  [  174.019458] msm dpu: underrun intf=6 count=1
+  [  174.030587] msm dpu: underrun intf=6 count=2
+  [  174.041688] msm dpu: underrun intf=6 count=3
+  [  174.052778] msm dpu: underrun intf=6 count=4
+  [  174.063899] msm dpu: underrun intf=6 count=5
+  [  174.075090] msm dpu: underrun intf=6 count=6
+
+The mixers paint INTF_UNDERFLOW_COLOR while starved -- dpu_encoder_phys_vid sets
+underflow_clr to 0xff -- so this is a brief full-screen blue flash. No IOMMU
+faults accompany it and the source addresses read back correctly, so the pipes
+are starved rather than blocked. It is not duration dependent: a 7 s suspend
+reproduced it and 3 minute ones came back clean.
+
+Restoring only the bandwidth vote was measured and is not sufficient. With
+avg=1220935 peak=800000 re-voted 352 us into the resume, all six underruns still
+occurred, so the core clock is restored too -- after the vote, matching the
+ordering dpu_core_perf_crtc_update() documents ("bandwidth is available before
+clock rate is increased").
+
+Only non-zero values are remembered, so neither the zero written by the crtc
+disable nor the transient avg=0 vote seen just after resume becomes the value
+restored.
+
+Measured on an X1E80100 laptop: 4 of 8 resumes underran before, 0 of 7 after,
+across suspends from 4 s to 5m37s. Logging used to establish this is not
+included here.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.h
+@@ -101,6 +101,11 @@
+ 	atomic_t bandwidth_ref;
+ 	struct icc_path *path[2];
+ 	u32 num_paths;
++
++	/* last real vote/rate, so runtime resume can restore them */
++	u32 avg_bw;
++	u32 peak_bw;
++	u64 core_clk_rate;
+ };
+ 
+ struct vsync_info {
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+@@ -1449,6 +1449,7 @@
+ static int __maybe_unused dpu_runtime_resume(struct device *dev)
+ {
+ 	int rc = -1;
++	int i;
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct msm_drm_private *priv = platform_get_drvdata(pdev);
+ 	struct dpu_kms *dpu_kms = to_dpu_kms(priv->kms);
+@@ -1463,6 +1464,31 @@
+ 		return rc;
+ 	}
+ 
++	/*
++	 * dpu_runtime_suspend() dropped the interconnect vote to zero, and
++	 * nothing votes again until the next atomic commit -- but scanout
++	 * restarts below. Restore the last vote first, or the pipes starve for
++	 * the frames in between and the mixers paint INTF_UNDERFLOW_COLOR.
++	 */
++	for (i = 0; i < dpu_kms->num_paths; i++)
++		icc_set_bw(dpu_kms->path[i], dpu_kms->avg_bw, dpu_kms->peak_bw);
++
++	/*
++	 * Same gap for the core clock: the crtc disable that precedes suspend
++	 * runs dev_pm_opp_set_rate(dev, 0), and nothing raises it again until
++	 * the next commit. Restore it after the bw vote, matching the ordering
++	 * dpu_core_perf_crtc_update() documents.
++	 */
++	if (dpu_kms->core_clk_rate) {
++		int crc = dev_pm_opp_set_rate(dev, dpu_kms->core_clk_rate);
++
++		if (crc)
++			DPU_ERROR("failed to restore core clock rate %llu: %d\n",
++				  dpu_kms->core_clk_rate, crc);
++		else
++			dpu_kms->perf.core_clk_rate = dpu_kms->core_clk_rate;
++	}
++
+ 	dpu_vbif_init_memtypes(dpu_kms);
+ 
+ 	drm_for_each_encoder(encoder, ddev)
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
+@@ -243,6 +243,16 @@
+ 
+ 	avg_bw /= kms->num_paths;
+ 
++	/*
++	 * Only remember a real vote. Disabling a crtc memsets its perf params
++	 * and votes zero, and that happens before runtime suspend -- recording
++	 * it would make the restore below a no-op.
++	 */
++	if (avg_bw) {
++		kms->avg_bw = avg_bw;
++		kms->peak_bw = peak_bw;
++	}
++
+ 	for (i = 0; i < kms->num_paths; i++)
+ 		icc_set_bw(kms->path[i], avg_bw, peak_bw);
+ 
+@@ -402,6 +412,9 @@
+ 		}
+ 
+ 		kms->perf.core_clk_rate = clk_rate;
++		/* Same reasoning as the bw vote: disable sets this to 0. */
++		if (clk_rate)
++			kms->core_clk_rate = clk_rate;
+ 		DRM_DEBUG_ATOMIC("update clk rate = %lld HZ\n", clk_rate);
+ 	}
+ 	return 0;
