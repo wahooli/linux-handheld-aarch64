@@ -2,8 +2,9 @@
 #
 # Committed in patches/el2/, not fetched: 0003-0029 are Stephan Gerhold's
 # wip/qcom-laptops-6.17-el2 series, whose codelinaro branch is dead (mirror:
-# github.com/jglathe/linux_ms_dev_kit), and 0001, 0002, 0030 and the 'local:'
-# patches were written locally. There is no manifest upstream to take.
+# github.com/jglathe/linux_ms_dev_kit), and 0001, 0002, 0030, 0031 and the
+# 'local:' patches were written locally, as are 0031 and 0032. There is no
+# manifest upstream to take.
 #
 # Order is the series order and it matters -- these are git format-patch
 # commits with Fixes: edges between them. Provenance: docs/PATCHES.md.
@@ -38,6 +39,14 @@
 0028-platform-arm64-add-Yoga-Slim-7x-IT8987-EC-driver-DT-.patch
 0029-drm-msm-a6xx-Fix-stale-rpmh-votes-after-suspend.patch
 0030-local-remoteproc-qcom_q6v5_pas-Disable-recovery-for-.patch
+
+# HDR10 output on the eDP panel. Touches only drm/msm/dp, which nothing else in
+# this series or in CachyOS's branches goes near.
+0031-drm-msm-dp-Send-HDR-static-metadata-on-eDP.patch
+
+# Debug aid, not a fix: an on-demand DPU register snapshot, for the half-screen
+# scanout corruption that never raises an interrupt for the existing triggers.
+0032-drm-msm-dpu-Add-a-debugfs-trigger-for-the-display-sna.patch
 
 # Copied byte-for-byte from armada (kernel/patches/<name> at ARMADA_REF
 # eb63d011a3a9) so el2 keeps USE_ARMADA=no and an armada rebase cannot break
