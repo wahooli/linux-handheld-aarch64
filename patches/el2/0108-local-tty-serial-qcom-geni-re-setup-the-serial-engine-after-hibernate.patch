@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Fri, 12 Sep 2026 19:20:00 +0300
+Subject: [PATCH 108/108] local: tty: serial: qcom-geni: re-setup the serial
+ engine after a hibernate restore
+
+Second half of the Bluetooth-after-resume fix. Patch 0085 restores the TLMM pad
+so BT_EN drives again; this one makes uart14 work once the chip is enabled.
+
+port->setup is a bool set once, at the end of qcom_geni_serial_port_setup(),
+and cleared nowhere in the file -- not by qcom_geni_serial_shutdown(), not by
+runtime PM, not by suspend or resume. Within one boot that is correct: the
+serial engine keeps its configuration across an open/close cycle. Across a
+cross-boot resume it is a lie, and it gates the only code that programs the
+engine: the SE firmware load when the proto register does not read UART,
+setup_fifos(), SE_UART_RX_STALE_CNT, geni_se_config_packing(), geni_se_init()
+and geni_se_select_mode(). qcom_geni_serial_startup() sees the flag, skips all
+of it, and hands back a port whose engine is at power-on values.
+
+Textbook shape B from docs.local/METHOD.md -- "any static bool / driver flag".
+
+Measured on x1e80100. With 0085 in, gpio116 is restored and the power sequencer
+drives it high; sampling the pad every 50 ms through a power-on shows a clean
+low->high at +60 ms, held ~10 s, on each of the four qca_setup() retries. So the
+chip IS enabled, and it still answers nothing:
+
+  Bluetooth: hci0: setting up wcn7850
+  Bluetooth: hci0: command 0xfc00 tx timeout
+  Bluetooth: hci0: Reading QCA version information failed (-110)
+  Bluetooth: hci0: Retry BT power ON:0
+
+Confirmed by repair, in two steps so the answer could not be ambiguous:
+
+  rebind hci_uart_qca on serial0-0   -> fails identically. Fresh qca_data,
+                                        fresh hci_dev, fresh IBS state machine;
+                                        struct qcom_geni_serial_port untouched.
+  rebind a98000.serial               -> works first try. The struct is destroyed
+                                        and re-created, so port->setup is false
+                                        again:
+      a98000.serial: ttyHS1 at MMIO 0xa98000 ... registered
+      Bluetooth: hci0: setting up wcn7850
+      Bluetooth: hci0: QCA Product ID :0x00000019      <- 59 ms later
+      Bluetooth: hci0: QCA setup on UART is completed
+    followed by a real scan, BR/EDR and LE.
+
+The same pair rules out the other candidate. dev_pm_opp_set_rate() in
+geni_serial_set_rate() is on METHOD's list of reads that lie, and a stale rate
+was the obvious suspect -- but the clk core's cached rate lives in the gcc
+provider against GCC_QUPV3_WRAP1_S6_CLK, not in the consumer, so it survives an
+unbind. Only the OPP table is re-created. If the rate cache were the defect the
+rebind could not have fixed it, and it did.
+
+Clearing the flag on .restore is the whole fix. An open port is re-set-up
+immediately -- uart_resume_port() calls ops->startup() for a port that was
+initialized -- and a closed one on its next open, which is the Bluetooth case
+here since the controller is powered off before hibernating.
+
+.restore only, so ordinary suspend/resume still skips the work: there the engine
+kept its state and re-running the setup would be a pointless reprogram of a live
+port. Consoles are included deliberately; their engine was reset by the same
+reboot, and qcom_geni_serial_port_setup() has handled uart_console() since it
+was written.
+
+SYSTEM_SLEEP_PM_OPS() is expanded by hand so .restore can differ from .resume
+without relying on a designated initializer overriding the macro's.
+
+Not board-specific: every qcom geni UART shares these pm ops.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+ drivers/tty/serial/qcom_geni_serial.c | 63 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 62 insertions(+), 1 deletion(-)
+
+--- a/drivers/tty/serial/qcom_geni_serial.c
++++ b/drivers/tty/serial/qcom_geni_serial.c
+@@ -2002,6 +2002,58 @@
+ 	return ret;
+ }
+ 
++/*
++ * Hibernate restore: the serial engine came back from the reboot at power-on
++ * values, and port->setup says it was already programmed.
++ *
++ * port->setup is set once, at the end of qcom_geni_serial_port_setup(), and is
++ * cleared nowhere -- not by qcom_geni_serial_shutdown(), not by runtime PM, not
++ * by suspend or resume. Within one boot that is correct: the block keeps its
++ * configuration across an open/close cycle, so re-running the setup would be
++ * wasted work. Across a cross-boot resume it is a lie, and it gates the ONLY
++ * code that programs the engine -- the SE firmware load when the proto register
++ * does not read UART, setup_fifos(), SE_UART_RX_STALE_CNT,
++ * geni_se_config_packing(), geni_se_init() and geni_se_select_mode().
++ * qcom_geni_serial_startup() sees the flag, skips all of it, and hands out a
++ * port whose engine is unconfigured.
++ *
++ * Measured on x1e80100 with the WCN7850's Bluetooth half on uart14. After a
++ * cross-boot resume, powering the controller on gives:
++ *
++ *   Bluetooth: hci0: setting up wcn7850
++ *   Bluetooth: hci0: command 0xfc00 tx timeout
++ *   Bluetooth: hci0: Reading QCA version information failed (-110)
++ *
++ * four times over, once per qca_setup() retry. Confirmed by repair, in two
++ * steps so the answer could not be ambiguous. Rebinding only hci_uart_qca on
++ * serial0-0 -- fresh qca_data, fresh hci_dev, this struct untouched -- fails
++ * identically. Rebinding a98000.serial, which destroys and re-creates this
++ * struct, works on the first try: the version read answers in 59 ms, the
++ * firmware downloads, and the controller scans.
++ *
++ * That also rules out the other candidate. The rebind gives a fresh OPP table
++ * but does NOT clear the clk core's cached rate, which lives in the gcc
++ * provider against GCC_QUPV3_WRAP1_S6_CLK rather than in the consumer, so a
++ * stale dev_pm_opp_set_rate()/clk_set_rate() cache would have survived the
++ * rebind and the rebind would not have helped.
++ *
++ * Clearing the flag on .restore is the whole fix: an open port is re-set-up
++ * immediately, because uart_resume_port() calls ops->startup() for a port that
++ * was initialized, and a closed one is re-set-up on its next open. Only
++ * .restore, so ordinary suspend/resume -- where the engine kept its state --
++ * still skips the work. Consoles included: their engine was reset by the same
++ * reboot, and qcom_geni_serial_port_setup() has handled the console case since
++ * it was written.
++ */
++static int qcom_geni_serial_restore(struct device *dev)
++{
++	struct qcom_geni_serial_port *port = dev_get_drvdata(dev);
++
++	port->setup = false;
++
++	return qcom_geni_serial_resume(dev);
++}
++
+ #if IS_ENABLED(CONFIG_SERIAL_QCOM_GENI_CONSOLE)
+ static const struct qcom_geni_device_data qcom_geni_console_data = {
+ 	.console = true,
+@@ -2044,10 +2096,19 @@
+ 	.set_rate = geni_serial_set_level,
+ };
+ 
++/*
++ * SYSTEM_SLEEP_PM_OPS() expanded by hand so .restore can differ from .resume
++ * without relying on a designated initializer overriding the macro's.
++ */
+ static const struct dev_pm_ops qcom_geni_serial_pm_ops = {
+ 	SET_RUNTIME_PM_OPS(qcom_geni_serial_runtime_suspend,
+ 			   qcom_geni_serial_runtime_resume, NULL)
+-	SYSTEM_SLEEP_PM_OPS(qcom_geni_serial_suspend, qcom_geni_serial_resume)
++	.suspend = pm_sleep_ptr(qcom_geni_serial_suspend),
++	.resume = pm_sleep_ptr(qcom_geni_serial_resume),
++	.freeze = pm_sleep_ptr(qcom_geni_serial_suspend),
++	.thaw = pm_sleep_ptr(qcom_geni_serial_resume),
++	.poweroff = pm_sleep_ptr(qcom_geni_serial_suspend),
++	.restore = pm_sleep_ptr(qcom_geni_serial_restore),
+ };
+ 
+ static const struct of_device_id qcom_geni_serial_match_table[] = {

@@ -1,0 +1,169 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] ASoC: qcom: q6dsp-lpass-clocks: rebind consumers when the provider returns
+
+Restart the audio DSP and the sound card never comes back. With the consumers
+now linked to this provider they at least release their clocks cleanly on the
+way down, but they are never bound again afterwards:
+
+    # cat /proc/asound/cards
+    --- no soundcards ---
+    # cat /sys/bus/platform/devices/6d44000.codec/driver
+    (no such file -- unbound)
+
+This provider is a service on the DSP's packet-router bus, so its device is
+destroyed and recreated on every DSP restart, while its consumers -- the LPASS
+macro codecs, and the SoundWire masters behind them -- are ordinary platform
+devices that outlive it. device_del() purges every device link along with the
+device, so the replacement provider has nothing left recording that those
+consumers exist. They sit unbound rather than deferred, and deferred probe
+only ever retries the deferred list, so nothing brings them back.
+
+Attach them from here once the provider is registered again. The tree is
+walked for nodes that name this device in "clocks", and only devices that are
+currently unbound are touched.
+
+This only ever binds a driver; it never releases one. That matters: releasing
+a driver at this point would tear the codec and SoundWire stack down over
+clocks that have already been unregistered, which hangs the machine.
+
+Ordering needs no attention. One macro exports the fsgen the others consume,
+so a consumer attached before its own supplier simply returns -EPROBE_DEFER
+and lands on the deferred-probe list, where the core retries it.
+
+Shared by q6prm-clocks and q6afe-clocks, so both DSP generations are covered.
+
+Depends on the consumers having a link to this provider, otherwise they are
+still holding clk_nodrv_ops handles by the time we get here.
+
+Run the attach from a work item rather than out of probe directly:
+device_attach() on a consumer while this probe is still in flight finds the
+supplier in DL_DEV_PROBING, so device_links_check_suppliers() turns it away
+with -EPROBE_DEFER. The consumer is retried later and does bind, but the
+wasted attempt also trips a WARN in __device_links_no_driver(), which expects
+a supplier that is bound or unbinding rather than one mid-probe. Waiting until
+probe has returned lets the consumers bind on the first try.
+
+---
+--- a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
++++ b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
+@@ -7,6 +7,7 @@
+ #include <linux/module.h>
+ #include <linux/device.h>
+ #include <linux/platform_device.h>
++#include <linux/of_platform.h>
+ #include <linux/of.h>
+ #include <linux/slab.h>
+ #include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
+@@ -29,6 +30,7 @@
+ 
+ struct q6dsp_cc {
+ 	struct device *dev;
++	struct work_struct attach_work;
+ 	struct q6dsp_clk *clks[Q6DSP_MAX_CLK_ID];
+ 	const struct q6dsp_clk_desc *desc;
+ };
+@@ -126,6 +128,90 @@
+ 	return ERR_PTR(-ENOENT);
+ }
+ 
++/*
++ * Bind the consumers that were left stranded by the last DSP restart.
++ *
++ * This provider is a service on the DSP's packet-router bus, so its device is
++ * destroyed and recreated every time the DSP goes down and comes back, while
++ * its consumers -- the LPASS macro codecs and, behind them, the SoundWire
++ * masters -- are ordinary platform devices that outlive it. A device link
++ * makes those consumers release their clocks cleanly on the way down, but the
++ * link is purged along with our device, so the replacement device has nothing
++ * recording that anyone is waiting for it. The consumers are left unbound
++ * rather than deferred, and deferred probe therefore never retries them: the
++ * card simply never comes back.
++ *
++ * Walk the tree for nodes that name us in "clocks" and attach the ones that
++ * are currently unbound. This only ever binds -- it never releases a driver --
++ * so it cannot tear anything down over clocks that are already gone. Ordering
++ * needs no attention either: a consumer whose own supplier is still missing
++ * (fsgen, exported by one macro and used by the others) returns -EPROBE_DEFER
++ * and lands on the deferred-probe list, where the core takes over.
++ */
++static void q6dsp_clock_attach_consumers(struct device *dev)
++{
++	struct platform_device *consumer;
++	struct of_phandle_args args;
++	struct device_node *np;
++	int i, ret;
++
++	for_each_node_with_property(np, "clocks") {
++		if (np == dev->of_node)
++			continue;
++
++		for (i = 0; !of_parse_phandle_with_args(np, "clocks", "#clock-cells",
++							i, &args); i++) {
++			bool match = args.np == dev->of_node;
++
++			of_node_put(args.np);
++			if (!match)
++				continue;
++
++			consumer = of_find_device_by_node(np);
++			if (consumer) {
++				if (!consumer->dev.driver) {
++					ret = device_attach(&consumer->dev);
++					/*
++					 * -EPROBE_DEFER is the normal answer for
++					 * a consumer waiting on another consumer
++					 * (fsgen); the core retries those itself.
++					 */
++					if (ret < 0 && ret != -EPROBE_DEFER)
++						dev_warn(dev, "%pOFn did not attach: %d\n",
++							 np, ret);
++				}
++				put_device(&consumer->dev);
++			}
++			break;
++		}
++	}
++}
++
++/*
++ * Run the attach from a work item rather than straight out of probe.
++ *
++ * device_attach() on a consumer while we are still inside our own probe finds
++ * us in DL_DEV_PROBING, so device_links_check_suppliers() turns it away with
++ * -EPROBE_DEFER. The consumer lands on the deferred-probe list and does get
++ * bound eventually, but the wasted attempt trips a WARN on the way out --
++ * __device_links_no_driver() expects a supplier that is bound or unbinding,
++ * not one mid-probe. Waiting until probe has returned makes the consumers
++ * bind on the first try and takes the warning with it.
++ */
++static void q6dsp_clock_attach_work(struct work_struct *work)
++{
++	struct q6dsp_cc *cc = container_of(work, struct q6dsp_cc, attach_work);
++
++	q6dsp_clock_attach_consumers(cc->dev);
++}
++
++static void q6dsp_clock_cancel_attach(void *data)
++{
++	struct q6dsp_cc *cc = data;
++
++	cancel_work_sync(&cc->attach_work);
++}
++
+ int q6dsp_clock_dev_probe(struct platform_device *pdev)
+ {
+ 	struct q6dsp_cc *cc;
+@@ -180,6 +266,13 @@
+ 
+ 	dev_set_drvdata(dev, cc);
+ 
++	INIT_WORK(&cc->attach_work, q6dsp_clock_attach_work);
++	ret = devm_add_action_or_reset(dev, q6dsp_clock_cancel_attach, cc);
++	if (ret)
++		return ret;
++
++	schedule_work(&cc->attach_work);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(q6dsp_clock_dev_probe);

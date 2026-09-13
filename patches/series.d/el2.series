@@ -25,7 +25,6 @@
 0016-rpmsg-core-Make-it-easier-to-manually-create-endpoin.patch
 0017-net-qrtr-smd-Fix-race-conditions-while-opening-closi.patch
 0018-local-arm64-dts-qcom-x1-el2-drop-top-level-remotepro.patch
-0019-local-arm64-dts-qcom-x1-el2-store-RTC-offset-in-SDAM.patch
 0020-media-iris-Port-firmware-loading-without-TZ-PAS-from.patch
 0021-arm64-dts-qcom-x1-el2-Add-iris-video-firmware-node.patch
 0022-fixup-iris-qcom_mdt_load_no_init-dropped-pas_id-in-7.patch
@@ -57,6 +56,807 @@
 # sys_* helpers, which warn once each unless FBINFO_VIRTFB is set. The flag was
 # just never set; drm_fbdev_dma/shmem, omapdrm, exynos and tegra all set it.
 0035-drm-msm-Set-FBINFO_VIRTFB-on-the-fbdev-framebuffer.patch
+
+# --- hibernate at EL2 ------------------------------------------------------
+# Cross-boot resume completes with the fourteen patches below plus
+# pcie_qcom.hib_force_teardown=1 on the kernel command line. Everything else
+# from the hunt is out of the series -- see the dropped block at the end of
+# this section; files stay in patches/el2/ and the reasoning is in
+# docs.local/HIBERNATE-EL2.md.
+#
+# Still broken after a resume and NOT addressed here: the eDP panel stays
+# dark, and the ADSP glink edge is stale, so battery, thermal, audio and UCSI
+# behind it all time out.
+
+# Upstream in v7.3-rc1, absent from the 7.2 base: resume_target_kernel() masks
+# only IRQs, so a Debug/SError/FIQ taken during the restore copy -- when no
+# exception vectors are mapped -- is fatal and silent. At EL1 the firmware
+# hypervisor absorbs SError/FIQ routing; bare-metal EL2 takes them directly.
+# 0038 is the same series' error-path companion.
+0037-arm64-hibernate-mask-DAIF-before-restoring-hibernate.patch
+0038-arm64-hibernate-Restore-DAIF-state-on-error.patch
+
+# Post-restore, the SMMUv3 hardware and the restored kernel disagree about the
+# command-queue indices ("CMDQ error ... Illegal command" storms), the queue
+# sticks in error state and every later mapping silently never reaches the
+# hardware (F_TRANSLATION storm on the WiFi client, ath12k reset loop). Re-run
+# the device reset from .restore_noirq to resync. el2-only exposure: the plain
+# dtb leaves pcie_smmu to the firmware hypervisor.
+0041-local-iommu-arm-smmu-v3-resync-hardware-on-hibernate.patch
+
+# DEBUG, TEMPORARY -- the hibernate-with-Bluetooth-on crash, 2026-09-12.
+# Un-shelved from docs.local/shelved-patches/. Hibernating with the controller
+# powered writes the image to 100%, reboots, and the restored kernel dies with
+# no journal, no console and no pstore (efi-pstore never registers here, see
+# HIBERNATE-EL2.md:1165). The following boot reports "PM: Image not found
+# (code -22)" because swsusp_check() clears the swap signature as soon as it
+# FINDS the image, before reading it -- so that message is what a crashed
+# resume looks like, not evidence the image was never written.
+
+# LOAD-BEARING, and default off: needs pcie_qcom.hib_force_teardown=1 on the
+# command line, because sysfs only reaches the kernel that WRITES the image,
+# where it changes nothing. The kernel that READS the image leaves pcie4's RC
+# live at quiesce -- its endpoint is driverless (no ath12k in the initramfs)
+# so dw_pcie_suspend_noirq() takes the d3cold early return -- while the
+# restored image carries suspended=true and re-inits warm hardware. No single
+# register write in that re-init is lethal; the inherited state is. Tear the
+# RC down at freeze regardless, so restore re-inits cold hardware, which is
+# the state test_resume proves works.
+0057-local-PCI-dwc-qcom-force-RC-teardown-at-hibernate-freeze.patch
+
+# Real protocol bug, not hibernate-specific. receive_version_ack() resends
+# VERSION whenever the acked feature mask differs from ours, so a remote that
+# acks a SUPERSET of what we offered produces a byte-identical resend and an
+# unbounded VERSION/VERSION_ACK ping-pong. Seen against the ADSP (we offer
+# 0x1, it acks 0x7) at ~4 us per iteration; after 65 ms the doorbell storm
+# took the DSP firmware out.
+0066-local-rpmsg-glink-no-livelock-on-superset-version-ack.patch
+
+# The GPU restore. Proven together and only together -- 0069 alone took the
+# failure count 5 -> 1, 0068 closed the last one. Both engage only if the GPU
+# is runtime-ACTIVE at freeze (~/hibernate-script.sh does this); otherwise
+# adreno's freeze/restore are 5 us no-ops and the GMU is never brought up in
+# the restore path at all.
+#   0068  GMU_STATUS_PDC_SLEEP is software state, so it comes back from the
+#         image while the RSC comes from a reboot that reset it rather than
+#         slept it. a6xx_rpmh_start() then polls for an ACK that cannot
+#         arrive: "Unable to power on the GPU RSC". Clear the bit on a cold
+#         boot, a decision derived from hardware (CX_MISC_TCM_RET_CNTL), not
+#         from the image.
+#   0069  the arm-smmu (v2) driver behind the GPU aliases .restore onto
+#         .resume, which early-returns while the device is runtime-suspended.
+#         "Runtime-suspended" describes the image, not the silicon: the reset
+#         is skipped, the hardware never learns the restored stream mappings
+#         and the GMU cannot fetch its firmware.
+0068-local-drm-msm-a6xx-clear-stale-pdc-sleep-on-cold-boot.patch
+0069-local-iommu-arm-smmu-reprogram-on-hibernate-restore.patch
+
+
+# BACK IN 2026-09-10, one build after being trimmed out -- removing it is what
+# proved it load-bearing. The ADSP edge is stale after every cross-boot resume
+# and cannot be recovered from Linux, so every consumer behind it (battmgr, the
+# thermal zone, audio, UCSI) pays a full 10 s per request, forever. Measured on
+# the trimmed kernel: 34 "intent request timed out" in 5 minutes, all on
+# 6800000.remoteproc:glink-edge, zero successful requests between them, 28
+# battmgr -110s, systemd-journald and upowerd parked in D state and the load
+# average climbing 2.9 -> 4.1 with nothing runnable. Three consecutive timeouts
+# (30 s of total silence) is enough to call the remote gone and fail fast; any
+# success resets the count and a re-registered edge starts from zero.
+0072-local-rpmsg-glink-fail-fast-when-the-remote-is-gone.patch
+
+
+# Fix candidate, UNTESTED, and the last known step in the post-resume GPU
+# failure. 0068 gets the first (cold) bring-up right; this is the one after
+# it. a6xx_rpmh_stop() sets GMU_STATUS_PDC_SLEEP unconditionally, including
+# right after its own poll timed out and it logged "Unable to power off the
+# GPU RSC". The next bring-up reads warm from hardware, so 0068's cold-boot
+# clear does not apply, and a6xx_rpmh_start() waits for a wake ACK from an
+# RSC that never slept -> OOB timeouts -> DPU preemption timeout -> hangcheck,
+# and 3d00000.gpu ends at runtime_status=error. Roughly three minutes after
+# every cross-boot resume, and it needs a use/idle/use cycle to show.
+# Only arm the wake when the sleep was acknowledged. Residual risk in the
+# patch header; depends on 0068.
+0075-local-drm-msm-a6xx-do-not-claim-RSC-sleep-after-a-failed-power-off.patch
+# Keep: user A/B confirmed resume fails without 0076 (2026-09-12).
+0076-local-thermal-qcom-spmi-temp-alarm-dump-irq-state-on-restore.patch
+
+# THE FIX for the PMIC interrupt storm, found by the 0076 register dump (since
+# shelved to docs.local/shelved-patches/). The
+# peripheral was never the problem -- status/shdn_ctl1/alarm_ctl come back
+# byte-identical and RT_STS is clear. What the reboot resets is the INTERRUPT
+# configuration: SET_TYPE and both POLARITY registers go to power-on defaults
+# while irq_desc comes back from the image, so Linux runs handle_edge_irq
+# against hardware that is now level with no polarity. The ack clears the
+# latch, the level input re-latches at once, forever. Those registers are only
+# written by qpnpint_irq_set_type() at request time and spmi-pmic-arb has no
+# PM ops, so nothing replays them -- which is why unbind/rebind cured it and
+# re-initialising the alarm did not. Affects EVERY interrupt behind this
+# controller (pmic_glink/UCSI, pwrkey, RTC alarm), not just thermal.
+0077-local-spmi-pmic-arb-restore-irq-type-after-hibernation.patch
+
+# The sibling of 0077, one bus over, and the reason keyboard/touchpad/EC/lid
+# are all dead after a resume. msm_pinctrl_resume() re-applies only the pin
+# mux (ctl register) via pinctrl_force_default(); the interrupt config lives
+# in intr_cfg -- polarity, detection type, raw-status enable and the TARGET
+# PROCESSOR -- and is written only by msm_gpio_irq_set_type() at request time.
+# Measured: physically typing on the laptop for 10s after a resume, twice,
+# gave +0 on every TLMM input line. Replays irq_set_irq_type() for every
+# enabled gpio in .restore_noirq, and logs intr_cfg before/after so one boot
+# shows whether the register really was lost.
+0079-local-pinctrl-qcom-restore-irq-config-after-hibernation.patch
+
+# 0079 is inert without this. The x1e80100 TLMM driver never set .pm, so NO
+# pinctrl PM callback runs on this SoC -- not even the long-standing
+# msm_pinctrl_resume(). Proven the direct way: 0079 logs every interrupt it
+# reprograms and printed NOTHING after a resume while input stayed dead. Only
+# 5 of 86 qcom pinctrl drivers wire this up; sc7280 is the pattern.
+0080-local-pinctrl-qcom-x1e80100-wire-up-pm-ops.patch
+
+# FOURTH instance of the same defect class (after SMMU, PMIC irqchip, TLMM).
+# NECESSARY BUT NOT SUFFICIENT -- see the measured result below; the earlier
+# claim that it "explains the whole ADSP failure" is retracted.
+# IPCC_REG_RECV_SIGNAL_ENABLE is
+# written only by qcom_ipcc_unmask_irq(), and the reboot clears it. Normally
+# resume_device_irqs() rewrites it via the unmask -- but qcom_glink_smem
+# requests its interrupt with IRQF_NO_SUSPEND, so it is never masked and never
+# unmasked, and nothing rewrites the register. Every doorbell the DSP rings
+# after a resume is dropped inside IPCC. Sending still works (SEND_ID is a
+# stateless write), which is exactly the asymmetry observed: do_cleanup
+# reached the ADSP and tore down its audio service, while zero inbound
+# interrupts arrived. The DSP was answering all along.
+#
+# TESTED ON HARDWARE 2026-09-10, cross-boot (hibtest mode=reboot): it FIRES
+# and the ADSP is STILL DEAD. "qcom-ipcc 408000.mailbox: re-armed 2 receive
+# signal(s)" at 20:31:13, then battmgr -110 at 20:31:18 and "intent request
+# timed out 3 times, treating remote as gone" at 20:31:49. The doorbell was
+# only half of it: the reboot also RESETS the DSP, so it has no channels
+# open while the restored image still holds ten. Keep this patch -- the
+# register really is cleared and really does need rewriting -- and fix the
+# channel desync in 0082.
+0081-local-mailbox-qcom-ipcc-rearm-recv-signals-after-hibernation.patch
+
+# The other half of the ADSP failure, and the one that actually kills the
+# edge: a cross-boot resume resets the DSP, so it comes back with no glink
+# channels while the image still describes ten open ones. Unfixable after
+# the fact -- that is what all four recovery attempts in ADSP-EL2.md were
+# hitting, and why a post-resume rproc stop returns -22 (the SMP2P handshake
+# comes out of the image, so the remote never acks). Do it from the other
+# end instead: rproc_shutdown() before the snapshot, rproc_boot() after.
+# The stop/start cycle is MEASURED clean on a running EL1 machine -- 10
+# channels -> 0 -> 10, battmgr and UCSI recover. EL1 only in effect: at EL2
+# the DSPs are attach-only, never RPROC_RUNNING, so the notifier is inert.
+# Known pre-existing limitation it does NOT fix: audio. After any ADSP
+# restart the PDR ack for msm/adsp/audio_pd is never sent, the DSP faults
+# ~10 s later (servreg_monitor.c:537) taking CDSP with it, both recover, and
+# the sound card does not come back. Disable with
+# qcom_q6v5_pas.hibernate_restart=0.
+0082-local-remoteproc-qcom_q6v5_pas-restart-the-DSP-across-hibernation.patch
+
+# 0082 ALONE IS NOT ENOUGH -- tested 2026-09-11, it fails with -110. The freeze
+# half works (both DSPs "stopped before the image"), but rproc_boot() on the way
+# back never sees the SMP2P ready signal. Root cause one layer down, MEASURED
+# with the qcom_smp2p tracepoints on the failed machine:
+#     irq 17 smp2p-adsp (IPCC) +1   <- the ADSP does ring the doorbell
+#     irq 202 q6v5 ready       +0   <- no edge is ever raised
+#     smp2p_notify_in: slave-kernel: status:0x0 val:0x0
+# smp2p caches raw pointers into SMEM (in, out, entry->value) and they come back
+# from the image, while the resuming bootloader re-initialised SMEM underneath.
+# qcom_smp2p_intr() sees a non-NULL ->in and never re-acquires, so every entry
+# reads empty. Both directions: it is also why a post-resume rproc stop gets
+# "timeout waiting for shutdown response" and then -EINVAL. FIFTH instance of
+# the defect class (SMMU, PMIC irqchip, TLMM, IPCC, smp2p). 0082 depends on
+# this one; do not test 0082 without it.
+0083-local-soc-qcom-smp2p-reacquire-smem-items-on-hibernate-restore.patch
+
+# The last piece. With 0082+0083 the CDSP comes back and the ADSP still gets
+# -110, and the resync log shows why: NOTHING MOVED for the adsp
+# (in 235b9885->235b9885), so 0083's stale-pointer premise does not describe
+# that edge. The difference is entry->last_value. CDSP's item was not published
+# yet, so last_value stayed 0 and the first doorbell was a change -> ready
+# fired. ADSP's item was already there (bootloader started it), so
+# qcom_smp2p_start_in() latched the PREVIOUS incarnation's asserted ready bit,
+# and the instance we authenticated asserting it again was status==0, no edge,
+# timeout on a DSP that was already up. Latching is correct for smp2p (zeroing
+# would re-deliver fatal/stop as rising edges), so fix the assumption where it
+# lives: on timeout consult the smp2p LINE LEVEL, which readl()s the shared
+# item and cannot be fooled by last_value. Requires fatal+stop clear so a stale
+# ready from a remote that did not return cannot pass as a start.
+0084-local-remoteproc-qcom_q6v5-fall-back-to-the-smp2p-line-level.patch
+
+# BLUETOOTH AFTER RESUME. Third TLMM instance, after 0079 (intr_cfg) and 0080
+# (wiring .pm up at all): the ctl and io registers are lost too, and nothing
+# replays them either. Measured via /sys/kernel/debug/gpio, which is a real
+# MMIO read -- gpio116, the WCN7850's BT_EN, reads "out high" cold and
+# "in low pull down" (the power-on default) after a resume, so pwrseq's
+# gpiod_set_value() writes an io register that reaches no pad and hci0 dies at
+# "command 0xfc00 tx timeout". Pins with a second owner hid this: uart14's
+# gpio56-59 are re-muxed by the BOOT kernel probing a98000.serial before it
+# loads the image, and gpio117/WLAN_EN comes back driven at 16mA, a strength no
+# DT here asks for, so the boot firmware asserted it -- which is exactly why
+# Wi-Fi survives a resume and Bluetooth does not. Saves ctl+io at
+# .freeze/.poweroff, writes them back at .restore_noirq ahead of 0079's replay.
+# HARD DEPENDENCY on 0079, not just ordering: both rewrite
+# msm_pinctrl_dev_pm_ops, and this patch's diff carries 0079's
+# .restore_noirq line as CONTEXT. Dropping or reordering 0079 makes this fail
+# to apply, and 0080 is what gives x1e80100 pm_ops at all -- without it neither
+# does anything on this SoC. Treat 0079/0080/0085 as one unit when touching any
+# of them. Kept as three patches because 0080 is independently upstreamable and
+# 0079 still carries the before/after logging that has to stay for now.
+0085-local-pinctrl-qcom-restore-gpio-pad-state-after-hibernation.patch
+
+# THE DPU UNDERRUN FIX (0086 + 0091 squashed 2026-09-12). 0034 fixes the
+# bandwidth vote for runtime PM but cannot reach the hibernate path --
+# SET_SYSTEM_SLEEP_PM_OPS points .restore at pm_runtime_force_resume(), which
+# no-ops because needs_force_resume comes out of the image (the "returned 0
+# after 0 usecs" in the day-one notes). This adds a real .restore that re-votes
+# bw then clock, plus dpu_vbif_init_memtypes() and the encoder resume, and a
+# bw_debug knob (default off) that logs the calculation's inputs.
+#
+# RETRACTED 2026-09-11, and the retraction is the load-bearing part. The
+# "bw_ctl=0 after resume vs bw_ctl=2441871360 healthy" measurement that drove
+# two build cycles was a `tail -6` ARTIFACT: every zero line was timestamped
+# inside a ~10 ms window at the END of the capture -- modetest being killed and
+# CRTCs 110..114 tearing down at once. The healthy capture's last six lines
+# happened to include live ones, the broken capture's did not. bw_debug then
+# measured the calculation DURING operation and it is healthy --
+# plane_mask=0x1 sum=2034892800, both mode sources agreeing, which also kills
+# the stale-crtc->mode theory. DO NOT RESTART THE BANDWIDTH HUNT.
+#
+# KEEP IT ANYWAY. The missing .restore and the half-zeroed VBIF QoS remapper
+# (vbif 0x550-0x5c0, 00300030 -> 00000030, nothing else reprograms it) are
+# genuine gaps that this closes. It simply does not fix the panel.
+#
+# The underruns themselves ARE real: dpu_enc_underrun_cb fires ~2x per frame on
+# the eDP encoder, confirmed by tracepoint and visible on an EXTERNAL monitor
+# as one correct strip at the top (FIFO prefilled in vblank) then solid blue.
+# They are not what blacks the panel (that is 0090) -- INTF_UNDERFLOW_COLOR is
+# 0x000000ff in both states, so a merely-starved eDP would read blue too.
+#
+# THE CORE CLOCK, folded in from the former 0091 and VERIFIED 2026-09-12. The
+# underrun is real and its cause is the DPU core clock at 325 MHz instead of
+# 575. Read from silicon at disp_cc + 0x0:
+#     healthy  L_VAL=00440059 ALPHA=0000d800 -> 1725.0 MHz
+#     resumed  L_VAL=00440032 ALPHA=0000c800 ->  975.0 MHz
+# and mdss_mdp_clk_src is pll0/3. Every other PLL register is identical. The
+# RCG's own divider is correct on BOTH boots, which is why dumping it proved
+# nothing -- it is the PLL feeding it that drifted.
+#
+# A plain dev_pm_opp_set_rate() cannot fix that: it computes
+# forced = (current_rate_single_clk != freq) and _set_opp() returns early when
+# !forced && old_opp == opp. Both caches come back in the image, so the call
+# programs nothing -- not the clock, not the PLL, not the genpd perf state.
+# Step through another OPP first so the cache disagrees; CLK_SET_RATE_PARENT on
+# mdss_mdp_clk_src then propagates the real set down into the PLL. Logs
+# "hibernate: core clock forced to 534159360 Hz (rc=0)" on a real resume.
+0086-local-drm-msm-dpu-restore-bandwidth-and-core-clock-on-hibernate-restore.patch
+
+# THE eDP PANEL FIX, 2026-09-11 20:00. ROOT CAUSE CONFIRMED ON HARDWARE.
+# After a cross-boot resume the eDP pixel clock RCG (disp_cc + 0x82a0) has N
+# halved -- M=2903 N=7500 instead of N=15000 -- so the clock runs at exactly
+# 522,540,000 Hz instead of 261,270,000, i.e. the mode's rate at 1 pixel per
+# clock instead of the widebus 2. The INTF timing is widebus-halved on both
+# boots (htotal 1512), so the panel is driven at 120 Hz instead of 60. Measured
+# two independent ways: modetest -v reported 119.9 vs 59.8 Hz, and the
+# dpu_enc_frame_done_cb intervals agreed (8.34 vs 16.72 ms).
+#
+# 120 Hz is out of range for this 90 Hz panel, so the sink locks the LINK and
+# never presents -- which is why link training, DPCD, SMMU, DDR, every DPU and
+# DP register and a full mdss_gdsc power cycle all checked out perfectly while
+# the screen stayed black. Writing the healthy M/N back by hand and triggering
+# CMD_UPDATE made the panel light up: confirmed by repair, not just by reading.
+#
+# Mechanism: clk_set_rate() is called correctly on every modeset but
+# clk_core_set_rate_nolock() bails when the request equals core->rate -- the
+# CACHE, restored from the hibernation image. Same class as 0034/0068/0069/
+# 0077/0079/0080/0081/0083. Note debugfs clk_rate is NOT a hardware read
+# (CLK_GET_RATE_NOCACHE), which is why an early "78/78 clocks match" sweep
+# wrongly killed the clock theory.
+#
+# STILL OPEN after this: with the rate corrected the panel presents a strip of
+# correct pixels then INTF_UNDERFLOW_COLOR blue -- a real DPU underrun, the
+# same thing the external monitor always showed, and a separate bug.
+# mdss_mdp_clk_src is NOT its cause (CFG=00000105 src_div=5 on both boots).
+0090-local-drm-msm-dp-reprogram-the-pixel-clock-RCG-on-hibernate-restore.patch
+
+# THE GPU FIX. Found with the (now shelved) 0092 instrumentation:
+# a6xx_gmu_rpmh_init() programs the
+# RSC/PDC sequencer once at probe, and after a cross-boot restore the block is
+# reset with nothing reprogramming it. RSC_STATUS0_DRV0 reads 00000000 on the
+# first handshake after a resume, where 925 healthy handshakes only ever show
+# 01000000 (awake) or 01010006 (asleep). Unprogrammed sequencer -> the sleep
+# handshake cannot complete -> GMU OOB timeouts, CP ucode error, hangcheck.
+#
+# Also DISPROVED the hypothesis going in: the cold boot logs "clearing
+# GMU_STATUS_PDC_SLEEP (was clear)", so 0068 is behaving exactly as intended and
+# is NOT over-correcting. It stays.
+#
+# 0093 detects the unprogrammed state from HARDWARE (a zero STATUS0_DRV0) rather
+# than any flag -- every flag here comes back from the image and matches by
+# construction, which is what hid 0090, 0086 and 0068 -- and reprograms. Needed
+# caching the devm PDC mappings so rpmh_init can be re-run without leaking.
+0093-local-drm-msm-a6xx-reprogram-the-RSC-sequencer-after-hibernate.patch
+#
+# VERIFIED ON HARDWARE 2026-09-12. The reprogram fires and works:
+#   53.921256  RSC sequencer unprogrammed (STATUS0_DRV0=0) -- reprogramming
+#   53.921275  cold boot: clearing GMU_STATUS_PDC_SLEEP (was SET)
+#   53.921283  rpmh start:entry  STATUS0_DRV0=01000000   <- correct, not 0
+# "Unable to power off the GPU RSC" is GONE, and the GPU now runs a fully
+# working desktop for ~74 s after a resume (it previously died at the greeter).
+# Note "(was SET)": the stale PDC_SLEEP bit really does arrive set from the
+# image, so 0068 is doing real work and is NOT over-correcting.
+#
+# STILL BROKEN, a DIFFERENT fault further along:
+#   128.50  hw_init: timeout waiting for GPU to idle
+#           status 00800005 irq 00800200 rptr/wptr 12/12   (ring empty, not idle)
+#   128.50  gpu fault ring 0 fence 7c / CP ucode error interrupt
+#   128.50  hangcheck recover! offending task: Hyprland
+#   129.63  *ERROR* cx gdsc didn't collapse      <- recovery then impossible
+#   129.64  Timeout waiting for GMU OOB set GPU_SET, forever
+#
+# Two separable problems. (a) something makes the GPU fault ~74 s in, on a
+# hw_init after an idle. (b) a6xx_recover() cannot reset it because the CX
+# genpd never collapses -- gpu and gmu both sit runtime_status=active and the
+# pd_gate completion times out.
+#
+# (b) IS NOT A KERNEL BUG -- resolved 2026-09-12. This machine has a local
+# /etc/udev/rules.d/99-gpu-runtime-pm.rules that pins the gpu and gmu
+# power/control=on whenever it is on external power, which is precisely what
+# stops a6xx_recover() collapsing cx. Unplugged, "cx gdsc didn't collapse"
+# does not occur at all. Nothing to fix in-tree; it does mean every GPU
+# measurement has to be taken on battery or it measures the udev rule.
+#
+# That leaves (a), which 0094 is the fix candidate for.
+#
+# a6xx_zap_shader_init() remembers "already loaded" in a function-local static.
+# That flag comes back SET out of the hibernation image while the reboot reset
+# the secure world, so the shader is not loaded in hardware, hw_init takes the
+# early return, and then tells a still-secure GPU to leave secure mode. The
+# in-tree comment at the call site predicts exactly this ("a permissions
+# violation will soon follow"). Same defect class as 0090/0086/0093/0068/0069:
+# one-shot software state that survives the image and matches by construction.
+0094-local-drm-msm-a6xx-reload-the-zap-shader-after-hibernate.patch
+0095-local-remoteproc-qcom_q6v5_pas-use-boot-lite-IDs-after-hibernate.patch
+0096-local-ASoC-qcom-q6apm-enable-responses-before-child-probes.patch
+
+# Not a hibernate bug, despite being found here: a plain "echo stop > .../
+# remoteproc0/state; echo start > ..." reproduces it in two seconds on a
+# never-hibernated system. Every clock the LPASS macro codecs use comes from
+# &q6prmcc, a clock controller on a GPR service of the ADSP, so restarting the
+# DSP unregisters the provider under live consumers. clk_unregister() does not
+# fail -- it installs clk_nodrv_ops (.prepare returns -ENXIO) -- so the handles
+# are dead for good, runtime_resume fails, power.runtime_error latches, and all
+# four macros sit in runtime_status "error" with the card present and silent.
+# Recording the dependency makes the driver core unbind the codecs BEFORE the
+# supplier's remove runs, so they release live clocks and get re-probed when the
+# DSP returns. Do not "fix" this by re-probing afterwards -- see shelved 0098,
+# which froze the machine twice.
+0099-local-ASoC-codecs-lpass-macro-depend-on-the-dsp-that-provides-the-clocks.patch
+
+# The other half of 0099. A device link makes the consumers release their
+# clocks cleanly when the DSP goes down, but the link is purged with the
+# provider's device (device_del -> device_links_purge), so the replacement
+# provider has nothing recording that anyone is waiting for it. The codecs are
+# left UNBOUND rather than deferred, deferred probe only retries the deferred
+# list, and the card never returns at all. Attach them from the provider's
+# probe. Attach-only on purpose -- releasing a driver there would tear the
+# stack down over already-unregistered clocks, which is what hung the machine
+# with shelved 0098.
+0100-local-ASoC-qcom-q6dsp-lpass-clocks-rebind-consumers-when-the-provider-returns.patch
+
+# Fallout from 0099/0100 making the unbind/rebind path reachable at all: these
+# drivers' remove paths have never run on this SoC and are broken three ways.
+# wsa_macro leaks its clk registration (clk_hw_register, not devm) so re-probe
+# dies -EEXIST and the card never returns; nobody calls pm_runtime_disable() so
+# the next probe warns "Unbalanced pm_runtime_enable!"; and every remove
+# double-disables the clocks its runtime_suspend already dropped, because
+# __device_release_driver() runtime-suspends before calling .remove() -- that
+# is the WARN storm, and the panic when panic_on_warn is set.
+0101-local-ASoC-lpass-macro-soundwire-make-the-remove-paths-work.patch
+
+# The dependency chain is two deep -- q6prmcc -> macro -> SoundWire master --
+# and 0100 only covers the first hop. The masters take "iface" from a macro, so
+# they are unbound with it and then never rebound (force-unbound devices are not
+# on the deferred list), leaving no SoundWire bus, no wsa884x, and a card device
+# that stays bound with no ALSA card behind it. Same attach-only trick, applied
+# where the macro re-registers its fsgen.
+0102-local-ASoC-lpass-macro-rebind-fsgen-consumers-after-a-dsp-restart.patch
+
+# 0102 gets the SoundWire masters re-attached; they then fail to probe, because
+# of_irq_get() cannot remap their interrupt. The DT says IRQ_TYPE_LEVEL_HIGH and
+# the driver requests IRQF_TRIGGER_RISING over the top of it; the mapping
+# survives the unbind, so the second of_irq_get() hits "type mismatch" and gets
+# virq 0 back -- which the driver does not reject, so it request_irq(0)s and
+# fails -EINVAL. Dispose the mapping on unbind so the next probe rebuilds it.
+0103-local-soundwire-qcom-drop-the-irq-mapping-on-unbind.patch
+
+# Last hop. With everything below it rebinding, the card still does not come
+# back: it holds DAI-name pointers borrowed from the components
+# (snd_soc_dai_name_get() does not copy), stays bound on ASoC's rebind list
+# when they go away, and retries forever against freed names -- "CODEC DAI
+# not registered", with the name printed empty. Unbind/bind of "sound" by hand
+# fixes it; a managed link with DL_FLAG_AUTOPROBE_CONSUMER makes the core do
+# the same thing at the right moment.
+0104-local-ASoC-qcom-common-follow-the-dai-components-the-card-resolved.patch
+
+# The cold-boot delay: apm_probe() asks the DSP for SPF state ~40 ms after the
+# ADSP reports up, SPF is not answering yet, and the flat 5 s wait gates
+# everything behind it -- macros bind 35 ms after it gives up, card0 70 ms after
+# that. Measured: card at 12.33 s instead of ~7.1 s, which is why the first
+# speaker-test after a cold boot finds no card. Poll with short waits instead of
+# parking on the worst case. Adds a timeout-taking variant of
+# audioreach_send_cmd_sync(); the old entry point and every other command are
+# unchanged.
+0107-local-ASoC-qcom-q6apm-poll-for-spf-readiness-instead-of-one-long-wait.patch
+
+# BLUETOOTH AFTER RESUME, second half (0085 is the first). With the pad restored
+# the chip is enabled -- sampling gpio116 every 50 ms through a power-on shows a
+# clean low->high at +60 ms on each of the four qca_setup() retries -- and it
+# still answers nothing. port->setup is a bool set once in
+# qcom_geni_serial_port_setup() and cleared NOWHERE, so after a cross-boot
+# resume qcom_geni_serial_startup() skips the only code that programs the serial
+# engine: SE firmware load, setup_fifos(), RX_STALE_CNT, packing, watermarks,
+# mode select. Confirmed by repair: rebinding hci_uart_qca alone fails
+# identically, rebinding a98000.serial (which re-creates the port struct) works
+# first try. That also excludes the dev_pm_opp_set_rate() rate cache -- the clk
+# core caches against the gcc provider, not the consumer, so it survives an
+# unbind and the rebind could not have fixed it. Clears the flag on .restore
+# only; suspend/resume keep skipping the work.
+0108-local-tty-serial-qcom-geni-re-setup-the-serial-engine-after-hibernate.patch
+
+# Hibernating with Bluetooth ON does not survive the resume; with it OFF it
+# always has. The difference is that an open serdev port makes uart_resume_port()
+# run the full re-init instead of taking its early return. This closes the port
+# and powers the chip down at .freeze so the image records the case that works,
+# and brings it back with hci_reset_dev() at .restore. AVOIDS the fault rather
+# than fixing it -- any other geni UART open across a hibernate still hits it.
+# Brought back from a PM notifier on PM_POST_HIBERNATION, not from .restore:
+# the restore callback runs inside dpm_resume(), so a firmware download there
+# lands on top of the display and GPU restore and the desktop waits for it.
+# The notifier point is after dpm_resume_end() and thaw_processes().
+# qca_freeze() also clears hdev->hw_error AND hdev->reset -- both answer "no
+# reply" by talking to the chip anyway, and hci_cmd_timeout() -> qca_reset()
+# crashes the SoC for a dump, then calls hci_reset_dev() to go round again.
+# The crumb instrument that was chasing the underlying fault was withdrawn
+# after it turned out to be writing PMIC bytes outside the range 0043
+# validated; see docs.local/METHOD.md.
+0114-local-Bluetooth-hci_qca-close-the-controller-before-the-hibernate-snapshot.patch
+
+# Twenty of the twenty-eight seconds between 0114's restore callback and a
+# working controller are two HCI_INIT_TIMEOUTs caused by the core running
+# hdev->shutdown against the chip qca_freeze() already powered off. This skips
+# the pre-shutdown VSC when QCA_BT_OFF is set. Reverted once as 0114 rev2, when
+# the tree still had the hdev->flush use-after-free that rev4 fixed; retrying on
+# the theory that the wait was hiding that bug rather than doing work.
+0115-local-Bluetooth-hci_qca-skip-the-pre-shutdown-command-when-the-chip-is-off.patch
+
+# THE WARNINGS LEFT BEHIND BY A DSP STOP/START. Reproduced without hibernating:
+# "echo stop > /sys/class/remoteproc/remoteproc0/state; sleep 2; echo start > ...".
+#
+# 0116 WAS HERE AND IS SHELVED -- it broke the speakers. It linked
+# 6e80000.pinctrl to the clock controller so pm_clk would release
+# LPASS_HW_MACRO/DCODEC before clk_unregister() retired them, which did remove
+# two clk.c:4482 WARN_ON_ONCE splats. But unbinding the pin controller
+# force-unbinds its whole gpio subtree, and the reset.gpio.* AUXILIARY devices
+# behind wsa884x's reset-gpios never come back -- force-unbound devices are not
+# on the deferred-probe list. wsa884x takes that reset with
+# devm_reset_control_get_optional_shared(), so it probes happily with
+# sd_reset == NULL and never deasserts, leaving the WSA8845s in the reset
+# spkr_01_sd_n_active's "output-low" put them in. Everything reads BOUND,
+# nothing defers, nothing errors, and the speakers are simply UNATTACHED.
+# See docs.local/shelved-patches/README.md before reviving it.
+
+# ucsi_unregister() disables notifications as its first act, and PDR calls it
+# precisely because the PD carrying that interface has gone -- so the write goes
+# to a dead remote and is reported as "failed to send UCSI write request: -5".
+# Nothing is wrong and the caller ignores the return. Refuse from pd_running,
+# which PDR has already set, instead of learning it from the transport.
+0117-local-usb-typec-ucsi-glink-do-not-send-to-a-protection-domain-that-is-down.patch
+
+# "Handover signaled, but it already happened" is SMP2P behaving normally:
+# qcom_smp2p_check_ssr() zeroes entry->last_value on every scan once SSR-ack is
+# negotiated, so the doorbell carrying the remote's stop-ack re-delivers ready
+# and handover with it. The guard is right, the error level is not. NOT fixed in
+# SMP2P -- that re-delivery is what raises the ready edge after a restart, and
+# making the reset conditional would risk every start falling back to 0084's
+# line level and paying a 5 s timeout.
+0118-local-remoteproc-qcom_q6v5-a-repeated-handover-signal-is-not-an-error.patch
+
+# Two more the SSR loop surfaced once 0116-0118 stopped hiding the rest of the
+# cycle. Neither is new, both are upstream and both predate this stack; they
+# only became visible because the restart path now runs to completion.
+#
+# 0119: ucsi_debugfs_register() is called from ucsi_register() but released
+# only from ucsi_destroy(), which pairs up for an interface registered once.
+# ucsi_glink registers and unregisters on every PDR down/up, so the second
+# registration hits "debugfs: 'pmic_glink.ucsi.0' already exists in 'ucsi'" and
+# overwrites ucsi->debugfs, leaking the old struct and its dentries each time.
+0119-local-usb-typec-ucsi-drop-debugfs-on-unregister-not-only-on-destroy.patch
+
+# 0120: "Driver needs fixing: Unsorted reg_defaults". Both macro drivers build
+# their table at probe by memcpy'ing a codec-version table onto the base one,
+# and the version registers interleave with the base range, so the result is
+# unsorted even though each half is in order. regcache_sort_defaults() is
+# exported for this; same sort(), same comparator, same buffer regmap would
+# have sorted itself, so the array is identical and only the pass and the
+# message go.
+0120-local-ASoC-lpass-macro-sort-the-reg_defaults-we-assemble.patch
+
+# The one real defect of the set, and the second attempt at it. 6e80000.pinctrl
+# takes LPASS_HW_MACRO/DCODEC from &q6prmcc through pm_clk and still holds them
+# when a DSP restart unregisters the provider, so clk_unregister() retires the
+# handles into clk_nodrv_ops: two "unregistering prepared clock", two
+# clk.c:4482 WARN_ON_ONCE on the next autosuspend, and a dead LPASS vote for
+# the rest of the boot (-ENXIO out of __pm_clk_enable on every later resume).
+# 0116 fixed it with a device link and broke the speakers -- see
+# docs.local/shelved-patches/README.md. This releases the clocks from a bus
+# notifier on the provider instead: BUS_NOTIFY_UNBIND_DRIVER arrives before
+# device_remove(), so pm_clk_destroy() unwinds them while they are still live,
+# and BUS_NOTIFY_BOUND_DRIVER gets fresh ones. NO BIND STATE CHANGES, which is
+# the whole point -- that is what 0116 got wrong.
+0121-local-pinctrl-qcom-lpass-lpi-hand-the-clocks-back-before-the-provider-goes.patch
+
+# Found by cycling twice in one boot, which nothing before this stack could do
+# -- audio was dead after the first cycle, so a second was meaningless.
+# qcom_swrm_probe() requested its interrupt before sdw_bus_master_add() filled
+# bus->slaves from the DT, and qcom_swrm_get_device_status() registers any
+# attach it cannot find there under a NULL fwnode. On a re-probe the speakers
+# are still enumerated on the wire, so the interrupt fires into an empty list,
+# claims the DT entry's name, and sdw_of_find_slaves() dies -EEXIST: no card,
+# and a driverless zombie device left behind. Request the irq after the bus is
+# populated, and disable it before sdw_bus_master_delete() empties the list on
+# the way out.
+0122-local-soundwire-qcom-do-not-enumerate-before-the-bus-knows-its-slaves.patch
+
+# HW video decode after a cross-boot resume. The iris firmware lives in the
+# no-map video_mem carveout, which has no struct page and so is never in the
+# hibernation image -- but core->state comes back from the image saying the
+# firmware is loaded and booted. iris_pm_resume() then takes the power-collapse
+# exit path, re-boots firmware that is not there, and returns -EBUSY; and
+# iris_core_init() short-circuits on that same IRIS_CORE_INIT, so nothing ever
+# reloads it and every open() of /dev/video0 fails -EBUSY for the rest of the
+# boot. Reset the core to DEINIT on .restore. Software side only: the block is
+# powered down by the preceding .freeze and its registers must not be touched,
+# which is why iris_fw_unload() (it resets the XTSS first) is not reused.
+# Textbook METHOD.md shape A, same family as 0094's zap shader.
+0123-local-media-iris-reload-the-firmware-after-hibernate.patch
+
+#
+# VERIFIED ON HARDWARE 2026-09-12, on BOTH power states:
+#   38.668993  qcom_scm: PM: platform_pm_restore returned 0   <- SCM back first
+#   38.697375  adreno 3d00000.gpu: hibernate: zap shader will be reloaded
+#   45.193333  RSC sequencer unprogrammed (STATUS0_DRV0=0) -- reprogramming
+#   45.193360  rpmh start:entry  STATUS0_DRV0=01000000
+# then nothing: zero CP ucode error, zero hw_init timeout, zero gpu fault, zero
+# hangcheck, zero "cx gdsc didn't collapse". devfreq logged 1850 transitions
+# reaching the top 1250 MHz OPP, so the GPU is genuinely rendering rather than
+# merely quiet. THE DESKTOP SURVIVES A CROSS-BOOT RESUME AND STAYS USABLE.
+#
+# Both power states had to be tested: they take different restore paths, thanks
+# to the local udev rule that pins the GPU runtime-active on external power.
+# power/control=on is pm_runtime_forbid(), which holds a usage_count, so
+# pm_runtime_need_not_resume() (needs usage_count <= 1) is false and
+# pm_runtime_force_suspend() sets needs_force_resume instead of marking the
+# device suspended -- the GMU is then booted EAGERLY inside the restore and zero
+# rpmh handshakes follow. On battery it stays suspended across the restore and
+# the GMU comes up lazily at the first submit, then cycles normally. Clearing
+# the flag in .restore is right for both: it runs before adreno_system_resume()
+# either way, and hw_init() -- the only caller of a6xx_zap_shader_init() -- is
+# reached from msm_gpu_submit() regardless.
+#
+# This was the LAST fault in the resume path. 0090 + 0086 + 0093 + 0094 together
+# take this machine from "black panel" to a working desktop after hibernate.
+#
+# VERIFIED ON HARDWARE 2026-09-11 20:20. Read from silicon across four boots:
+#   healthy N=15000 | broken N=7500 | after manual poke N=15000
+#   after 0090, automatically on a real resume: N=15000
+# and the restore logs "pixel clk cache 261270000 -> 130635000 Hz". THE PANEL
+# NOW PRESENTS AFTER A RESUME instead of showing nothing.
+#
+# What it presents is INTF_UNDERFLOW_COLOR blue -- the second, independent
+# fault. Note every earlier underrun measurement was taken while the clock ran
+# at 2x (double the fetch demand), so none of them distinguish an independent
+# bug from a consequence of this one. Next suspect: disp_cc_pll0 at
+# disp_cc + 0x0, parent of mdss_mdp_clk_src (src_sel=1, src_div=5 => pll0/3).
+#
+# RESULT 2026-09-11 19:30: the MDSS wrapper is NOT the cause. 0x090..0x0CC
+# looked like firmware state lost across hibernate (1 healthy / 0 resumed) but
+# it is an ACTIVITY flag: healthy reads 0 when idle, and the resumed machine
+# reads 1 on all sixteen when modetest holds a mode. Writing 1 sticks and
+# changes nothing -- no LM CRC, panel still black. The dump only does
+# pm_runtime_resume_and_get(), which powers the block but starts nothing.
+#
+# KEEP IT: read-only, and the only view of ae00000 that exists. But fix it to
+# hold a mode before trusting any future comparison.
+#
+# RESULT 2026-09-11 18:45: the SMMU is NOT the cause. The restore print says
+# "106 of 117 stream mapping groups disagree", which looks damning next to the
+# GPU SMMU's 0 of 24 -- but the debugfs dump shows every disagreement is
+# qcom_smmu_write_s2cr()'s bypass_quirk substitution (89 FAULT->FAULT cb0/cb255,
+# 5 BYPASS->TRANS cb255->cb73=bypass_cbndx). ZERO groups that should translate
+# fail to. MDSS SID 1c00/0002 is TRANS on cb 8; cb 8 has cached TTBR0 == live
+# TTBR0 and SCTLR M=1. The GPU reads 0 only because qcom_adreno_smmu_500_impl
+# does not install .write_s2cr.
+#
+# KEEP IT for now anyway: it is read-only, it is the only view of cached-vs-live
+# SMMU state on this machine, and the count in the restore log is a cheap
+# regression check. If it is ever re-read, teach it about bypass_quirk first so
+# the count stops crying wolf.
+
+# 0086 SECOND PREMISE ALSO RETRACTED, 2026-09-11 late. The VBIF claim -- "half
+# the QoS remapper at 0x550-0x5c0 comes back zeroed, 00300030 -> 00000030" --
+# came from dpu-HEALTHY-NOSDDM.txt vs dpu-BROKEN-NOSDDM.txt, and that pair is
+# NOT comparable. sspp_8 SSPP_FETCH_CONFIG reads 00000087 healthy and 000c0087
+# resumed; _dpu_hw_sspp_setup_format() writes the highest_bank_bit field ONLY
+# for non-linear formats, so one side was fetching LINEAR and the other UBWC.
+# The healthy side also had two planes active (sspp_9, a 512x512 leftover) to
+# the resumed side's one, and dpu_vbif_set_qos_remap() runs PER ACTIVE PLANE --
+# which is exactly why the UPPER 16 bits of all twelve remap registers differ.
+#
+# So the VBIF re-init may still be correct; its EVIDENCE was never valid. Do not
+# cite those twelve registers again without a controlled capture from
+# ~/clean-dump.sh, which pins format, plane count and mode on both sides.
+
+# THE PANEL'S OWN POWER SEQUENCE: raised and DISPROVEN ON HARDWARE the same
+# evening, 2026-09-11. Written up as 0087, now in docs.local/shelved-patches/.
+#
+# The theory: this is a Samsung ATNA33XC20 OLED whose driver warns that "once
+# EL_ON3 drops we absolutely need a power cycle before the next enable or the
+# backlight will never come on again", and which enforces T12 (500 ms min off)
+# in software against p->powered_off_time -- a stamp that comes out of the
+# SNAPSHOT IMAGE on a cross-boot restore, i.e. the wrong epoch, so the wait is
+# skipped and the panel is re-powered too soon.
+#
+# The measurement that killed it. On the resumed, black machine, with sddm
+# stopped so fbcon owned the CRTC, fb0/blank drove a full FB_BLANK_POWERDOWN ->
+# drm_client_modeset_dpms(OFF) cycle straight through the panel driver:
+#
+#     1.09s  active     -> suspending
+#     1.15s  suspending -> suspended     <- regulator off, powered_off_time
+#                                           stamped correctly, from THIS boot
+#     4.23s  suspended  -> resuming      <- 3082 ms genuinely powered down
+#     4.34s  resuming   -> active        <- 110 ms, T12 already satisfied
+#
+# That is a real, spec-honouring power cycle -- six times the T12 minimum, rail
+# down, EL_ON3 down, full prepare/enable chain and link retrain on the way back.
+# THE PANEL STAYED BLACK. So the panel's power sequence, its power-on timing and
+# the DDIC's post-power-cycle state are all excluded, and 0087 fixes nothing.
+#
+# Worth keeping for the exclusion, which is a large one: combined with the
+# byte-identical DPCD, the whole "the panel is latched off" branch is now dead.
+
+
+# ---------------------------------------------------------------------------
+# ADSP: four RECOVERY approaches exhausted 2026-09-10. NOT closed -- see the
+# correction at the end of this block.
+#
+# After a cross-boot resume the ADSP answers NOTHING. Measured with the
+# qcom_glink tracepoints on a resumed machine: one VERSION sent (0078's knob),
+# and our own tx is the ONLY glink event in the whole capture. No reply, no
+# late arrival. It has not crashed either -- the smp2p `fatal`, `ready`,
+# `handover` and `stop` interrupts are all at zero and remoteproc still reads
+# `attached`. It is alive and simply does not respond.
+#
+#   rproc detach/attach (0065)  mechanism works, the DSP then crashes
+#   glink edge cycle    (0067)  oopsed, NULL deref
+#   GLINK SSR do_cleanup(0073)  no CLEANUP_DONE; destroys a healthy edge
+#   fresh VERSION       (0078)  total silence
+#
+# The one thing that would work -- restarting the DSP -- needs TZ/PAS, and at
+# EL2 qcom_pas_ops_no_reset has no .start and no .load. That is the whole
+# reason 0008-0014 exist to attach to an already-running DSP.
+#
+# Consequence: battery, charging, thermal reporting and audio stay dead after
+# a cross-boot resume, and 0072 is what keeps that from taking the machine
+# down with it. Do not retry those four as-is.
+#
+# CORRECTION: "wall, stop" was an overclaim. 0013's commit message says PAS
+# AUTHENTICATION WORKS at EL2 -- only the hardware reset register sequence is
+# missing, and on this firmware split that sequence is performed by the QC
+# hypervisor. That is why Windows can restart the DSP on resume and we cannot:
+# we removed the hypervisor by booting at EL2. It is a reverse-engineering
+# gap, not a security boundary.
+#
+# Also unexplained: the failure is ONE-DIRECTIONAL. DSP -> Linux works after a
+# resume (irq 228 glink-smem keeps counting; the DSP sent GPR packets during
+# the do_cleanup test). Only Linux -> DSP is ignored. And SMEM, where the
+# glink FIFOs live, is no-map reserved memory -- not in the image, and
+# re-initialised by the bootloader every boot.
+#
+# A hibernate that resumes into an unusable machine is not a working feature.
+# Either this gets fixed or hibernate is not shippable.
+#
+# NOT ruled out for later: at EL1 the DSPs are kernel-loaded via TZ/PAS
+# (state=running), so a plain `rproc stop` + `start` should genuinely restart
+# the ADSP after a resume. That is an EL1-only recovery and useless for a KVM
+# setup, but it has never been tried and would confirm the diagnosis.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 0073/0074 DROPPED AGAIN 2026-09-10 -- the do_cleanup route is dead.
+#
+# Re-tested on a HEALTHY boot with the whole qcom_glink tracepoint group armed
+# and a 3 s baseline proving tracing was live. After do_cleanup("apss"):
+# ZERO version/open/open_ack/close/close_ack events in either direction, only
+# PMIC_RTR_ADSP_APPS data, then "timeout waiting for cleanup done message",
+# then 3 intent timeouts and a dead edge. The DSP does receive it (18x
+# "qcom,apr GPR: Port not registered" = its audio service tearing down) but it
+# never restarts negotiation.
+#
+# So do_cleanup DESTROYS a healthy edge rather than recovering one, and must
+# never be wired into the restore path. The earlier note claiming it made the
+# ADSP re-announce all nine channels is RETRACTED; 0067 (edge cycle knob, later
+# dropped for oopsing) was in that build and may be what actually produced the
+# re-announce.
+#
+# 0074's premise -- that the remote re-announces after a restart -- has still
+# never been observed. It is not disproven, it is untriggered.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 0071 DISPROVEN 2026-09-10, two revisions, kept only as a record.
+#
+# rev1 failed -EINVAL x8 ("invalid TEMP_DAC trip = 3"): qpnp_tm_init() is not
+# idempotent, configure_trip_temps() uses chip->ntrips as the hardware stage
+# index and probe leaves it at STAGE_COUNT. rev2 rewound ntrips, the restore
+# then returned 0 with no errors -- AND THE STORM GOT WORSE: 4064/s per line
+# and cpu0 at 92.2% hardirq, against 2371/s and 88.9% with no patch at all.
+# So re-running the driver's init is not the fix, and writing
+# ALARM_CTRL_FORCE_ENABLE back makes the alarm assert harder.
+#
+# What unbind/rebind does and .restore does not is RE-REQUEST THE IRQ.
+# spmi-pmic-arb has no PM ops whatsoever, and the PMIC-side per-interrupt
+# registers are written only at request/activate/unmask/set_type time:
+# qpnpint_irq_domain_activate() does EN_CLR + LATCHED_CLR, irq_unmask does
+# EN_SET, irq_set_type does SET_TYPE. All of that happens once, at probe.
+# That is the leading hypothesis now, one layer below the thermal driver.
+#
+# NOT yet a patch: three hypotheses about this storm have now been wrong, and
+# qpnpint_irq_unmask() only rewrites hardware when EN_SET reads back clear, so
+# "replay the irq setup" may be a no-op too. The next step is EVIDENCE -- read
+# the temp-alarm peripheral's SPMI registers on a storming machine and on a
+# healthy one and diff. PMIC SPMI reads are known safe here (the pinctrl
+# pinconf-groups read of REG_EN_CTL worked fine).
+#
+# WORKAROUND that does work, no reboot: ~/tmfix.sh (cycles the driver binding
+# on all eight alarms, which re-requests every irq).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# TRIMMED 2026-09-10 -- everything that does not contribute to the resume
+# completing. Six went out; 0072 came straight back (see above), so five are
+# gone. Each reverses cleanly on its own against the full tree, so any one goes
+# back by re-adding its line here AND to patches/series.generated (the PKGBUILD
+# reads the generated file).
+#
+#   0039  SCM waitq wait bounded to 30 s, plus IRQF_NO_SUSPEND on the SCM irq.
+#         Re-enabled 2026-09-12 for the 0095 resume freeze and shelved again
+#         the same day: it never fired, so it measured nothing and remains an
+#         unproven change to a path every SCM caller shares.
+#   0040  DPM_WATCHDOG around device_prepare(). CONFIG_DPM_WATCHDOG is not set
+#         in this build, so it compiles to nothing; it was only ever live with
+#         a debug fragment that no longer exists.
+#   0058  ath12k unbind across hibernation (default off). Superseded by
+#         measurement: the restore now completes with WiFi loaded, so the
+#         "must unload ath12k" rule this automates is obsolete.
+#   0073  glink_ssr do_cleanup debug knob. Its experiment is finished:
+#         do_cleanup("apss") does make the ADSP re-announce all nine channels.
+#         Needed again only to resume that work, and only with 0074.
+#   0071  PMIC temp-alarm re-init on restore. DISPROVEN ON HARDWARE and it
+#         made things WORSE -- see the block below.
+#   0074  drop stale channels when the remote restarts its link -- the Linux
+#         half of the 0073 result. The most invasive change written in this
+#         hunt (it frees channels and unregisters rpmsg devices from the RX
+#         path) and it has never actually executed.
+#
+# Earlier passes, same rule, files kept in patches/el2/ or
+# docs.local/shelved-patches/: 0042, 0046, 0048-0056 (fix candidates and
+# restore skip-switches), 0043/0044/0045/0047/0059/0060/0062/0063/0064 (SDAM
+# crumb instrumentation -- channel exhausted), 0061 (ramoops: DRAM does not
+# survive a reset on this box), 0065 (rproc .detach -- mechanism works, fix
+# does not), 0067 (glink edge cycle knob -- OOPSED), 0070 (printk inside the
+# KMS teardown -- HUNG hibernate ENTRY), 0071 (spmi temp alarm reprogram --
+# no effect).
+# ---------------------------------------------------------------------------
 
 # Copied byte-for-byte from armada (kernel/patches/<name> at ARMADA_REF
 # eb63d011a3a9) so el2 keeps USE_ARMADA=no and an armada rebase cannot break

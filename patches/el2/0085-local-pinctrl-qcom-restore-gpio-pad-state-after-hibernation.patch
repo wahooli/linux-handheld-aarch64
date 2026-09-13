@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Fri, 12 Sep 2026 19:00:00 +0300
+Subject: [PATCH 85/85] local: pinctrl: qcom: restore the gpio pad registers
+ after hibernation
+
+Bluetooth does not work after a cross-boot hibernate resume. The controller is
+the WCN7850's UART half on uart14, hci_qca over serdev, enabled by the
+wcn7850-pmu power sequencer through TLMM gpio116.
+
+Measured with /sys/kernel/debug/gpio, which is a real hardware read --
+msm_gpio_dbg_show_one() does MMIO reads of the ctl and io registers rather than
+reporting a cached value. On a boot that never hibernated, with Bluetooth first
+off and then on:
+
+  gpio116 : out low  func0 2mA no pull
+  gpio116 : out high func0 2mA no pull
+
+After a cross-boot resume, with Bluetooth off exactly as it was at freeze:
+
+  gpio116 : in  low  func0 2mA pull down
+
+Input with a pull-down: the TLMM power-on default. The output enable is gone.
+pwrseq_qcom_wcn then asserts the line with gpiod_set_value_cansleep(bt_gpio, 1),
+which reaches msm_gpio_set() -- and that writes the io register and nothing
+else. The pad never drives, the Bluetooth half of the chip stays in reset, and
+qca_setup() fails the way a chip that is not there fails:
+
+  Bluetooth: hci0: setting up wcn7850
+  Bluetooth: hci0: command 0xfc00 tx timeout
+  Bluetooth: hci0: Reading QCA version information failed (-110)
+  Bluetooth: hci0: Retry BT power ON:0
+
+Nothing replays ctl or io. pinctrl_bind_pins() runs once, at probe.
+msm_pinctrl_resume() calls pinctrl_force_default(), which selects
+pctldev->hog_default -- hogs only, not consumer states. And gpiolib keeps no
+record of a line's output value, so even a direction replay could not put the
+level back. Same defect class as the companion patch 0079, one register over:
+0079 restores intr_cfg, this restores ctl and io.
+
+Why only this pin. Pins with a second owner come back correct and hid the bug
+for a while. uart14's own pins are right after a resume -- gpio56-59, func1,
+carrying the exact bias of qup_uart14_default down to the keeper on CTS and the
+pull-up on RX -- because the boot kernel probes a98000.serial before it loads
+the image, and pinctrl_bind_pins() muxes them then. gpio117, WLAN enable, reads
+"out high 16mA": driven, but at a drive strength no DT here asks for
+(wcn_wlan_bt_en says 2mA), so the boot firmware asserted it, which is why Wi-Fi
+survives a resume and Bluetooth does not. gpio116 has neither owner and is left
+at reset values.
+
+Save ctl and io for every valid gpio at .freeze/.poweroff, write them back at
+.restore_noirq. Every value written is one this kernel itself programmed, so a
+pin some other agent already got right is written back identically, and a pin
+nobody owns is corrected. io is written before ctl so a pin regaining its output
+enable already holds the right level and does not glitch the pad.
+
+The save runs before pinctrl_force_sleep(), so the image carries the active
+configuration rather than the hogs' sleep state; msm_pinctrl_resume() runs
+pinctrl_force_default() on the way out and puts the hogs back.
+
+Pads before irq config in .restore_noirq: an interrupt is configured on a line
+whose mux and direction have to be right first, and 0079's replay writes
+intr_cfg only. Still .restore_noirq, for 0079's reason -- ahead of
+resume_device_irqs().
+
+SET_SYSTEM_SLEEP_PM_OPS() is expanded by hand because .freeze and .poweroff now
+differ from .suspend. Suspend/resume keep the plain callbacks: only the
+hibernate path has anything to put back.
+
+Not board-specific: msm_pinctrl_dev_pm_ops is shared by every qcom pinctrl
+driver, so this covers all of them. On x1e80100 it costs 2 * 4 * 300 bytes in
+struct msm_pinctrl and no allocation on the freeze path.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+ drivers/pinctrl/qcom/pinctrl-msm.c | 138 +++++++++++++++++++++++++++++-
+ 1 file changed, 137 insertions(+), 1 deletion(-)
+
+--- a/drivers/pinctrl/qcom/pinctrl-msm.c
++++ b/drivers/pinctrl/qcom/pinctrl-msm.c
+@@ -58,6 +58,10 @@
+  * @soc:            Reference to soc_data of platform specific data.
+  * @regs:           Base addresses for the TLMM tiles.
+  * @phys_base:      Physical base address
++ * @pm_ctl:         Hibernate: saved ctl register (mux, drive, bias, output
++ *                  enable) per gpio.
++ * @pm_io:          Hibernate: saved io register (output level) per gpio.
++ * @pm_saved:       Hibernate: pm_ctl/pm_io hold a snapshot taken at freeze.
+  */
+ struct msm_pinctrl {
+ 	struct device *dev;
+@@ -80,6 +84,10 @@
+ 	const struct msm_pinctrl_soc_data *soc;
+ 	void __iomem *regs[MAX_NR_TILES];
+ 	u32 phys_base[MAX_NR_TILES];
++
++	u32 pm_ctl[MAX_NR_GPIO];
++	u32 pm_io[MAX_NR_GPIO];
++	bool pm_saved;
+ };
+ 
+ #define MSM_ACCESSOR(name) \
+@@ -1535,6 +1543,86 @@
+ }
+ 
+ /*
++ * Hibernate: the pad configuration lives in two registers that nothing replays
++ * after a cross-boot restore.
++ *
++ * ctl holds the mux, drive strength, bias AND the output enable; io holds the
++ * output level. Both come back from the reboot at power-on values while every
++ * driver that programmed them comes back from the image believing otherwise,
++ * and nothing rewrites them. pinctrl_bind_pins() runs once, at probe.
++ * msm_pinctrl_resume()'s pinctrl_force_default() re-applies only HOGS -- it
++ * selects pctldev->hog_default, not consumer states. And gpiolib caches no
++ * output value at all, so there is nothing to replay from: msm_gpio_set()
++ * writes the io register and never touches ctl.
++ *
++ * Measured on x1e80100. The WCN7850's Bluetooth enable is TLMM gpio116, driven
++ * by the wcn7850-pmu power sequencer. On a boot that never hibernated, with
++ * Bluetooth first off and then on:
++ *
++ *   gpio116 : out low  func0 2mA no pull
++ *   gpio116 : out high func0 2mA no pull
++ *
++ * After a cross-boot resume, with Bluetooth off exactly as it was at freeze:
++ *
++ *   gpio116 : in  low  func0 2mA pull down
++ *
++ * Input, with a pull-down: the power-on default. The output enable is gone, so
++ * pwrseq_qcom_wcn's gpiod_set_value_cansleep(bt_gpio, 1) writes an io register
++ * that reaches no pad. The Bluetooth half of the chip stays in reset and
++ * qca_setup() fails the way a chip that is not there fails:
++ *
++ *   Bluetooth: hci0: setting up wcn7850
++ *   Bluetooth: hci0: command 0xfc00 tx timeout
++ *   Bluetooth: hci0: Reading QCA version information failed (-110)
++ *
++ * Only pins with no second owner are affected, which is what made this hard to
++ * see. uart14's own pins come back correct -- gpio56-59, func1, carrying the
++ * exact bias of qup_uart14_default down to the keeper on CTS and the pull-up on
++ * RX -- because the boot kernel probes a98000.serial before it loads the image
++ * and pinctrl_bind_pins() muxes them then. gpio117, WLAN enable, comes back
++ * "out high 16mA": driven, but at a drive strength this DT never asks for
++ * (wcn_wlan_bt_en says 2mA), so the boot firmware asserted it. gpio116 has
++ * neither, and is the one pin left at reset values.
++ *
++ * So save both registers at freeze and write them back at restore. Every value
++ * written is one this kernel itself programmed, so a pin some other agent got
++ * right is written back identically and a pin nobody owns is corrected.
++ */
++static void msm_pinctrl_save_pads(struct msm_pinctrl *pctrl)
++{
++	unsigned long flags;
++	unsigned int i;
++
++	for (i = 0; i < pctrl->chip.ngpio; i++) {
++		const struct msm_pingroup *g = &pctrl->soc->groups[i];
++
++		if (!gpiochip_line_is_valid(&pctrl->chip, i))
++			continue;
++
++		raw_spin_lock_irqsave(&pctrl->lock, flags);
++		pctrl->pm_ctl[i] = msm_readl_ctl(pctrl, g);
++		pctrl->pm_io[i] = msm_readl_io(pctrl, g);
++		raw_spin_unlock_irqrestore(&pctrl->lock, flags);
++	}
++
++	pctrl->pm_saved = true;
++}
++
++static int __maybe_unused msm_pinctrl_freeze(struct device *dev)
++{
++	struct msm_pinctrl *pctrl = dev_get_drvdata(dev);
++
++	/*
++	 * Before pinctrl_force_sleep(), so the image carries the active
++	 * configuration rather than the hogs' sleep state. msm_pinctrl_resume()
++	 * runs pinctrl_force_default() on the way out and puts those back.
++	 */
++	msm_pinctrl_save_pads(pctrl);
++
++	return msm_pinctrl_suspend(dev);
++}
++
++/*
+  * Hibernate restore: TLMM comes back from the reboot with its per-interrupt
+  * configuration at power-on values, while irq_desc comes back from the image
+  * still describing what was programmed at request time.
+@@ -1581,6 +1669,43 @@
+ 	unsigned int i;
+ 
+ 	/*
++	 * The pads first: an interrupt is configured on a line whose mux and
++	 * direction have to be right, and 0079's irq_set_irq_type() replay
++	 * below writes intr_cfg only.
++	 */
++	for (i = 0; pctrl->pm_saved && i < pctrl->chip.ngpio; i++) {
++		const struct msm_pingroup *g = &pctrl->soc->groups[i];
++		u32 ctl, io;
++		unsigned long flags;
++		bool changed;
++
++		if (!gpiochip_line_is_valid(&pctrl->chip, i))
++			continue;
++
++		raw_spin_lock_irqsave(&pctrl->lock, flags);
++		ctl = msm_readl_ctl(pctrl, g);
++		io = msm_readl_io(pctrl, g);
++		/*
++		 * in_bit is the live pad level and tracks the outside world, so
++		 * only out_bit can be meaningfully compared or restored.
++		 */
++		changed = ctl != pctrl->pm_ctl[i] ||
++			  ((io ^ pctrl->pm_io[i]) & BIT(g->out_bit));
++		if (changed) {
++			/*
++			 * io before ctl: a pin regaining its output enable
++			 * already holds the right level, so the pad does not
++			 * glitch on the way through.
++			 */
++			io &= ~BIT(g->out_bit);
++			io |= pctrl->pm_io[i] & BIT(g->out_bit);
++			msm_writel_io(io, pctrl, g);
++			msm_writel_ctl(pctrl->pm_ctl[i], pctrl, g);
++		}
++		raw_spin_unlock_irqrestore(&pctrl->lock, flags);
++	}
++
++	/*
+ 	 * Every gpio with a mapped irq, NOT just pctrl->enabled_irqs.
+ 	 * msm_gpio_irq_mask() clears that bitmap and suspend_device_irqs()
+ 	 * has masked every non-wakeup interrupt before we get here, so by
+@@ -1628,8 +1753,19 @@
+ 	return 0;
+ }
+ 
++/*
++ * SET_SYSTEM_SLEEP_PM_OPS() expanded by hand: the hibernate entries have to
++ * differ from the suspend ones. .freeze and .poweroff snapshot the pads, and
++ * only the hibernate path has anything to put back, so suspend/resume keep the
++ * plain callbacks and stay exactly as they were.
++ */
+ const struct dev_pm_ops msm_pinctrl_dev_pm_ops = {
+-	SET_SYSTEM_SLEEP_PM_OPS(msm_pinctrl_suspend, msm_pinctrl_resume)
++	.suspend = pm_sleep_ptr(msm_pinctrl_suspend),
++	.resume = pm_sleep_ptr(msm_pinctrl_resume),
++	.freeze = pm_sleep_ptr(msm_pinctrl_freeze),
++	.thaw = pm_sleep_ptr(msm_pinctrl_resume),
++	.poweroff = pm_sleep_ptr(msm_pinctrl_freeze),
++	.restore = pm_sleep_ptr(msm_pinctrl_resume),
+ 	.restore_noirq = pm_sleep_ptr(msm_pinctrl_restore_noirq),
+ };
+ 

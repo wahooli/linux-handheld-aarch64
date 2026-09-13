@@ -29,6 +29,49 @@ if [ "$(id -u build)" != "${HOST_UID}" ] || [ "$(id -g build)" != "${HOST_GID}" 
     usermod  -u "${HOST_UID}" -g "${HOST_GID}" build
     chown -R build:build /home/build
 fi
+# The image's mirrorlist points at ALARM's geo-redirector, which can hand out a
+# mirror trickling at KB/s -- and pacman never abandons a connection that still
+# moves, so the -Syu below sits there for half an hour. Individual mirrors are
+# no better as a static pin: fl.us swung 500 KB/s -> 16 KB/s within an hour, and
+# this also runs on CI machines whose location varies. So race the candidates at
+# startup: each downloads core.db (~250 KB) in parallel, bounded by -m, and the
+# fastest goes first in the mirrorlist. -L because several answer 30x; a mirror
+# that times out mid-transfer still reports its partial speed, a dead one scores
+# 0 and loses. The redirector stays as fallback, and is the pick when every
+# probe fails. ParallelDownloads stops one throttled connection from
+# serializing the rest.
+mirrors=(
+    de3.mirror.archlinuxarm.org
+    dk.mirror.archlinuxarm.org
+    uk.mirror.archlinuxarm.org
+    fl.us.mirror.archlinuxarm.org
+    ca.us.mirror.archlinuxarm.org
+    tw.mirror.archlinuxarm.org
+    sg.mirror.archlinuxarm.org
+    au.mirror.archlinuxarm.org
+)
+probes="$(mktemp -d)"
+for m in "${mirrors[@]}"; do
+    curl -m 10 -sLo /dev/null -w '%{speed_download}' \
+        "http://${m}/aarch64/core/core.db" > "${probes}/${m}" 2>/dev/null &
+done
+wait
+best="$(for m in "${mirrors[@]}"; do
+    # ${speed:-0}: a probe that failed before transferring leaves an empty file.
+    speed="$(cat "${probes}/${m}" 2>/dev/null)"
+    printf '%s %s\n' "${speed:-0}" "${m}"
+done | sort -rn | awk 'NR == 1 && $1 > 0 { print $2 }')"
+rm -rf "${probes}"
+echo "==> mirror: ${best:-none reachable, geo-redirector only}"
+{
+    if [ -n "${best}" ]; then
+        printf 'Server = http://%s/$arch/$repo\n' "${best}"
+    fi
+    printf 'Server = http://mirror.archlinuxarm.org/$arch/$repo\n'
+} > /etc/pacman.d/mirrorlist
+grep -q '^ParallelDownloads' /etc/pacman.conf \
+    || sed -i '/^\[options\]/a ParallelDownloads = 5' /etc/pacman.conf
+
 # Sync before makepkg --syncdeps goes looking for makedepends: the builder image
 # is cached and rebuilt weekly, so by the end of that week its database names
 # versions the mirror has already replaced and every fetch 404s. -Syu rather than

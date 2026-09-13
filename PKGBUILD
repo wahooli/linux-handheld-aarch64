@@ -182,7 +182,8 @@ prepare() {
     ARCH=arm64 bash scripts/kconfig/merge_config.sh -m .config "${frags[@]}"
     make ARCH=arm64 olddefconfig > /dev/null
 
-    # Verify every requested symbol survived: merge_config.sh warns about
+    # Verify the final request for each symbol survived (later fragments win,
+    # including ignored *.local.config overrides). merge_config.sh warns about
     # overrides but exits 0, and a dropped CONFIG_DRM_MSM=y is a black screen you
     # debug on the device instead of in CI. Each form goes missing differently:
     #
@@ -210,7 +211,15 @@ prepare() {
             *) grep -qxF "${line}" .config \
                    || { echo "::  NOT SET: ${line} (is: $(grep -E "^${key}=" .config || echo 'absent'))"; missing=1; } ;;
         esac
-    done < <(cat "${frags[@]}" | grep -E '^(CONFIG_[A-Z0-9_]+=.+|# CONFIG_[A-Z0-9_]+ is not set)$')
+    done < <(awk '
+        /^CONFIG_[A-Z0-9_]+=.+$/ {
+            key = $0; sub(/=.*/, "", key); requested[key] = $0
+        }
+        /^# CONFIG_[A-Z0-9_]+ is not set$/ {
+            requested[$2] = $0
+        }
+        END { for (key in requested) print requested[key] }
+    ' "${frags[@]}")
     [ "${missing}" = 0 ] || { echo "::  config fragments did not fully apply"; return 1; }
 
     # No `make kernelrelease > version` here: setlocalversion reads the

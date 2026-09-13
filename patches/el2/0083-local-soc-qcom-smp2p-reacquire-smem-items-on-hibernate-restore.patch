@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Fri, 11 Sep 2026 13:00:00 +0300
+Subject: [PATCH 83/83] local: soc: qcom: smp2p: re-acquire SMEM items on
+ hibernate restore
+
+smp2p caches raw pointers into SMEM -- smp2p->in, smp2p->out and one
+entry->value per entry -- and after a cross-boot hibernate resume they come
+back out of the image. The resuming kernel's bootloader has re-initialised
+SMEM in the meantime, so those pointers describe the pre-hibernate layout and
+the driver reads memory that no longer holds the remote's item.
+
+The failure is silent and total. qcom_smp2p_intr() takes the "acquire smem
+item, if not already found" path, sees a non-NULL smp2p->in, and never
+re-acquires. Measured on x1e80100 after a cross-boot resume, with the ADSP
+demonstrably running and ringing the doorbell:
+
+  irq 17  smp2p-adsp (IPCC)  +1     <- the kick arrives
+  irq 202 q6v5 ready         +0     <- no edge is ever generated
+  qcom_smp2p:smp2p_notify_in: smp2p-adsp: slave-kernel: status:0x0 val:0x0
+
+val is zero: the entry reads as empty, so there is nothing to diff against and
+no sub-interrupt is raised. Both directions are affected, which explains two
+previously separate symptoms:
+
+ - qcom_q6v5_wait_for_start() never completes, so booting the DSP after a
+   resume fails with -110 ("start timed out"), and
+ - a shutdown request is never acked, because the outbound item is equally
+   stale -- which is why a post-resume rproc stop reports "timeout waiting for
+   shutdown response" and then -EINVAL from qcom_scm_pas_shutdown().
+
+Fix it by redoing, on restore, the part of probe that binds the driver to
+SMEM: drop every cached pointer and the negotiation result, re-acquire the
+inbound item, re-take-over the outbound one, re-map the outbound entries by
+name, and let qcom_smp2p_start_in() rebind the inbound entries and latch their
+current values. Then kick, so the remote re-announces.
+
+.restore_noirq because the interrupt is plain IRQF_ONESHOT with no
+IRQF_NO_SUSPEND: it is still masked in that phase, so no qcom_smp2p_intr() can
+race the resync, and resume_device_irqs() unmasks it immediately afterwards.
+Deliberately no qcom_smp2p_scan() from here -- that would deliver nested
+interrupts during the noirq phase; the first real interrupt after the unmask
+does it instead.
+
+The dev_info() prints the old and new item pointers so a single boot shows
+whether they actually moved, rather than leaving it inferred.
+
+Measured result, and it narrows the claim above. Of the two edges only the
+CDSP's item had actually gone: its qcom_smem_get() now fails and the pointer
+goes 9f2681d5 -> NULL, after which the normal acquire path in
+qcom_smp2p_intr() picks it up and the CDSP boots ("hibernate: booted after
+restore"). The ADSP's items did not move at all (235b9885 -> 235b9885), so for
+that edge this patch is not what was broken -- it still failed with -110 until
+0084. Both are real, and this one is still required: without it the CDSP's
+pointer is never dropped and never re-acquired.
+
+This is the fifth instance of the same defect class in this series, after the
+SMMU (0041/0069), the PMIC irqchip (0077), the TLMM (0079/0080) and IPCC
+(0081): hardware or shared-memory state that a cross-boot resume re-initialises
+underneath a driver that only ever programs it once, at probe.
+---
+ drivers/soc/qcom/smp2p.c | 103 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 100 insertions(+), 3 deletions(-)
+
+--- a/drivers/soc/qcom/smp2p.c
++++ b/drivers/soc/qcom/smp2p.c
+@@ -523,9 +523,8 @@
+ 	.update_bits = smp2p_update_bits,
+ };
+ 
+-static int qcom_smp2p_outbound_entry(struct qcom_smp2p *smp2p,
+-				     struct smp2p_entry *entry,
+-				     struct device_node *node)
++static int qcom_smp2p_map_outbound_entry(struct qcom_smp2p *smp2p,
++					 struct smp2p_entry *entry)
+ {
+ 	struct smp2p_smem_item *out = smp2p->out;
+ 	int i;
+@@ -547,6 +546,19 @@
+ 	/* Make the logical entry reference the physical value */
+ 	entry->value = &out->entries[i].value;
+ 
++	return 0;
++}
++
++static int qcom_smp2p_outbound_entry(struct qcom_smp2p *smp2p,
++				     struct smp2p_entry *entry,
++				     struct device_node *node)
++{
++	int ret;
++
++	ret = qcom_smp2p_map_outbound_entry(smp2p, entry);
++	if (ret < 0)
++		return ret;
++
+ 	entry->state = qcom_smem_state_register(node, &smp2p_state_ops, entry);
+ 	if (IS_ERR(entry->state)) {
+ 		dev_err(smp2p->dev, "failed to register qcom_smem_state\n");
+@@ -827,6 +839,90 @@
+ 	smp2p->out->valid_entries = 0;
+ }
+ 
++/*
++ * Hibernation: re-acquire the SMEM items after a cross-boot resume.
++ *
++ * smp2p caches raw pointers into SMEM -- smp2p->in, smp2p->out and one
++ * entry->value per entry -- and those come back out of the hibernation image.
++ * The resuming kernel's bootloader has re-initialised SMEM in the meantime, so
++ * the item it describes is not necessarily where it was when the image was
++ * taken, and the cached pointers address the old layout.
++ *
++ * The failure is silent and total: qcom_smp2p_intr() takes the "already found"
++ * path, never re-acquires, and every entry reads as zero. Measured on
++ * x1e80100, with the ADSP demonstrably running and ringing the doorbell:
++ *
++ *   irq 17 (smp2p-adsp, IPCC)  +1     <- the kick arrives
++ *   irq 202 (q6v5 ready)       +0     <- no edge is ever generated
++ *   smp2p_notify_in: slave-kernel: status:0x0 val:0x0
++ *
++ * Nothing downstream can recover from that. qcom_q6v5_wait_for_start() times
++ * out (-110) so the DSP cannot be booted, and a shutdown request is never
++ * acked either, because the outbound item is just as stale -- which is what
++ * makes a post-resume rproc stop return -EINVAL.
++ *
++ * So drop everything learned about SMEM and redo the part of probe that binds
++ * us to it. .restore_noirq because the interrupt is plain IRQF_ONESHOT: it is
++ * still masked here, so no qcom_smp2p_intr() can race the resync, and
++ * resume_device_irqs() unmasks it afterwards. Do not scan from here -- that
++ * would deliver nested irqs in the noirq phase; kick instead and let the first
++ * real interrupt do it.
++ */
++static int qcom_smp2p_restore_noirq(struct device *dev)
++{
++	struct qcom_smp2p *smp2p = dev_get_drvdata(dev);
++	struct smp2p_smem_item *old_in = smp2p->in;
++	struct smp2p_smem_item *old_out = smp2p->out;
++	struct smp2p_entry *entry;
++	void *in;
++	int ret;
++
++	smp2p->in = NULL;
++	smp2p->valid_entries = 0;
++	smp2p->negotiation_done = false;
++	smp2p->ssr_ack_enabled = false;
++	smp2p->ssr_ack = false;
++
++	list_for_each_entry(entry, &smp2p->inbound, node) {
++		entry->value = NULL;
++		entry->last_value = 0;
++	}
++
++	/* Same order as probe: the inbound item gates the outbound takeover. */
++	in = qcom_smem_get(smp2p->remote_pid, smp2p->smem_items[SMP2P_INBOUND], NULL);
++	if (!IS_ERR(in))
++		smp2p->in = in;
++
++	ret = qcom_smp2p_alloc_outbound_item(smp2p);
++	if (ret < 0) {
++		dev_err(dev, "hibernate: cannot reacquire outbound item: %d\n", ret);
++		return ret;
++	}
++
++	list_for_each_entry(entry, &smp2p->outbound, node) {
++		ret = qcom_smp2p_map_outbound_entry(smp2p, entry);
++		if (ret < 0) {
++			dev_err(dev, "hibernate: cannot remap outbound entry %s: %d\n",
++				entry->name, ret);
++			return ret;
++		}
++	}
++
++	/* Rebinds the inbound entries and latches their current values. */
++	qcom_smp2p_start_in(smp2p);
++
++	dev_info(dev, "hibernate: resynced smem, in %p->%p out %p->%p, %u inbound entries\n",
++		 old_in, smp2p->in, old_out, smp2p->out, smp2p->valid_entries);
++
++	qcom_smp2p_kick(smp2p);
++
++	return 0;
++}
++
++static const struct dev_pm_ops qcom_smp2p_pm_ops = {
++	.restore_noirq = pm_sleep_ptr(qcom_smp2p_restore_noirq),
++};
++
+ static const struct of_device_id qcom_smp2p_of_match[] = {
+ 	{ .compatible = "qcom,smp2p" },
+ 	{}
+@@ -839,6 +935,7 @@
+ 	.driver  = {
+ 		.name  = "qcom_smp2p",
+ 		.of_match_table = qcom_smp2p_of_match,
++		.pm = pm_sleep_ptr(&qcom_smp2p_pm_ops),
+ 	},
+ };
+ module_platform_driver(qcom_smp2p_driver);
+-- 
+2.51.0

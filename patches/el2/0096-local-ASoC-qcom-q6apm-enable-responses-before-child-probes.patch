@@ -1,0 +1,204 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] ASoC: qcom: q6apm: publish the service callback before probing children
+
+apr_device_probe() installs a GPR service's response callback only after the
+service's probe() has returned. apm_probe() sends APM_CMD_GET_SPF_STATE and
+then populates its children before that point, so every reply arriving in
+that window is dropped by gpr_do_rx_callback(), which finds svc->callback
+still NULL. The state query times out on every boot ("CMD timeout for
+[1001021]"), which upstream gets away with because it ignores the result.
+
+The mapping commands do not get away with it. The DSP acknowledges
+APM_CMD_SHARED_MEM_MAP_REGIONS with the mem_map_handle, so a dropped reply
+leaves the region mapped in the DSP with no handle on this side, and the next
+attempt to map the same region is refused outright -- "DSP returned
+error[100100c] 1", which is where the sound card fails with -EINVAL out of
+snd_soc_pcm_component_new(). q6apm_dai maps PCM memory synchronously from its
+own probe whenever the rest of the card is already registered, which is
+exactly the situation when the DSP is restarted on a running system: after a
+hibernate restore, or a manual remoteproc cycle.
+
+Let a service publish its own callback once the state that callback reads is
+initialised, and have APM do so before its first command. Publish with
+release/acquire ordering against the RX path, and withdraw it again (draining
+the RX workqueue) if probe then fails, before the driver core releases the
+devres state behind it. The callback is deliberately left in place across
+remove: children send unmap commands from their own teardown and those
+replies still have to land. idr_remove() in apr_device_remove() already
+stops new lookups finding the service, as before.
+
+Also propagate state-query failures instead of returning apm->state after a
+timeout, so q6apm_is_adsp_ready() stops reading a negative errno as ready,
+and undo g_apm and the populated children when probe fails.
+
+---
+--- a/include/linux/soc/qcom/apr.h
++++ b/include/linux/soc/qcom/apr.h
+@@ -193,5 +193,6 @@
+ void gpr_free_port(gpr_port_t *port);
+ int gpr_send_port_pkt(gpr_port_t *port, const struct gpr_pkt *pkt);
+ int gpr_send_pkt(gpr_device_t *gdev, const struct gpr_pkt *pkt);
++void gpr_set_service_callback(gpr_device_t *gdev, gpr_port_cb callback);
+ 
+ #endif /* __QCOM_APR_H_ */
+--- a/drivers/soc/qcom/apr.c
++++ b/drivers/soc/qcom/apr.c
+@@ -259,10 +259,37 @@
+ 	return 0;
+ }
+ 
++/**
++ * gpr_set_service_callback() - publish or withdraw a service response callback
++ * @gdev: GPR service device
++ * @callback: callback to publish, or NULL to withdraw it
++ *
++ * apr_device_probe() only publishes a service's callback once probe() has
++ * returned, so a service that sends a command from inside its own probe never
++ * sees the reply -- gpr_do_rx_callback() finds a NULL callback and drops the
++ * packet. Such a service calls this itself, once the state the callback reads
++ * is initialised and before it sends its first command.
++ *
++ * Withdrawing (@callback NULL) drains the RX workqueue, so no callback is
++ * still running when the caller's state goes away. Call from probe/remove
++ * only, never from the RX workqueue itself.
++ */
++void gpr_set_service_callback(gpr_device_t *gdev, gpr_port_cb callback)
++{
++	struct packet_router *gpr = gdev->svc.pr;
++
++	/* Pair with the acquire in gpr_do_rx_callback(). */
++	smp_store_release(&gdev->svc.callback, callback);
++	if (!callback)
++		flush_workqueue(gpr->rxwq);
++}
++EXPORT_SYMBOL_GPL(gpr_set_service_callback);
++
+ static int gpr_do_rx_callback(struct packet_router *gpr, struct apr_rx_buf *abuf)
+ {
+ 	uint16_t hdr_size, ver;
+ 	struct pkt_router_svc *svc = NULL;
++	gpr_port_cb callback;
+ 	struct gpr_resp_pkt resp;
+ 	struct gpr_hdr *hdr;
+ 	unsigned long flags;
+@@ -306,8 +333,9 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (svc->callback)
+-		svc->callback(&resp, svc->priv, 0);
++	callback = smp_load_acquire(&svc->callback);
++	if (callback)
++		callback(&resp, svc->priv, 0);
+ 
+ 	return 0;
+ }
+@@ -368,8 +396,13 @@
+ 	int ret;
+ 
+ 	ret = adrv->probe(adev);
+-	if (!ret)
+-		adev->svc.callback = adrv->gpr_callback;
++	/*
++	 * A service may have published the callback itself from probe(); on
++	 * failure withdraw it again, before the driver core releases the
++	 * devres-allocated state it reads.
++	 */
++	if (adrv->gpr_callback)
++		gpr_set_service_callback(adev, ret ? NULL : adrv->gpr_callback);
+ 
+ 	return ret;
+ }
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -29,6 +29,8 @@
+ 
+ static struct q6apm *g_apm;
+ 
++static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op);
++
+ int q6apm_send_cmd_sync(struct q6apm *apm, const struct gpr_pkt *pkt,
+ 			uint32_t rsp_opcode)
+ {
+@@ -142,12 +144,16 @@
+ 
+ static int q6apm_get_apm_state(struct q6apm *apm)
+ {
++	int ret;
++
+ 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(0,
+ 								APM_CMD_GET_SPF_STATE, 0);
+ 	if (IS_ERR(pkt))
+ 		return PTR_ERR(pkt);
+ 
+-	q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
++	ret = q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
++	if (ret)
++		return ret;
+ 
+ 	return apm->state;
+ }
+@@ -155,7 +161,7 @@
+ bool q6apm_is_adsp_ready(void)
+ {
+ 	if (g_apm)
+-		return q6apm_get_apm_state(g_apm);
++		return q6apm_get_apm_state(g_apm) > 0;
+ 
+ 	return false;
+ }
+@@ -875,19 +881,44 @@
+ 
+ 	idr_init(&apm->modules_idr);
+ 
++	/*
++	 * Publish the response callback before the first command. The APR bus
++	 * would only do it once this probe returns, and by then it is too
++	 * late: the state query below, and every command a child sends while
++	 * of_platform_populate() runs, would have their replies dropped. That
++	 * is not only a lost answer -- APM_CMD_SHARED_MEM_MAP_REGIONS is
++	 * acknowledged with the mem_map_handle, so a dropped reply leaves the
++	 * region mapped in the DSP with no handle on this side, and the next
++	 * attempt to map it fails outright.
++	 *
++	 * Children map PCM memory synchronously from their own probe whenever
++	 * the rest of the card is already registered, which is exactly the
++	 * case when the DSP is restarted on a running system -- after a
++	 * hibernate restore, say.
++	 */
++	gpr_set_service_callback(gdev, apm_callback);
++
+ 	g_apm = apm;
+ 
+-	q6apm_get_apm_state(apm);
++	ret = q6apm_get_apm_state(apm);
++	if (ret < 0)
++		dev_warn(dev, "APM state query failed: %d\n", ret);
++	else
++		dev_info(dev, "APM state %d, callback live before child probes\n", ret);
+ 
+ 	ret = snd_soc_register_component(dev, &q6apm_audio_component, NULL, 0);
+ 	if (ret < 0) {
+ 		dev_err(dev, "failed to register q6apm: %d\n", ret);
++		g_apm = NULL;
+ 		return ret;
+ 	}
+ 
+ 	ret = of_platform_populate(dev->of_node, NULL, NULL, dev);
+-	if (ret)
++	if (ret) {
++		of_platform_depopulate(dev);
+ 		snd_soc_unregister_component(dev);
++		g_apm = NULL;
++	}
+ 
+ 	return ret;
+ }
+@@ -896,6 +927,7 @@
+ {
+ 	of_platform_depopulate(&gdev->dev);
+ 	snd_soc_unregister_component(&gdev->dev);
++	g_apm = NULL;
+ }
+ 
+ struct audioreach_module *q6apm_find_module_by_mid(struct q6apm_graph *graph, uint32_t mid)

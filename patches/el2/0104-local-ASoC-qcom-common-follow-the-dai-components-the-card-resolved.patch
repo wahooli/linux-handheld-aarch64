@@ -1,0 +1,111 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] ASoC: qcom: common: follow the DAI components the card resolved
+
+Restart the audio DSP and the sound card never comes back, even once every
+codec, SoundWire master and slave underneath it has rebound:
+
+    snd-x1e80100 sound: ASoC: CODEC DAI  not registered
+    # cat /proc/asound/cards
+    --- no soundcards ---
+
+The DAI names the card resolved at probe are pointers borrowed from the
+components -- snd_soc_dai_name_get() returns dai->driver->name, it does not
+copy -- and nothing records that the card depends on those components staying
+put. So when the components are unbound the card is left bound, registered on
+ASoC's rebind list, still holding the old pointers, and every retry compares
+against names that no longer exist. The name prints empty above because that
+is all that is left of it.
+
+Unbinding and rebinding the card by hand fixes it, because a fresh probe
+re-parses the tree and resolves the names again. Nothing triggers that on its
+own.
+
+Record the dependency instead. A managed device link gets both halves: the
+card is unbound along with its components, while they are still healthy, and
+DL_FLAG_AUTOPROBE_CONSUMER has the core probe it again once they are back.
+
+Components whose device is destroyed rather than unbound -- the DSP's own GPR
+services -- take their link with them, but the LPASS macros are ordinary
+platform devices that outlive the DSP, so rebinding one of those brings the
+card back. Non-platform components such as SoundWire slaves have no platform
+device to link to and are skipped; they come and go with a master that is
+itself linked.
+
+This is the last hop of a dependency chain that reaches from the DSP's clock
+controller down to the card, none of which was previously expressed.
+
+---
+--- a/sound/soc/qcom/common.c
++++ b/sound/soc/qcom/common.c
+@@ -4,6 +4,7 @@
+ 
+ #include <dt-bindings/sound/qcom,q6afe.h>
+ #include <linux/module.h>
++#include <linux/of_platform.h>
+ #include <sound/jack.h>
+ #include <linux/input-event-codes.h>
+ #include "common.h"
+@@ -23,6 +24,51 @@
+ 	SND_SOC_DAPM_SPK("DP7 Jack", NULL),
+ };
+ 
++/*
++ * Depend on the device behind a resolved DAI, so the card follows it.
++ *
++ * The card holds the DAI names it resolved at probe, and those are pointers
++ * borrowed from the components -- snd_soc_dai_name_get() hands back
++ * dai->driver->name, it does not copy. Nothing records that the card needs
++ * those components to stay put, so when one is unbound (an audio DSP restart
++ * takes the whole LPASS stack down with it) the card is left registered on
++ * ASoC's rebind list still holding the old pointers. It then retries forever
++ * against names that no longer exist:
++ *
++ *   snd-x1e80100 sound: ASoC: CODEC DAI  not registered
++ *
++ * with the name printed empty, because that is what is left of it. Only a
++ * fresh probe re-parses the tree and re-resolves the names.
++ *
++ * A managed link gets both halves for free: the card is unbound with its
++ * components while they are still healthy, and DL_FLAG_AUTOPROBE_CONSUMER
++ * probes it again once they are back. Components whose device is destroyed
++ * rather than unbound (the DSP's own services) take their link with them, but
++ * the LPASS macros are ordinary platform devices that outlive the DSP, and
++ * rebinding one of those is enough to bring the card back.
++ *
++ * Non-platform components -- SoundWire slaves, say -- have no platform device
++ * to link to and are skipped; they come and go with a master that is itself
++ * linked.
++ */
++static void qcom_snd_link_dai_device(struct device *card_dev,
++				     struct device_node *np)
++{
++	struct platform_device *pdev;
++
++	if (!np)
++		return;
++
++	pdev = of_find_device_by_node(np);
++	if (!pdev)
++		return;
++
++	if (&pdev->dev != card_dev)
++		device_link_add(card_dev, &pdev->dev, DL_FLAG_AUTOPROBE_CONSUMER);
++
++	put_device(&pdev->dev);
++}
++
+ int qcom_snd_parse_of(struct snd_soc_card *card)
+ {
+ 	struct device *dev = card->dev;
+@@ -159,6 +205,11 @@
+ 			link->nonatomic = 1;
+ 		}
+ 
++		qcom_snd_link_dai_device(dev, link->cpus->of_node);
++		qcom_snd_link_dai_device(dev, link->platforms->of_node);
++		for (int i = 0; i < link->num_codecs; i++)
++			qcom_snd_link_dai_device(dev, link->codecs[i].of_node);
++
+ 		link->stream_name = link->name;
+ 		link++;
+ 	}

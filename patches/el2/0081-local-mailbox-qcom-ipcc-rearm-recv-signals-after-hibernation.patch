@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Wed, 10 Sep 2026 22:00:00 +0300
+Subject: [PATCH 81/81] local: mailbox: qcom-ipcc: re-arm receive signals after
+ hibernation
+
+After a cross-boot hibernate resume on x1e80100 the ADSP glink edge is dead:
+battery, charging, thermal reporting, audio and UCSI all time out, and every
+attempt to recover it at the protocol level failed because the remote never
+appeared to answer.
+
+It answers. Linux is not hearing it.
+
+IPCC_REG_RECV_SIGNAL_ENABLE is written only by qcom_ipcc_unmask_irq(), and
+the reboot clears it. For an ordinary interrupt that does not matter:
+suspend_device_irqs() masks it, resume_device_irqs() unmasks it, and the
+unmask rewrites the register. The glink edge interrupt is not ordinary --
+qcom_glink_smem requests it with IRQF_NO_SUSPEND:
+
+  drivers/rpmsg/qcom_glink_smem.c:
+      ret = devm_request_irq(&smem->dev, smem->irq, qcom_glink_smem_intr,
+                             IRQF_NO_SUSPEND | IRQF_NO_AUTOEN, ...
+
+so it is never masked at suspend and never unmasked at resume. Nothing
+rewrites RECV_SIGNAL_ENABLE, and every doorbell the remote rings afterwards
+is dropped in the IPCC block.
+
+Measured on a resumed machine with the qcom_glink tracepoints armed: zero
+inbound interrupts on both glink-smem lines over an idle baseline, and our
+own cmd_version tx as the only glink event in the capture. Sending still
+works, because IPCC_REG_SEND_ID is a stateless write -- a GLINK SSR
+do_cleanup reached the ADSP and made its audio service tear down
+(18x "qcom,apr GPR: Port not registered"). Only the receive direction is
+dead, which is exactly the asymmetry this bug produces.
+
+The DSP had not crashed: smp2p fatal/ready/handover/stop all read zero and
+remoteproc still reported it attached.
+
+Replay the enable for every mapped IPCC interrupt that is not masked, from
+.restore_noirq so the signals are live before resume_device_irqs() runs.
+
+This is the fourth instance of the same defect on this platform, after the
+SMMU, the SPMI PMIC irqchip and TLMM: hardware state programmed once at
+request or probe time, lost to the reboot, and never replayed because the
+driver's software state came back from the hibernation image believing it was
+still there.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+ drivers/mailbox/qcom-ipcc.c | 50 ++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+--- a/drivers/mailbox/qcom-ipcc.c
++++ b/drivers/mailbox/qcom-ipcc.c
+@@ -255,6 +255,55 @@
+ 	return devm_mbox_controller_register(dev, mbox);
+ }
+ 
++/*
++ * Hibernate restore: re-arm the receive signals.
++ *
++ * IPCC_REG_RECV_SIGNAL_ENABLE is written only by qcom_ipcc_unmask_irq(), and
++ * the reboot clears it. For an ordinary interrupt that is harmless, because
++ * suspend_device_irqs() masks it and resume_device_irqs() unmasks it again,
++ * which rewrites the register on the way back.
++ *
++ * The glink edge interrupt is not ordinary. qcom_glink_smem requests it with
++ * IRQF_NO_SUSPEND, so it is never masked at suspend and never unmasked at
++ * resume -- nothing rewrites RECV_SIGNAL_ENABLE, and after a cross-boot
++ * hibernate resume every doorbell the remote rings is silently dropped.
++ *
++ * Observed on x1e80100: after a resume, zero inbound interrupts on both
++ * glink-smem lines while the remote is demonstrably alive and receiving --
++ * a GLINK SSR do_cleanup reached the ADSP and made its audio service tear
++ * down, and a fresh VERSION went out on the wire. Sending works because
++ * IPCC_REG_SEND_ID is a stateless write; only the receive direction is dead.
++ * Everything downstream (battery, charging, thermal, audio, UCSI) then times
++ * out, and no amount of protocol-level recovery can help, because the replies
++ * never arrive.
++ *
++ * Replay the enable for every mapped IPCC interrupt that is not masked.
++ * .restore_noirq, so the signals are live before resume_device_irqs() runs.
++ */
++static int qcom_ipcc_restore_noirq(struct device *dev)
++{
++	struct qcom_ipcc *ipcc = dev_get_drvdata(dev);
++	unsigned int nr = irq_get_nr_irqs();
++	unsigned int count = 0;
++	unsigned int virq;
++
++	for (virq = 0; virq < nr; virq++) {
++		struct irq_data *d = irq_get_irq_data(virq);
++
++		if (!d || d->domain != ipcc->irq_domain)
++			continue;
++		if (irqd_irq_disabled(d) || irqd_irq_masked(d))
++			continue;
++
++		writel(irqd_to_hwirq(d), ipcc->base + IPCC_REG_RECV_SIGNAL_ENABLE);
++		count++;
++	}
++
++	dev_info(dev, "re-armed %u receive signal(s)\n", count);
++
++	return 0;
++}
++
+ static int qcom_ipcc_pm_resume(struct device *dev)
+ {
+ 	struct qcom_ipcc *ipcc = dev_get_drvdata(dev);
+@@ -357,6 +406,7 @@
+ 
+ static const struct dev_pm_ops qcom_ipcc_dev_pm_ops = {
+ 	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, qcom_ipcc_pm_resume)
++	.restore_noirq = pm_sleep_ptr(qcom_ipcc_restore_noirq),
+ };
+ 
+ static struct platform_driver qcom_ipcc_driver = {

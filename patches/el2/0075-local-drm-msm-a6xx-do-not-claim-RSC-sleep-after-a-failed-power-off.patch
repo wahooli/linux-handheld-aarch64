@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Wed, 10 Sep 2026 15:30:00 +0300
+Subject: [PATCH 75/75] local: drm/msm/a6xx: do not claim the RSC slept after a
+ failed power-off
+
+a6xx_rpmh_stop() polls RSCC_RSC_STATUS0_DRV0 for the sleep acknowledgement,
+logs "Unable to power off the GPU RSC" when it times out -- and then sets
+GMU_STATUS_PDC_SLEEP anyway, on both paths. The bit's contract is "this
+kernel put the RSC to sleep", which on the error path is exactly what did
+not happen.
+
+The next bring-up then reads the cold/warm state from hardware, finds a warm
+GMU, so patch 0068's cold-boot clear does not apply, and a6xx_rpmh_start()
+asks the RSC to wake from a sleep it never entered. The ACK cannot arrive.
+Observed on x1e80100 at EL2 roughly three minutes after every cross-boot
+hibernate resume, and it takes the GPU out for good:
+
+  [ 939.611] platform 3d6a000.gmu: GMU cold boot (TCM_RET_CNTL=0x0)
+  [ 940.947] *ERROR* Unable to power off the GPU RSC
+  [1119.667] platform 3d6a000.gmu: GMU warm boot (TCM_RET_CNTL=0x1)
+  [1119.678] *ERROR* Unable to power on the GPU RSC
+  [1121.732] *ERROR* Timeout waiting for GMU OOB set GPU_SET: 0x0   (x2)
+  [1132.091] msm_dpu: 43050c01: preemption timed out
+  [1132.091] *ERROR* 43050c01: hangcheck recover!
+
+leaving 3d00000.gpu at runtime_status=error. The first bring-up after the
+resume is the cold one and it succeeds -- 0068 handles that -- so this is a
+distinct bug from 0068, one step later in the same sequence, and it needs a
+use/idle/use cycle to show up.
+
+Only set the bit when the acknowledgement actually arrived, and say so when
+it did not, so the next bring-up's behaviour is attributable.
+
+RESIDUAL RISK, stated because it is not zero: if the RSC really did enter
+sleep and only the status poll failed, skipping the wake leaves it asleep and
+the GPU will not power up. That failure is loud and looks exactly like the
+one this replaces, so a run can tell them apart. The observed evidence points
+the other way -- the bring-up that follows the failed power-off reports a
+*warm* GMU, i.e. the RSC was not in the state the bit claimed.
+
+Depends on 0068 (both touch a6xx_gmu.c; 0068 clears the same bit on a cold
+boot).
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -657,7 +657,18 @@
+ 
+ 	gmu_write(gmu, REG_A6XX_GMU_RSCC_CONTROL_REQ, 0);
+ 
+-	set_bit(GMU_STATUS_PDC_SLEEP, &gmu->status);
++	/*
++	 * GMU_STATUS_PDC_SLEEP means "this kernel put the RSC to sleep", and
++	 * a6xx_rpmh_start() waits for a wake ACK on the strength of it. If the
++	 * sleep was never acknowledged we do not know that it happened, and
++	 * claiming it makes the next warm bring-up hang on an ACK that cannot
++	 * arrive.
++	 */
++	if (!ret)
++		set_bit(GMU_STATUS_PDC_SLEEP, &gmu->status);
++	else
++		dev_warn(gmu->dev,
++			 "RSC sleep not acknowledged, not arming the wake\n");
+ }
+ 
+ static inline void pdc_write(void __iomem *ptr, u32 offset, u32 value)

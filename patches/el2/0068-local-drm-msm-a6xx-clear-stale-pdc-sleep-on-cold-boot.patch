@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Thu, 11 Sep 2026 06:00:00 +0300
+Subject: [PATCH 68/68] local: drm/msm/a6xx: do not ask the RSC to wake from a
+ sleep it was reset out of
+
+After a cross-boot hibernate restore the GPU never comes back:
+
+  platform 3d6a000.gmu: [drm:a6xx_gmu_fw_start] *ERROR* Unable to power on the GPU RSC
+  adreno 3d00000.gpu: PM: platform_pm_restore returned -110
+
+a6xx_rpmh_start() is:
+
+	if (!test_and_clear_bit(GMU_STATUS_PDC_SLEEP, &gmu->status))
+		return 0;
+	gmu_write(gmu, REG_A6XX_GMU_RSCC_CONTROL_REQ, BIT(1));
+	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_RSCC_CONTROL_ACK, ...);
+
+GMU_STATUS_PDC_SLEEP is software state. a6xx_rpmh_stop() sets it when this
+kernel puts the RSC to sleep; a6xx_rpmh_start() then wakes it. Across a
+hibernate the bit arrives from the image while the silicon arrives from a
+reboot, which RESET the RSC rather than putting it to sleep -- so the wake
+request has nothing to wake and the ACK never comes. A fresh boot never hits
+this because gmu->status is zeroed by kzalloc_obj() at probe, so the very first
+bring-up takes the early return instead.
+
+Clear the bit on a cold boot, which is exactly the case where the RSC cannot
+still be in the sleep the bit describes, and which is decided from hardware
+(REG_A7XX_CX_MISC_TCM_RET_CNTL) rather than from the image. The wake is then
+skipped just as it is on first boot.
+
+Also log the cold/warm decision and the raw TCM_RET_CNTL. On this machine the
+GMU comes up WARM in ordinary operation -- every bring-up in a normal session
+logs 0x1 -- so the cold path is essentially only ever taken after a restore,
+which is why this went unnoticed.
+
+Ruled out along the way, each by instrumentation rather than argument:
+reloading the RSC sequencer uCode (a6xx_gmu_rpmh_init() is probe-only, but
+re-running it changes nothing -- reading the uCode straight back after the write
+returns 0xeaaae5a0 as expected, so the RSCC is powered, writable and correctly
+programmed); and pm_runtime_get_sync() on the GMU failing, which it does not.
+
+Depends on patch 0069 (arm-smmu reprogram on restore); without it the GMU still
+cannot fetch its firmware and fails slightly later instead.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c | 26 ++++++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -1307,6 +1307,7 @@
+ 	struct msm_gpu *gpu = &adreno_gpu->base;
+ 	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
+ 	int status, ret;
++	u32 tcm_ret = 0;
+ 
+ 	if (WARN(!gmu->initialized, "The GMU is not set up yet\n"))
+ 		return -EINVAL;
+@@ -1343,8 +1344,10 @@
+ 
+ 	/* Check to see if we are doing a cold or warm boot */
+ 	if (adreno_is_a7xx(adreno_gpu) || adreno_is_a8xx(adreno_gpu)) {
+-		status = a6xx_cx_misc_read(a6xx_gpu, REG_A7XX_CX_MISC_TCM_RET_CNTL) == 1 ?
+-			GMU_WARM_BOOT : GMU_COLD_BOOT;
++		tcm_ret = a6xx_cx_misc_read(a6xx_gpu, REG_A7XX_CX_MISC_TCM_RET_CNTL);
++		status = tcm_ret == 1 ? GMU_WARM_BOOT : GMU_COLD_BOOT;
++		dev_dbg(gmu->dev, "GMU %s boot (TCM_RET_CNTL=0x%x)\n",
++			 status == GMU_WARM_BOOT ? "warm" : "cold", tcm_ret);
+ 	} else if (gmu->legacy) {
+ 		status = gmu_read(gmu, REG_A6XX_GMU_GENERAL_7) == 1 ?
+ 			GMU_WARM_BOOT : GMU_COLD_BOOT;
+@@ -1355,6 +1358,27 @@
+ 		 */
+ 		status = GMU_COLD_BOOT;
+ 	}
++
++	/*
++	 * GMU_STATUS_PDC_SLEEP is software state: a6xx_rpmh_stop() sets it when
++	 * this kernel put the RSC to sleep, and a6xx_rpmh_start() then asks the
++	 * RSC to wake back up, polling RSCC_CONTROL_ACK.
++	 *
++	 * After a hibernate restore that bit comes from the image while the
++	 * hardware comes from a reboot, which RESET the RSC rather than putting
++	 * it to sleep. There is nothing to wake, the ACK never arrives, and the
++	 * poll fails with "Unable to power on the GPU RSC" -- taking the whole
++	 * GMU bring-up, and the display, with it. A fresh probe does not hit
++	 * this only because gmu->status starts zeroed, so a6xx_rpmh_start()
++	 * takes its early return.
++	 *
++	 * A cold boot is precisely the case where the RSC cannot still be in the
++	 * sleep this bit claims, and the cold/warm decision above is derived
++	 * from hardware (REG_A7XX_CX_MISC_TCM_RET_CNTL), not from the image.
++	 * Clear the bit and let the wake be skipped, exactly as on first boot.
++	 */
++	if (status == GMU_COLD_BOOT)
++		clear_bit(GMU_STATUS_PDC_SLEEP, &gmu->status);
+ 
+ 	ret = a6xx_gmu_fw_start(gmu, status);
+ 	if (ret)

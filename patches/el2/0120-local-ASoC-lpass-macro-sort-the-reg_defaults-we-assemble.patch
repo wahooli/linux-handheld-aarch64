@@ -1,0 +1,61 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] ASoC: codecs: lpass-{wsa,rx}-macro: sort the reg_defaults we assemble
+
+Three lines of regmap scolding on every probe of these codecs, so once per
+cold boot and once more per DSP restart now that they rebind:
+
+    wsa_macro 6aa0000.codec: Driver needs fixing: Unsorted reg_defaults, sorting the copy
+    rx_macro  6ac0000.codec: Driver needs fixing: Unsorted reg_defaults, sorting the copy
+    wsa_macro 6b00000.codec: Driver needs fixing: Unsorted reg_defaults, sorting the copy
+
+The static tables are each in order; the concatenation is not. Both drivers
+pick a codec-version table at probe and memcpy() it onto the end of the base
+table, and the version registers interleave with the base range rather than
+following it. regcache_init() bsearch()es the array, so it sorts its own copy
+and reports the driver while doing it.
+
+Sort it here instead, with regcache_sort_defaults() -- exported for exactly
+this, drivers that build the table at runtime. It is the same sort() with the
+same comparison function regmap would have run on the copy, over the same
+buffer, so the resulting array is identical and nothing about caching changes;
+only the extra pass and the message go away.
+
+va_macro and tx_macro use a single static table and are already in order.
+
+---
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -2764,6 +2764,15 @@
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * Each half is sorted, their concatenation is not: the version
++	 * registers interleave with the base range. regmap bsearch()es this
++	 * array, so left alone it sorts its own copy and says
++	 * "Driver needs fixing: Unsorted reg_defaults" while doing it. Same
++	 * comparison function, so the outcome is identical either way.
++	 */
++	regcache_sort_defaults(reg_defaults, def_count);
++
+ 	struct regmap_config *reg_config __free(kfree) = kmemdup(&wsa_regmap_config,
+ 								 sizeof(*reg_config),
+ 								 GFP_KERNEL);
+--- a/sound/soc/codecs/lpass-rx-macro.c
++++ b/sound/soc/codecs/lpass-rx-macro.c
+@@ -3857,6 +3857,15 @@
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * Each half is sorted, their concatenation is not: the version
++	 * registers interleave with the base range. regmap bsearch()es this
++	 * array, so left alone it sorts its own copy and says
++	 * "Driver needs fixing: Unsorted reg_defaults" while doing it. Same
++	 * comparison function, so the outcome is identical either way.
++	 */
++	regcache_sort_defaults(reg_defaults, def_count);
++
+ 	struct regmap_config *reg_config __free(kfree) = kmemdup(&rx_regmap_config,
+ 								 sizeof(*reg_config),
+ 								 GFP_KERNEL);

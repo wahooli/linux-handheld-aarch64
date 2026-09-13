@@ -1,0 +1,237 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] ASoC: codecs: lpass-macro: rebind fsgen consumers after a DSP restart
+
+Restarting the audio DSP now leaves the macro codecs bound and healthy, but
+still no sound card:
+
+    # cat /proc/asound/cards
+    --- no soundcards ---
+    # ls /sys/bus/soundwire/devices/
+    (empty)
+    6ab0000.soundwire   UNBOUND
+    6b10000.soundwire   UNBOUND
+
+Both SoundWire masters take their "iface" clock from a macro rather than from
+the DSP's clock controller, so when the macros are unbound the core unbinds
+the masters too -- correctly, since the clock is about to disappear with its
+provider. Nothing brings them back. They were force-unbound rather than
+deferred, and deferred probe only retries the deferred list, so the SoundWire
+buses are never recreated, the wsa884x speakers never enumerate, and the card
+waits forever for a component that will not arrive. The card device stays
+bound with no ALSA card behind it, which is what makes this confusing to read
+from userspace.
+
+This is the same gap already handled one level up, where the clock provider
+attaches its own consumers when it comes back; it simply has to be repeated
+here, because the dependency chain is two deep: provider -> macro -> master.
+
+Attach from the point where the fsgen provider is registered again. Only
+unbound devices are touched, and only ever to bind them -- never to release
+one, which over already-unregistered clocks hangs the machine. Consumers
+reached while this probe is still in flight answer -EPROBE_DEFER and land on
+the deferred-probe list, which is where they need to be: the core retries them
+once this driver is bound.
+
+As on the provider side, the attach runs from a work item rather than out of
+probe directly, so the consumers see this driver already bound and bind on the
+first try instead of being turned away -EPROBE_DEFER and warned about in
+__device_links_no_driver().
+
+---
+--- a/sound/soc/codecs/lpass-macro-common.h
++++ b/sound/soc/codecs/lpass-macro-common.h
+@@ -40,6 +40,7 @@
+ struct lpass_macro *lpass_macro_pds_init(struct device *dev);
+ void lpass_macro_pds_exit(struct lpass_macro *pds);
+ int lpass_macro_link_clk_provider(struct device *dev);
++void lpass_macro_attach_clk_consumers(struct device *dev);
+ void lpass_macro_set_codec_version(enum lpass_codec_version version);
+ enum lpass_codec_version lpass_macro_get_codec_version(void);
+ 
+--- a/sound/soc/codecs/lpass-macro-common.c
++++ b/sound/soc/codecs/lpass-macro-common.c
+@@ -5,6 +5,7 @@
+ #include <linux/module.h>
+ #include <linux/init.h>
+ #include <linux/of.h>
++#include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+@@ -129,6 +130,104 @@
+ }
+ EXPORT_SYMBOL_GPL(lpass_macro_link_clk_provider);
+ 
++/**
++ * lpass_macro_attach_clk_consumers() - bind whoever is waiting on our fsgen
++ * @dev: the macro codec device, once its clock provider is registered
++ *
++ * A macro exports a clock -- fsgen -- that the SoundWire masters and the other
++ * macros consume, so when a DSP restart unbinds this driver the core unbinds
++ * those consumers too. They are left *unbound* rather than deferred, and
++ * deferred probe only ever retries the deferred list, so nothing brings them
++ * back on its own: no SoundWire master means no wsa884x, which means the sound
++ * card can never finish binding.
++ *
++ * Attach them here. This only ever binds a driver, never releases one. A
++ * consumer reached while this probe is still in flight simply answers
++ * -EPROBE_DEFER and lands on the deferred-probe list, which is exactly where
++ * it needs to be -- the core retries it once this driver is bound.
++ */
++struct lpass_macro_attach {
++	struct work_struct work;
++	struct device *dev;
++};
++
++static void lpass_macro_do_attach(struct device *dev)
++{
++	struct platform_device *consumer;
++	struct of_phandle_args args;
++	struct device_node *np;
++	int i, ret;
++
++	for_each_node_with_property(np, "clocks") {
++		if (np == dev->of_node)
++			continue;
++
++		for (i = 0; !of_parse_phandle_with_args(np, "clocks", "#clock-cells",
++							i, &args); i++) {
++			bool match = args.np == dev->of_node;
++
++			of_node_put(args.np);
++			if (!match)
++				continue;
++
++			consumer = of_find_device_by_node(np);
++			if (consumer) {
++				if (!consumer->dev.driver) {
++					ret = device_attach(&consumer->dev);
++					if (ret < 0 && ret != -EPROBE_DEFER)
++						dev_warn(dev, "%pOFn did not attach: %d\n",
++							 np, ret);
++				}
++				put_device(&consumer->dev);
++			}
++			break;
++		}
++	}
++}
++
++/*
++ * Run the attach from a work item rather than straight out of probe.
++ *
++ * device_attach() on a consumer while we are still inside our own probe finds
++ * us in DL_DEV_PROBING, so device_links_check_suppliers() turns it away with
++ * -EPROBE_DEFER. The consumer lands on the deferred-probe list and does get
++ * bound eventually, but the wasted attempt trips a WARN on the way out --
++ * __device_links_no_driver() expects a supplier that is bound or unbinding,
++ * not one mid-probe. Waiting until probe has returned makes the consumers
++ * bind on the first try and takes the warning with it.
++ */
++static void lpass_macro_attach_work(struct work_struct *work)
++{
++	struct lpass_macro_attach *attach =
++		container_of(work, struct lpass_macro_attach, work);
++
++	lpass_macro_do_attach(attach->dev);
++}
++
++static void lpass_macro_cancel_attach(void *data)
++{
++	struct lpass_macro_attach *attach = data;
++
++	cancel_work_sync(&attach->work);
++}
++
++void lpass_macro_attach_clk_consumers(struct device *dev)
++{
++	struct lpass_macro_attach *attach;
++
++	attach = devm_kzalloc(dev, sizeof(*attach), GFP_KERNEL);
++	if (!attach)
++		return;
++
++	attach->dev = dev;
++	INIT_WORK(&attach->work, lpass_macro_attach_work);
++	if (devm_add_action_or_reset(dev, lpass_macro_cancel_attach, attach))
++		return;
++
++	schedule_work(&attach->work);
++}
++EXPORT_SYMBOL_GPL(lpass_macro_attach_clk_consumers);
++
+ void lpass_macro_pds_exit(struct lpass_macro *pds)
+ {
+ 	if (pds) {
+--- a/sound/soc/codecs/lpass-va-macro.c
++++ b/sound/soc/codecs/lpass-va-macro.c
+@@ -1424,7 +1424,14 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	return devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, &va->hw);
++	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, &va->hw);
++	if (ret)
++		return ret;
++
++	/* Our fsgen is back; rebind whatever a DSP restart unbound. */
++	lpass_macro_attach_clk_consumers(dev);
++
++	return 0;
+ }
+ 
+ static int va_macro_validate_dmic_sample_rate(u32 dmic_sample_rate,
+--- a/sound/soc/codecs/lpass-rx-macro.c
++++ b/sound/soc/codecs/lpass-rx-macro.c
+@@ -3746,7 +3746,14 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	return devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, hw);
++	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, hw);
++	if (ret)
++		return ret;
++
++	/* Our fsgen is back; rebind whatever a DSP restart unbound. */
++	lpass_macro_attach_clk_consumers(dev);
++
++	return 0;
+ }
+ 
+ static const struct snd_soc_component_driver rx_macro_component_drv = {
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -2660,7 +2660,14 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	return devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, hw);
++	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, hw);
++	if (ret)
++		return ret;
++
++	/* Our fsgen is back; rebind whatever a DSP restart unbound. */
++	lpass_macro_attach_clk_consumers(dev);
++
++	return 0;
+ }
+ 
+ static const struct snd_soc_component_driver wsa_macro_component_drv = {
+--- a/sound/soc/codecs/lpass-tx-macro.c
++++ b/sound/soc/codecs/lpass-tx-macro.c
+@@ -2225,7 +2225,14 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	return devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, hw);
++	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, hw);
++	if (ret)
++		return ret;
++
++	/* Our fsgen is back; rebind whatever a DSP restart unbound. */
++	lpass_macro_attach_clk_consumers(dev);
++
++	return 0;
+ }
+ 
+ static const struct snd_soc_component_driver tx_macro_component_drv = {

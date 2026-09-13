@@ -1,0 +1,93 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] usb: typec: ucsi: glink: do not send to a protection domain that is down
+
+Every audio DSP stop reports a driver error for something that is working
+exactly as designed:
+
+    # echo stop > /sys/class/remoteproc/remoteproc0/state
+    ucsi_glink.pmic_glink_ucsi pmic_glink.ucsi.0: failed to send UCSI write request: -5
+
+The UCSI interface lives in a protection domain on the ADSP. PDR announces
+that domain going down, pmic_glink_ucsi_pdr_notify() records it in pd_running
+and hands the rest to pmic_glink_ucsi_register(), which calls
+ucsi_unregister() -- and ucsi_unregister() disables notifications as its very
+first act, before it has torn anything down:
+
+    /* Disable notifications */
+    ucsi->ops->async_control(ucsi, UCSI_SET_NOTIFICATION_ENABLE);
+
+That write goes out over a link whose remote has just gone away, so
+rpmsg_send() fails and the driver reports it. There is nothing to fix on the
+far side and nothing the caller can do with the error -- ucsi_unregister()
+does not even look at it.
+
+So answer from what PDR already told us rather than finding out from the
+transport: with the PD down, fail reads and writes immediately with
+-ECONNRESET, which is what pmic_glink_send() returns once the endpoint itself
+is gone. Same outcome, no error reported for an expected condition.
+
+Note this also silences a genuine send failure while the PD is down, which is
+the intent: during that window every send fails, and a driver that was told
+the service is gone should not be talking to it.
+
+Not hibernation-specific: a plain SSR reproduces it, and the hibernate path
+merely performs a stop/start.
+
+---
+--- a/drivers/usb/typec/ucsi/ucsi_glink.c
++++ b/drivers/usb/typec/ucsi/ucsi_glink.c
+@@ -81,6 +81,31 @@
+ 	u8 read_buf[UCSI_BUF_V2_SIZE];
+ };
+ 
++/*
++ * The interface this driver talks to lives in a protection domain on the
++ * ADSP, and PDR tells us when that domain goes away. Anything sent after
++ * that point cannot be answered, and one such send is unavoidable:
++ * ucsi_unregister() disables notifications as its first act, so taking the
++ * PD down -- an SSR, or the DSP stop/start a hibernation cycle performs --
++ * always ended in
++ *
++ *   failed to send UCSI write request: -5
++ *
++ * reported as a driver error although nothing is wrong. Answer from what PDR
++ * already told us instead of finding out from the transport.
++ */
++static bool pmic_glink_ucsi_pd_running(struct pmic_glink_ucsi *ucsi)
++{
++	unsigned long flags;
++	bool running;
++
++	spin_lock_irqsave(&ucsi->state_lock, flags);
++	running = ucsi->pd_running;
++	spin_unlock_irqrestore(&ucsi->state_lock, flags);
++
++	return running;
++}
++
+ static int pmic_glink_ucsi_read(struct ucsi *__ucsi, unsigned int offset,
+ 				void *val, size_t val_len)
+ {
+@@ -94,6 +119,12 @@
+ 	req.hdr.opcode = UC_UCSI_READ_BUF_REQ;
+ 
+ 	mutex_lock(&ucsi->lock);
++
++	if (!pmic_glink_ucsi_pd_running(ucsi)) {
++		ret = -ECONNRESET;
++		goto out_unlock;
++	}
++
+ 	memset(ucsi->read_buf, 0, sizeof(ucsi->read_buf));
+ 	reinit_completion(&ucsi->read_ack);
+ 
+@@ -143,6 +174,9 @@
+ 	int ret;
+ 	u8 *buf;
+ 
++	if (!pmic_glink_ucsi_pd_running(ucsi))
++		return -ECONNRESET;
++
+ 	req.hdr.owner = PMIC_GLINK_OWNER_USBC;
+ 	req.hdr.type = MSG_TYPE_REQ_RESP;
+ 	req.hdr.opcode = UC_UCSI_WRITE_BUF_REQ;

@@ -1,0 +1,424 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Sat, 13 Sep 2026 10:00:00 +0300
+Subject: [PATCH 114/114] local: Bluetooth: hci_qca: close the controller before
+ the hibernate snapshot
+
+Sixth revision. Resume survives, returns immediately, and the controller comes
+back on its own a few seconds later without holding up the desktop.
+
+Hibernating with Bluetooth powered on does not survive the resume. With
+Bluetooth OFF it always has, and the difference is structural rather than
+anything in this driver: uart14's serdev port is CLOSED across the image, so
+uart_resume_port() finds an uninitialised port and returns without touching the
+hardware. With Bluetooth ON the port is open and the restore runs the full
+re-init -- ->startup(), qcom_geni_serial_port_setup(), ->set_termios(),
+->start_tx() -- against a serial engine that just came back from a reboot.
+
+So put the controller into the state that already works before the snapshot is
+taken: power the chip down and close the port at .freeze. The image then
+records exactly the Bluetooth-off case and the restore takes the early return.
+
+THIS AVOIDS THE FAILURE RATHER THAN FIXING IT. Whatever goes wrong in the
+open-port restore path is still there for any other geni UART open across a
+hibernate; this only removes Bluetooth from the list. Recording that here
+because the commit message is the only place it will survive.
+
+Coming back is hci_reset_dev(), which is what this driver already uses when the
+controller has gone away underneath it (SSR). The core runs hci_dev_do_close()
+then hci_dev_do_open(), and the open re-runs qca_setup(): re-open the port,
+power the chip, download the firmware. HCI_QUIRK_NON_PERSISTENT_SETUP is set on
+this SoC because the DT gives the bluetooth node no enable-gpios and the power
+sequencer is used instead, so setup runs on every open. That is the same path a
+userspace power off/on takes, and 0085+0108 made it work after a resume.
+
+hci_reset_dev() rather than calling hci_dev_do_close()/hci_dev_do_open()
+directly: those are declared in hci_core.h but not exported, so a module cannot
+reach them without adding an EXPORT_SYMBOL, and there is no need for one.
+
+hdev->hw_error is cleared first. hci_error_reset() invokes it before closing,
+and qca_hw_error() tries to collect a memory dump, which on a powered-down
+controller is an eight second wait for nothing. qca_setup() re-arms it.
+
+Sixth revision disarms hdev->reset along with hdev->hw_error. Revision 5 left
+it set, so the first command to time out while the chip was unpowered went
+hci_cmd_timeout() -> hdev->reset -> qca_reset(), which crashes the SoC to
+collect a dump and, when the dump does not arrive, calls hci_reset_dev() to
+start again. Setup was never the problem -- it succeeded five times in a row,
+each time immediately followed by another crash:
+
+  [49] Injecting HCI hardware error event    <- the deferred bring-up
+  [49] hardware error 0x00                   <- hw_error already NULL, good
+  [51] command 0x0c01 tx timeout
+  [51] crash the soc to collect controller dump
+  [74] QCA setup on UART is completed
+  [74] mem_dump_status: 0 / crash the soc to collect controller dump
+  ...
+
+qca_setup() arms hw_error and reset together, so qca_freeze() now clears them
+together, covering the whole window from freeze to the next successful open.
+
+Fifth revision stopped the bring-up from blocking the desktop. Revision 4 kicked
+it from qca_restore(), which runs inside dpm_resume() -- so the firmware
+download landed in the middle of the display and GPU restore and nothing came
+back on screen until Bluetooth was finished. The work is now kicked from a PM
+notifier on PM_POST_HIBERNATION/PM_POST_RESTORE, which the restored image
+reaches after dpm_resume_end() and thaw_processes(): every device back,
+userspace running. qca_restore() leaves hib_closed set for the notifier to
+consume and returns immediately.
+
+Fourth revision fixes a use-after-free that revisions 1-3 all carried.
+qca_freeze() cleared HCI_UART_PROTO_READY and closed the port, but never
+dropped hdev->flush. hci_dev_close_sync() calls it later, and:
+
+  hci_uart_flush() calls serdev_device_write_flush() UNCONDITIONALLY -- the
+  PROTO_READY test inside it only guards the proto flush that follows;
+  ttyport_write_flush() has no SERPORT_ACTIVE guard, unlike
+  ttyport_write_buf(); and ttyport_close() frees the tty via
+  tty_release_struct() while leaving serport->tty dangling.
+
+So the close path dereferenced a freed tty:
+
+  Unable to handle kernel paging request at 006f746b7365650d
+  pc : tty_driver_flush_buffer   lr : ttyport_write_flush
+  Workqueue: hci0 hci_error_reset
+  Call trace: tty_driver_flush_buffer / serdev_device_write_flush /
+              hci_uart_flush / hci_dev_close_sync / hci_error_reset
+  x1 : 706f746b73656565
+
+x1 is ASCII -- the freed tty had already been reused for a string. It only
+became fatal in revision 3 because the deferred work reaches the close reliably;
+revisions 1 and 2 were the same bug with worse timing.
+
+qca_freeze() now does what hci_uart_close() does, in that order: flush while the
+port is still open, drop hdev->flush, clear PROTO_READY, close.
+hci_uart_open() restores hdev->flush on the next open.
+
+Third revision. The second one tried to fix the desktop stall by skipping the
+pre-shutdown vendor command when the chip is already off. The resume stopped
+working completely and the reason was not understood, so it was reverted.
+
+Later note: 0115 re-lands exactly that skip and the resume survives. Revision 2
+still carried the hdev->flush use-after-free that revision 4 fixed, and losing
+the ten second wait made that panic reliable -- the delay was hiding a bug, not
+doing work. This patch no longer touches qca_hci_shutdown() at all; 0115 owns
+that function.
+
+What revision 1 relied on, by accident, is that the ten seconds pushed the
+reopen past the end of the resume. hci_reset_dev() was called straight from
+qca_restore(), so the close and reopen ran while dpm_resume() was still walking
+the device list, and the timeout was the only thing keeping them apart.
+Revision 2 removed it and the race appeared at once.
+
+So separate them deliberately rather than by luck: qca_restore() now schedules
+hib_restore_work and returns. The work runs on the system workqueue after the PM
+core has moved on, takes hdev->req_lock for the close/open cycle, and none of it
+sits in the resume's critical path. The desktop comes up first; Bluetooth
+follows.
+
+qca_close() cancels that work before freeing qca -- it runs on the system
+workqueue, so destroy_workqueue(qca->workqueue) does not drain it.
+
+Superseded, kept for the record: second revision fixes what the first one cost. It claimed the close would run
+asynchronously and not hold anything up. It does run in the hci workqueue, but
+it holds hdev->req_lock the whole time, and hci_dev_shutdown() calls
+qca_hci_shutdown() -> qca_send_pre_shutdown_cmd(), which waits HCI_INIT_TIMEOUT.
+That is TEN SECONDS, against a chip qca_freeze() has already powered off. Every
+mgmt call from bluetoothd queues behind the lock, and on the first test the
+graphical target did not come up until Bluetooth had finished coming back.
+
+So do not send a vendor command to a controller with no power: qca_hci_shutdown()
+now skips the pre-shutdown cmd when QCA_BT_OFF is set. That is correct on its own
+terms and not specific to hibernate -- the flag means the chip is down.
+
+hci_reset_sync() is not a factor: it is gated on HCI_QUIRK_RESET_ON_CLOSE, which
+only hci_ldisc sets, never the serdev path. What remains after the fix is the
+firmware download in qca_setup(), a second or two, which is real work.
+
+Double-close is safe: hci_uart_close() returns early unless
+HCI_UART_PROTO_READY is set, and qca_freeze() clears it in the same order
+hci_uart_close() does.
+
+SIMPLE_DEV_PM_OPS() is expanded by hand so the hibernate entries can differ from
+the suspend ones; .suspend and .resume keep the original callbacks, so s2idle is
+untouched.
+
+Revision 1 was not compile-tested -- the build's --cleanbuild had wiped src/ and
+with it the recorded savedcmd_ lines -- but it built and ran. Revision 2 adds
+three lines and a comment to a condition.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+ drivers/bluetooth/hci_qca.c | 219 ++++++++++++++++++++-
+ 1 file changed, 218 insertions(+), 1 deletions(-)
+
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@ -31,6 +31,7 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/serdev.h>
+ #include <linux/string_choices.h>
++#include <linux/suspend.h>
+ #include <linux/mutex.h>
+ #include <linux/unaligned.h>
+ 
+@@ -184,6 +185,11 @@
+ 	u64 rx_votes_off;
+ 	u64 votes_on;
+ 	u64 votes_off;
++
++	/* set by qca_freeze() when it closed the port before the snapshot */
++	bool hib_closed;
++	struct work_struct hib_restore_work;
++	struct notifier_block hib_pm_notifier;
+ };
+ 
+ enum qca_speed_type {
+@@ -235,6 +241,9 @@
+ static int qca_regulator_enable(struct qca_serdev *qcadev);
+ static void qca_regulator_disable(struct qca_serdev *qcadev);
+ static void qca_power_off(struct hci_uart *hu);
++static void qca_hib_restore_work(struct work_struct *work);
++static int qca_hib_pm_notify(struct notifier_block *nb, unsigned long action,
++			     void *unused);
+ static void qca_controller_memdump(struct work_struct *work);
+ static void qca_dmp_hdr(struct hci_dev *hdev, struct sk_buff *skb);
+ 
+@@ -598,6 +607,7 @@
+ 		return -ENOMEM;
+ 	}
+ 
++	INIT_WORK(&qca->hib_restore_work, qca_hib_restore_work);
+ 	INIT_WORK(&qca->ws_awake_rx, qca_wq_awake_rx);
+ 	INIT_WORK(&qca->ws_awake_device, qca_wq_awake_device);
+ 	INIT_WORK(&qca->ws_rx_vote_off, qca_wq_serial_rx_clock_vote_off);
+@@ -648,6 +658,9 @@
+ 	BT_DBG("HCI_UART_QCA open, tx_idle_delay=%u, wake_retrans=%u",
+ 	       qca->tx_idle_delay, qca->wake_retrans);
+ 
++	qca->hib_pm_notifier.notifier_call = qca_hib_pm_notify;
++	register_pm_notifier(&qca->hib_pm_notifier);
++
+ 	return 0;
+ }
+ 
+@@ -720,6 +733,15 @@
+ 
+ 	BT_DBG("hu %p qca close", hu);
+ 
++	/*
++	 * Unregister before the cancel, or the notifier could queue the work
++	 * again behind us. hib_restore_work runs on the system workqueue, not
++	 * qca->workqueue, so the destroy_workqueue() below does not drain it,
++	 * and it dereferences qca, which is freed at the end of this function.
++	 */
++	unregister_pm_notifier(&qca->hib_pm_notifier);
++	cancel_work_sync(&qca->hib_restore_work);
++
+ 	/* BT core skips qca_hci_shutdown() which calls qca_power_off() on rmmod */
+ 	if (!test_bit(QCA_BT_OFF, &qca->flags))
+ 		qca_power_off(hu);
+@@ -2769,7 +2791,202 @@
+ 	return 0;
+ }
+ 
+-static SIMPLE_DEV_PM_OPS(qca_pm_ops, qca_suspend, qca_resume);
++/*
++ * Hibernating with the controller powered on does not survive the resume, and
++ * the reason is structural rather than anything in this driver.
++ *
++ * With Bluetooth off, uart14's serdev port is CLOSED across the image, so
++ * uart_resume_port() finds an uninitialised port and returns without touching
++ * the hardware. That path works and has worked all along. With Bluetooth on the
++ * port is open, so the restore runs the full re-init -- ->startup(),
++ * port_setup(), ->set_termios(), ->start_tx() -- against a serial engine that
++ * came back from a reboot, and the machine does not come back.
++ *
++ * So put the controller in the state that already works before the snapshot is
++ * taken: power the chip down and close the port. The image then records exactly
++ * the Bluetooth-off case, byte for byte, and the restore takes the early
++ * return.
++ *
++ * This AVOIDS the failure rather than fixing it. Whatever goes wrong in the
++ * open-port restore path is still there for any other geni UART that is open
++ * across a hibernate; this only removes Bluetooth from the list. Said plainly
++ * because the commit message is the only place it will be recorded.
++ *
++ * Coming back is hci_reset_dev(), which is the mechanism this driver already
++ * uses for a controller that went away underneath it (SSR): the core does
++ * hci_dev_do_close() then hci_dev_do_open(), and the open re-runs qca_setup(),
++ * which re-opens the port, powers the chip and downloads the firmware.
++ * HCI_QUIRK_NON_PERSISTENT_SETUP is set for this SoC, so setup runs on every
++ * open -- that is the same path a userspace power-off/power-on takes, and it is
++ * known good.
++ *
++ * hdev->hw_error is cleared first. hci_error_reset() calls it before closing,
++ * and qca_hw_error() tries to collect a memory dump from the chip, which on a
++ * powered-down controller is an eight second wait for nothing. qca_setup()
++ * re-arms it on success.
++ *
++ * The close still costs a few seconds of command timeouts against a chip that
++ * is already off. It runs in the hci workqueue, asynchronously to the resume,
++ * so the resume itself is not held up; Bluetooth simply comes back a few
++ * seconds later.
++ */
++static int __maybe_unused qca_freeze(struct device *dev)
++{
++	struct serdev_device *serdev = to_serdev_device(dev);
++	struct qca_serdev *qcadev = serdev_device_get_drvdata(serdev);
++	struct hci_uart *hu = &qcadev->serdev_hu;
++	struct qca_data *qca = hu->priv;
++
++	/*
++	 * Already off, or no port to close: the ordinary suspend path is
++	 * correct and this is the case that already survives.
++	 */
++	if (test_bit(QCA_BT_OFF, &qca->flags) ||
++	    !test_bit(HCI_UART_PROTO_READY, &hu->flags))
++		return qca_suspend(dev);
++
++	qca_power_off(hu);
++
++	/*
++	 * From here until the next successful qca_setup() there is no powered
++	 * chip on the far end of the UART, and both of these callbacks answer
++	 * "the controller did not reply" by trying to talk to it anyway:
++	 * qca_reset() crashes the SoC to collect a dump, qca_hw_error() waits
++	 * eight seconds for one. hci_cmd_timeout() calls hdev->reset for every
++	 * timed-out command, and qca_reset() ends by calling hci_reset_dev(),
++	 * which starts the next round -- so one stray command becomes a
++	 * crash-and-dump loop that never converges. Leaving hdev->reset armed
++	 * is what broke revision 5:
++	 *
++	 *   command 0x0c01 tx timeout
++	 *   crash the soc to collect controller dump
++	 *   QCA setup on UART is completed        <- setup works fine...
++	 *   mem_dump_status: 0 / crash the soc    <- ...and is crashed again
++	 *
++	 * qca_setup() re-arms the pair together once an open succeeds, so a
++	 * failed setup correctly leaves them clear.
++	 */
++	hu->hdev->hw_error = NULL;
++	hu->hdev->reset = NULL;
++
++	/*
++	 * Exactly the order hci_uart_close() uses, and every step of it matters.
++	 *
++	 * hdev->flush MUST be dropped before the close. hci_uart_flush() calls
++	 * serdev_device_write_flush() unconditionally -- the PROTO_READY test in
++	 * it only guards the proto flush afterwards -- and ttyport_write_flush()
++	 * has no SERPORT_ACTIVE guard at all, unlike ttyport_write_buf(). So a
++	 * flush after the close dereferences serport->tty, which ttyport_close()
++	 * has already handed to tty_release_struct() without NULLing.
++	 *
++	 * Revision 3 left hdev->flush set and panicked on the first resume:
++	 *
++	 *   tty_driver_flush_buffer <- ttyport_write_flush
++	 *     <- serdev_device_write_flush <- hci_uart_flush
++	 *     <- hci_dev_close_sync <- hci_error_reset
++	 *
++	 *   Unable to handle kernel paging request at 006f746b7365650d
++	 *   x1 : 706f746b73656565
++	 *
++	 * x1 is ASCII: the freed tty had already been reused for a string.
++	 *
++	 * hci_uart_open() restores hdev->flush on the next open, and clearing
++	 * PROTO_READY keeps a later close from the HCI core a no-op rather than
++	 * a second serdev_device_close().
++	 */
++	serdev_device_write_flush(hu->serdev);
++	hu->hdev->flush = NULL;
++	clear_bit(HCI_UART_PROTO_READY, &hu->flags);
++	serdev_device_close(hu->serdev);
++
++	qca->hib_closed = true;
++
++	return 0;
++}
++
++/*
++ * Bringing the controller back is deferred out of the restore callback.
++ *
++ * Revision 1 called hci_reset_dev() straight from qca_restore(), so the close
++ * and reopen ran while dpm_resume() was still walking the device list. It
++ * happened to work only because qca_send_pre_shutdown_cmd() sat in a ten second
++ * timeout first, which pushed the reopen past the end of the resume. Revision 2
++ * removed that timeout and the resume broke: the reopen then raced the rest of
++ * the device restore.
++ *
++ * So do it properly. The work runs on the system workqueue, after
++ * qca_restore() has returned and the PM core has moved on, and it takes
++ * hdev->req_lock for the close/open cycle without any of that being in the
++ * resume's critical path. The desktop comes up first; Bluetooth follows.
++ */
++static void qca_hib_restore_work(struct work_struct *work)
++{
++	struct qca_data *qca = container_of(work, struct qca_data,
++					    hib_restore_work);
++	struct hci_uart *hu = qca->hu;
++
++	/* hw_error and reset were disarmed in qca_freeze(). */
++	hci_reset_dev(hu->hdev);
++}
++
++static int __maybe_unused qca_restore(struct device *dev)
++{
++	struct serdev_device *serdev = to_serdev_device(dev);
++	struct qca_serdev *qcadev = serdev_device_get_drvdata(serdev);
++	struct hci_uart *hu = &qcadev->serdev_hu;
++	struct qca_data *qca = hu->priv;
++
++	if (!qca->hib_closed)
++		return qca_resume(dev);
++
++	/*
++	 * hib_closed stays set: qca_hib_pm_notify() consumes it once the rest
++	 * of resume is done. Bringing the controller back from here would run
++	 * a firmware download inside dpm_resume(), alongside the display and
++	 * GPU restore, and the desktop does not come back until it finishes.
++	 */
++	clear_bit(QCA_SUSPENDING, &qca->flags);
++
++	return 0;
++}
++
++/*
++ * PM_POST_HIBERNATION fires in the restored image after dpm_resume_end() and
++ * thaw_processes() -- every device back, userspace running. PM_POST_RESTORE is
++ * the same point for the paths that use the restore chain. Kicking the reset
++ * from here is what makes the bring-up non-blocking: resume completes, the
++ * desktop is already up, and the controller reappears a few seconds later.
++ */
++static int qca_hib_pm_notify(struct notifier_block *nb, unsigned long action,
++			     void *unused)
++{
++	struct qca_data *qca = container_of(nb, struct qca_data,
++					    hib_pm_notifier);
++
++	if (action != PM_POST_HIBERNATION && action != PM_POST_RESTORE)
++		return NOTIFY_DONE;
++
++	if (qca->hib_closed) {
++		qca->hib_closed = false;
++		schedule_work(&qca->hib_restore_work);
++	}
++
++	return NOTIFY_DONE;
++}
++
++/*
++ * SIMPLE_DEV_PM_OPS() expanded by hand: the hibernate entries have to differ
++ * from the suspend ones. Suspend and resume keep the original callbacks, so
++ * s2idle is untouched.
++ */
++static const struct dev_pm_ops qca_pm_ops = {
++	.suspend = pm_sleep_ptr(qca_suspend),
++	.resume = pm_sleep_ptr(qca_resume),
++	.freeze = pm_sleep_ptr(qca_freeze),
++	.thaw = pm_sleep_ptr(qca_restore),
++	.poweroff = pm_sleep_ptr(qca_freeze),
++	.restore = pm_sleep_ptr(qca_restore),
++};
+ 
+ #ifdef CONFIG_OF
+ static const struct of_device_id qca_bluetooth_of_match[] = {

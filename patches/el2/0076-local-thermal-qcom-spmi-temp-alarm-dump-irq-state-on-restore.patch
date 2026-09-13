@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Wed, 10 Sep 2026 16:30:00 +0300
+Subject: [PATCH 76/76] local: thermal/qcom-spmi-temp-alarm: dump the alarm and
+ interrupt state on hibernate restore
+
+Pure instrumentation. Reads nine registers, writes none, changes no
+behaviour. It exists because three fix attempts for this bug were wrong and
+the next step has to be evidence.
+
+The bug: after a cross-boot hibernate resume all eight PMIC temp-alarm
+interrupts assert continuously, ~2400/s each, all dispatched in one
+pmic_arb_chained_irq() pass, pinning cpu0 at ~90% hardirq until the machine
+is unusable. There is no thermal event behind it -- every zone still reports
+DEFAULT_TEMP, and qpnp_tm_update_temp_no_adc() only moves chip->temp when
+get_temp_stage() changes, so the stage has not moved since probe.
+
+What has been tried, and what it ruled out:
+
+  - Cycling the driver binding (unbind + rebind) stops the storm dead on the
+    cycled alarm while the other seven keep going. So *something* done at
+    probe fixes it.
+  - Re-running qpnp_tm_init() from a .restore -- trip thresholds plus
+    ALARM_CTRL_FORCE_ENABLE -- does NOT fix it. With the call succeeding
+    (rev2, after fixing a chip->ntrips idempotency bug that made rev1 fail
+    -EINVAL) the storm ran at 4064/s per line versus 2371/s with no patch at
+    all, i.e. reprogramming the alarm makes it assert harder.
+
+The remaining difference between those two is that a rebind RE-REQUESTS THE
+IRQ. spmi-pmic-arb declares no PM ops at all, and the QPNP per-interrupt
+registers are written only at request time: qpnpint_irq_domain_activate()
+writes EN_CLR and LATCHED_CLR, irq_unmask() writes EN_SET, irq_set_type()
+writes SET_TYPE/POLARITY_HIGH/POLARITY_LOW. Across a hibernate the PMIC comes
+back from a reboot while irq_desc comes back from the image, so none of it is
+rewritten.
+
+That is a hypothesis, not a conclusion -- and qpnpint_irq_unmask() only
+rewrites hardware when EN_SET reads back clear, so simply replaying the irq
+setup may be a no-op too. Rather than guess a fourth time, read the state.
+
+Those registers live in this peripheral's own block (0x10-0x18), which
+qpnp_tm_read() already reaches via chip->base, so no new plumbing is needed.
+Dump them at probe for a healthy reference and again on .restore, and diff.
+
+RT_STS is the discriminator: set means the alarm source genuinely is
+asserting and the fault is in the alarm block; clear, with LATCHED_STS
+setting anyway, means the line is being re-latched by an edge/polarity
+configuration that no longer matches what Linux believes -- which points at
+spmi-pmic-arb and not at this driver.
+
+platform_set_drvdata() is added because the driver never stored it; get_temp
+reaches the chip through thermal_zone_device_priv().
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+ drivers/thermal/qcom/qcom-spmi-temp-alarm.c | 71 ++++++++++++++++++++
+ 1 file changed, 71 insertions(+)
+
+--- a/drivers/thermal/qcom/qcom-spmi-temp-alarm.c
++++ b/drivers/thermal/qcom/qcom-spmi-temp-alarm.c
+@@ -755,6 +755,73 @@
+ 	return ret;
+ }
+ 
++/*
++ * Diagnostic only -- reads, never writes.
++ *
++ * After a cross-boot hibernate resume all eight PMIC temp-alarm interrupts
++ * assert continuously (~2400/s each, cpu0 pinned in hardirq) with no thermal
++ * event behind them: every zone still reports DEFAULT_TEMP, so
++ * get_temp_stage() has not changed since probe. Cycling the driver binding
++ * stops it dead; re-running qpnp_tm_init() from a .restore does not, and
++ * makes it worse. The difference is that a rebind re-requests the irq, and
++ * the QPNP per-interrupt registers are programmed only at request time.
++ *
++ * Those registers live in this peripheral's own block, so dump them here and
++ * compare probe (healthy) against restore (storming). RT_STS is the
++ * discriminator: set means the source really is asserting, clear means the
++ * line is being re-latched by an edge/polarity configuration that no longer
++ * matches what Linux believes.
++ */
++#define QPNP_TM_REG_INT_RT_STS		0x10
++#define QPNP_TM_REG_INT_SET_TYPE	0x11
++#define QPNP_TM_REG_INT_POLARITY_HIGH	0x12
++#define QPNP_TM_REG_INT_POLARITY_LOW	0x13
++#define QPNP_TM_REG_INT_EN_SET		0x15
++#define QPNP_TM_REG_INT_LATCHED_STS	0x18
++
++static void qpnp_tm_dump_state(struct qpnp_tm_chip *chip, const char *when)
++{
++	static const struct { u16 addr; const char *name; } regs[] = {
++		{ QPNP_TM_REG_STATUS,		 "status"    },
++		{ QPNP_TM_REG_SHUTDOWN_CTRL1,	 "shdn_ctl1" },
++		{ QPNP_TM_REG_ALARM_CTRL,	 "alarm_ctl" },
++		{ QPNP_TM_REG_INT_RT_STS,	 "rt_sts"    },
++		{ QPNP_TM_REG_INT_SET_TYPE,	 "set_type"  },
++		{ QPNP_TM_REG_INT_POLARITY_HIGH, "pol_hi"    },
++		{ QPNP_TM_REG_INT_POLARITY_LOW,	 "pol_lo"    },
++		{ QPNP_TM_REG_INT_EN_SET,	 "en_set"    },
++		{ QPNP_TM_REG_INT_LATCHED_STS,	 "latched"   },
++	};
++	char buf[160];
++	int i, n = 0;
++	u8 val;
++
++	for (i = 0; i < ARRAY_SIZE(regs); i++) {
++		if (qpnp_tm_read(chip, regs[i].addr, &val) < 0)
++			n += scnprintf(buf + n, sizeof(buf) - n, " %s=??",
++				       regs[i].name);
++		else
++			n += scnprintf(buf + n, sizeof(buf) - n, " %s=%02x",
++				       regs[i].name, val);
++	}
++
++	dev_info(chip->dev, "%s:%s stage=%u\n", when, buf, chip->stage);
++}
++
++static int __maybe_unused qpnp_tm_pm_restore(struct device *dev)
++{
++	struct qpnp_tm_chip *chip = dev_get_drvdata(dev);
++
++	if (chip)
++		qpnp_tm_dump_state(chip, "restore");
++
++	return 0;
++}
++
++static const struct dev_pm_ops qpnp_tm_pm_ops = {
++	.restore = pm_sleep_ptr(qpnp_tm_pm_restore),
++};
++
+ static int qpnp_tm_probe(struct platform_device *pdev)
+ {
+ 	struct qpnp_tm_chip *chip;
+@@ -883,6 +950,9 @@
+ 
+ 	thermal_zone_device_update(chip->tz_dev, THERMAL_EVENT_UNSPECIFIED);
+ 
++	platform_set_drvdata(pdev, chip);
++	qpnp_tm_dump_state(chip, "probe");
++
+ 	return 0;
+ }
+ 
+@@ -896,6 +966,7 @@
+ 	.driver = {
+ 		.name = "spmi-temp-alarm",
+ 		.of_match_table = qpnp_tm_match_table,
++		.pm = pm_sleep_ptr(&qpnp_tm_pm_ops),
+ 	},
+ 	.probe  = qpnp_tm_probe,
+ };

@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Wed, 10 Sep 2026 20:30:00 +0300
+Subject: [PATCH 79/79] local: pinctrl: qcom: restore per-interrupt config
+ after hibernation
+
+After a cross-boot hibernate resume no TLMM-backed interrupt arrives, so the
+keyboard, touchpad, embedded controller and lid switch are all dead. Measured
+on x1e80100 by physically typing on the laptop keyboard and moving the
+touchpad for ten seconds, twice, on a verified restore (340
+platform_pm_restore, 0 platform_pm_thaw):
+
+  irq 200 msmgpio  66 Edge  qcom_x1e_it8987_ec     +0
+  irq 211 msmgpio  51 Level hid-over-i2c           +0
+  irq 212 msmgpio   3 Level hid-over-i2c           +0
+  irq 213 msmgpio  67 Level hid-over-i2c           +0
+
+Zero on every line.
+
+msm_pinctrl_resume() re-applies only the pin mux and config, via
+pinctrl_force_default() and the ctl register. The interrupt configuration is
+a different register: intr_cfg holds the polarity, the detection type, the
+raw-status enable and the target processor, and it is written only by
+msm_gpio_irq_set_type() -- which runs when the interrupt is requested and
+never again. Across a hibernate the TLMM block comes back from the reboot at
+power-on values while irq_desc comes back from the image, so the line ends up
+detecting the wrong condition, or routed to a processor that is not us, and
+the interrupt never arrives.
+
+This is the same defect as in spmi-pmic-arb, fixed by the companion patch
+"spmi: pmic-arb: restore per-interrupt type and polarity after hibernation",
+one bus over. There it manifested as a 2400/s interrupt storm because the
+mismatch made a level source look edge-triggered; here it manifests as
+silence.
+
+Replay the programming for every interrupt the controller has enabled.
+irq_set_irq_type() takes the descriptor lock and calls chip->irq_set_type()
+unconditionally, so re-applying the type Linux already believes in is enough
+to reprogram the hardware and nothing needs saving across the image.
+pctrl->enabled_irqs is the same bitmap the chained handler scans, so it is
+exactly the set that matters.
+
+.restore_noirq, so it runs before resume_device_irqs() unmasks anything: an
+interrupt delivered against a stale configuration is precisely how the PMIC
+version of this bug produced its storm.
+
+The before/after intr_cfg values are logged for the first few pins, so one
+boot shows whether the register really had been lost rather than leaving that
+inferred. On the first run that logging paid for itself twice: it printed
+"gpio67 irq cfg restored: 0xe2 -> 0x71", confirming the register really is
+lost, and "replayed irq config for 2 gpio(s)" -- far too few, which is how the
+iteration bug below was caught.
+
+Iterate every gpio with a mapped irq rather than pctrl->enabled_irqs.
+msm_gpio_irq_mask() clears that bitmap and suspend_device_irqs() masks every
+non-wakeup interrupt before .restore_noirq runs, so it holds only the few
+still unmasked. The masked ones are never fixed up later either, because
+resume_device_irqs() ends in msm_gpio_irq_unmask(), which writes the enable
+bit and nothing else.
+
+Not board-specific: msm_pinctrl_dev_pm_ops is shared by every qcom pinctrl
+driver, so this covers all of them.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+ drivers/pinctrl/qcom/pinctrl-msm.c | 98 ++++++++++++++++++++
+ 1 file changed, 98 insertions(+), 2 deletions(-)
+
+--- a/drivers/pinctrl/qcom/pinctrl-msm.c
++++ b/drivers/pinctrl/qcom/pinctrl-msm.c
+@@ -1534,8 +1534,104 @@
+ 	return pinctrl_force_default(pctrl->pctrl);
+ }
+ 
+-SIMPLE_DEV_PM_OPS(msm_pinctrl_dev_pm_ops, msm_pinctrl_suspend,
+-		  msm_pinctrl_resume);
++/*
++ * Hibernate restore: TLMM comes back from the reboot with its per-interrupt
++ * configuration at power-on values, while irq_desc comes back from the image
++ * still describing what was programmed at request time.
++ *
++ * msm_pinctrl_resume() only re-applies the pin mux and config
++ * (pinctrl_force_default(), the ctl register). The interrupt configuration --
++ * polarity, detection type, raw-status enable and, critically, the TARGET
++ * PROCESSOR -- lives in the separate intr_cfg register and is written only by
++ * msm_gpio_irq_set_type(), which runs when the interrupt is requested and
++ * never again. Nothing replays it, so after a cross-boot resume the line is
++ * either detecting the wrong edge/level or routed to a processor that is not
++ * us, and the interrupt simply never arrives.
++ *
++ * Measured on x1e80100 after a cross-boot resume, physically typing on the
++ * laptop keyboard and moving the touchpad for ten seconds, twice:
++ *
++ *   irq 200 msmgpio  66 Edge  qcom_x1e_it8987_ec     +0
++ *   irq 211 msmgpio  51 Level hid-over-i2c           +0
++ *   irq 212 msmgpio   3 Level hid-over-i2c           +0
++ *   irq 213 msmgpio  67 Level hid-over-i2c           +0
++ *
++ * Zero on every line. Keyboard, touchpad, the embedded controller and the lid
++ * switch are all behind TLMM, which is why none of them work after a resume.
++ *
++ * Replay it for every interrupt this controller has enabled.
++ * irq_set_irq_type() takes the descriptor lock and calls chip->irq_set_type()
++ * unconditionally, so re-applying the type Linux already believes in is enough
++ * to reprogram the hardware; nothing has to be saved across the image.
++ * pctrl->enabled_irqs is the same bitmap the chained handler scans, so it is
++ * exactly the set that matters.
++ *
++ * .restore_noirq, so this runs before resume_device_irqs() unmasks anything --
++ * an interrupt delivered against a stale configuration is how the PMIC
++ * equivalent of this bug produced a 2400/s interrupt storm.
++ *
++ * The before/after intr_cfg values are logged once per controller so a single
++ * boot shows whether the register really had been lost.
++ */
++static int __maybe_unused msm_pinctrl_restore_noirq(struct device *dev)
++{
++	struct msm_pinctrl *pctrl = dev_get_drvdata(dev);
++	unsigned int shown = 0;
++	unsigned int count = 0;
++	unsigned int i;
++
++	/*
++	 * Every gpio with a mapped irq, NOT just pctrl->enabled_irqs.
++	 * msm_gpio_irq_mask() clears that bitmap and suspend_device_irqs()
++	 * has masked every non-wakeup interrupt before we get here, so by
++	 * restore time it holds only the few still unmasked -- on this
++	 * machine 2 of 5, which is how this was noticed. The masked ones are
++	 * never fixed up afterwards either: resume_device_irqs() ends in
++	 * msm_gpio_irq_unmask(), which writes the enable bit and nothing
++	 * else. irq_find_mapping() plus the trigger-type check below is the
++	 * correct filter.
++	 */
++	for (i = 0; i < pctrl->chip.ngpio; i++) {
++		const struct msm_pingroup *g = &pctrl->soc->groups[i];
++		unsigned int virq, type;
++		struct irq_data *d;
++		u32 before, after;
++
++		virq = irq_find_mapping(pctrl->chip.irq.domain, i);
++		if (!virq)
++			continue;
++
++		d = irq_get_irq_data(virq);
++		if (!d)
++			continue;
++
++		type = irqd_get_trigger_type(d);
++		if (type == IRQ_TYPE_NONE)
++			continue;
++
++		before = msm_readl_intr_cfg(pctrl, g);
++		irq_set_irq_type(virq, type);
++		after = msm_readl_intr_cfg(pctrl, g);
++		count++;
++
++		if (before != after && shown < 4) {
++			dev_info(dev,
++				 "gpio%u irq cfg restored: %#x -> %#x\n",
++				 i, before, after);
++			shown++;
++		}
++	}
++
++	if (count)
++		dev_info(dev, "replayed irq config for %u gpio(s)\n", count);
++
++	return 0;
++}
++
++const struct dev_pm_ops msm_pinctrl_dev_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(msm_pinctrl_suspend, msm_pinctrl_resume)
++	.restore_noirq = pm_sleep_ptr(msm_pinctrl_restore_noirq),
++};
+ 
+ EXPORT_SYMBOL(msm_pinctrl_dev_pm_ops);
+ 

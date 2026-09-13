@@ -1,0 +1,139 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] soundwire: qcom: do not enumerate before the bus knows its slaves
+
+The second consecutive DSP restart in a boot loses the sound card:
+
+    sysfs: cannot create duplicate filename '/bus/soundwire/devices/sdw:1:0:0217:0204:00:0'
+      sdw_slave_add <- sdw_of_find_slaves <- sdw_bus_master_add <- qcom_swrm_probe
+    soundwire sdw-master-1-0: Failed to add slave: ret -17
+    /proc/asound/cards -> --- no soundcards ---
+
+and leaves a driverless device behind, its status attribute empty, where a
+wsa884x should be.
+
+qcom_swrm_get_device_status() answers an attach by searching bus->slaves for a
+matching device id and, when it finds none, registering the device itself with
+a NULL fwnode -- deliberately, so an undeclared part is still visible in
+sysfs. But qcom_swrm_probe() requested the interrupt well before
+sdw_bus_master_add(), and it is sdw_bus_master_add() that fills bus->slaves
+from the device tree. An attach arriving in between therefore searches an
+empty list, always "finds none", and claims the name the device tree entry is
+about to want; sdw_of_find_slaves() then collides with it and returns -EEXIST.
+
+A first probe never hits this, because nothing is attached yet and enumeration
+only starts when qcom_swrm_init() programs the block. On a re-probe the parts
+are still enumerated on the wire from the previous incarnation, so the
+interrupt can fire the moment it is requested. Nothing on this SoC used to
+re-probe these masters, which is why it has sat here unexercised; it becomes
+reachable as soon as a DSP restart takes the SoundWire masters down and brings
+them back, and it needs two restarts in one boot to show.
+
+So request the interrupt after sdw_bus_master_add(). Enumeration is driven by
+qcom_swrm_init(), which runs later still, so nothing needs the handler any
+earlier.
+
+Close the same window on the way out as well. sdw_bus_master_delete() empties
+bus->slaves while the interrupt is still live -- devres does not free it until
+after remove() returns -- so an attach landing there re-registers the device
+that was just deleted and the next probe inherits the collision. disable_irq()
+before the delete; devres still frees it afterwards, and 0103's dispose action
+still runs after that.
+
+Incidentally fixes a clock leak on the way past: the wake-irq failure path
+jumped to err_init, which returns without the clk_disable_unprepare() that
+err_clk does. It now unwinds through err_master_add.
+
+---
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -1655,6 +1655,38 @@
+ 
+ 	ctrl->reg_read(ctrl, SWRM_COMP_HW_VERSION, &ctrl->version);
+ 
++	ctrl->bus.controller_id = -1;
++
++	if (ctrl->version > SWRM_VERSION_1_3_0) {
++		ctrl->reg_read(ctrl, SWRM_COMP_MASTER_ID, &val);
++		ctrl->bus.controller_id = val;
++	}
++
++	ret = sdw_bus_master_add(&ctrl->bus, dev, dev->fwnode);
++	if (ret) {
++		dev_err(dev, "Failed to register Soundwire controller (%d)\n",
++			ret);
++		goto err_clk;
++	}
++
++	/*
++	 * Only now that sdw_bus_master_add() has put the device tree's slaves
++	 * on bus->slaves. qcom_swrm_get_device_status() answers an attach by
++	 * searching that list and, finding nothing, registering the device
++	 * itself with a NULL fwnode -- so an interrupt arriving while the list
++	 * is still empty claims the name the device tree entry is about to
++	 * want, and sdw_of_find_slaves() then fails:
++	 *
++	 *   sysfs: cannot create duplicate filename '/bus/soundwire/devices/sdw:1:0:0217:0204:00:0'
++	 *   soundwire sdw-master-1-0: Failed to add slave: ret -17
++	 *
++	 * leaving a driverless device behind and no sound card. A first probe
++	 * never hits it -- nothing is attached yet -- but on a re-probe the
++	 * parts are still enumerated on the wire from the previous incarnation
++	 * and the interrupt can fire immediately. Enumeration is driven from
++	 * qcom_swrm_init() below, so nothing needs the handler before this
++	 * point.
++	 */
+ 	ret = devm_request_threaded_irq(dev, ctrl->irq, NULL,
+ 					qcom_swrm_irq_handler,
+ 					IRQF_TRIGGER_RISING |
+@@ -1662,7 +1694,7 @@
+ 					"soundwire", ctrl);
+ 	if (ret) {
+ 		dev_err(dev, "Failed to request soundwire irq\n");
+-		goto err_clk;
++		goto err_master_add;
+ 	}
+ 
+ 	ctrl->wake_irq = of_irq_get(dev->of_node, 1);
+@@ -1673,24 +1705,10 @@
+ 						"swr_wake_irq", ctrl);
+ 		if (ret) {
+ 			dev_err(dev, "Failed to request soundwire wake irq\n");
+-			goto err_init;
++			goto err_master_add;
+ 		}
+ 	}
+ 
+-	ctrl->bus.controller_id = -1;
+-
+-	if (ctrl->version > SWRM_VERSION_1_3_0) {
+-		ctrl->reg_read(ctrl, SWRM_COMP_MASTER_ID, &val);
+-		ctrl->bus.controller_id = val;
+-	}
+-
+-	ret = sdw_bus_master_add(&ctrl->bus, dev, dev->fwnode);
+-	if (ret) {
+-		dev_err(dev, "Failed to register Soundwire controller (%d)\n",
+-			ret);
+-		goto err_clk;
+-	}
+-
+ 	qcom_swrm_init(ctrl);
+ 	wait_for_completion_timeout(&ctrl->enumeration,
+ 				    msecs_to_jiffies(TIMEOUT_MS));
+@@ -1728,6 +1746,16 @@
+ {
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(&pdev->dev);
+ 
++	/*
++	 * The other half of the race the probe path comments on: the handler
++	 * registers a slave it cannot find on bus->slaves, and
++	 * sdw_bus_master_delete() empties that list while the interrupt is
++	 * still live -- devres does not free it until after this returns. An
++	 * attach landing in that window re-registers the device that was just
++	 * deleted, and the next probe inherits the collision.
++	 */
++	disable_irq(ctrl->irq);
++
+ 	sdw_bus_master_delete(&ctrl->bus);
+ 
+ 	/*

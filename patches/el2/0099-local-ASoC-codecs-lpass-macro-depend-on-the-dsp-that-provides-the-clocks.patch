@@ -1,0 +1,204 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] ASoC: codecs: lpass-macro: depend on the DSP that provides the clocks
+
+Restart the audio DSP on an x1e80100 and every LPASS macro codec is left
+permanently broken:
+
+    # echo stop > /sys/class/remoteproc/remoteproc0/state
+    # echo start > /sys/class/remoteproc/remoteproc0/state
+    clk_unregister: unregistering prepared clock: LPASS_HW_DCODEC
+    clk_unregister: unregistering prepared clock: LPASS_HW_MACRO
+    va_macro 6d44000.codec: unable to prepare mclk
+
+    # cat /sys/bus/platform/devices/6d44000.codec/power/runtime_status
+    error
+
+All four macros end up there, the card survives but is silent in both
+directions, and only a reboot clears it.
+
+Every clock these codecs use -- mclk, the HW_MACRO and HW_DCODEC votes, and
+the fsgen they pass between themselves -- comes from &q6prmcc, a clock
+controller on a GPR service of the audio DSP. Restarting the DSP therefore
+unregisters the provider while the codecs still hold its clocks.
+
+Nothing tells them it is about to happen. clk_get() records no dependency, and
+the device links fw_devlink builds from the "clocks" phandle point at the
+remoteproc rather than at the service, because the GPR service devices do not
+exist yet when the tree is parsed -- and the remoteproc never unbinds, so the
+core sees no supplier change. clk_unregister() consequently runs with live
+consumers, and rather than failing it installs clk_nodrv_ops on every handle,
+whose .prepare returns -ENXIO until the last clk_put(). The next
+va_macro_runtime_resume() fails there, rpm_callback() latches the errno in
+power.runtime_error, and the codec can no longer be resumed at all:
+pm_runtime_get_sync() returns -EINVAL without invoking the callback, which is
+the -EINVAL that surfaces from snd_soc_pcm_component_pm_runtime_get().
+
+There is no recovery after the fact. Reviving a handle requires a clk_put()
+and a fresh clk_get(), so a re-probe -- and re-probing at that point means
+tearing the codec, SoundWire and card stack down while every clock in it is
+already clk_nodrv_ops, which hangs the machine.
+
+So record the dependency instead, on the device that actually supplies the
+clocks. __device_release_driver() unbinds consumers before it calls the
+supplier's remove callback, so the codecs release live clocks on the way down
+and clk_unregister() then finds no consumers left; DL_FLAG_AUTOPROBE_CONSUMER
+has the core probe them again when the DSP returns. No dead handle is ever
+created, nothing touches an unclocked LPASS register, and no runtime PM error
+is latched.
+
+Platforms whose macros take their clocks from an always-on block resolve no
+packet-router device and are left alone.
+
+Not hibernation-specific: a plain SSR reproduces it, and the hibernate path
+merely performs a stop/start.
+
+---
+--- a/sound/soc/codecs/lpass-macro-common.h
++++ b/sound/soc/codecs/lpass-macro-common.h
+@@ -39,6 +39,7 @@
+ 
+ struct lpass_macro *lpass_macro_pds_init(struct device *dev);
+ void lpass_macro_pds_exit(struct lpass_macro *pds);
++int lpass_macro_link_clk_provider(struct device *dev);
+ void lpass_macro_set_codec_version(enum lpass_codec_version version);
+ enum lpass_codec_version lpass_macro_get_codec_version(void);
+ 
+--- a/sound/soc/codecs/lpass-macro-common.c
++++ b/sound/soc/codecs/lpass-macro-common.c
+@@ -8,6 +8,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
++#include <linux/soc/qcom/apr.h>
+ 
+ #include "lpass-macro-common.h"
+ 
+@@ -58,6 +59,76 @@
+ }
+ EXPORT_SYMBOL_GPL(lpass_macro_pds_init);
+ 
++/**
++ * lpass_macro_link_clk_provider() - depend on the DSP that provides our clocks
++ * @dev: the macro codec device
++ *
++ * On these SoCs every clock a macro codec uses -- mclk, the HW_MACRO and
++ * HW_DCODEC votes, and fsgen -- comes from a clock controller that lives on
++ * the audio DSP's packet-router bus, so the provider is torn down whenever the
++ * DSP is restarted. An SSR does it, and so does the stop/start a hibernation
++ * cycle performs.
++ *
++ * Nothing tells the codec that is about to happen. clk_get() records no
++ * dependency, and the device links fw_devlink builds from the "clocks" phandle
++ * point at the remoteproc -- the nearest ancestor that had a struct device
++ * when the tree was parsed -- which never unbinds. So clk_unregister() runs
++ * with this driver still holding its clocks, and rather than failing it gives
++ * every one of them clk_nodrv_ops, whose .prepare returns -ENXIO for good.
++ * The next runtime resume fails, rpm_callback() latches the errno in
++ * power.runtime_error, and the codec is stuck in runtime PM error with no way
++ * back: recovering a handle needs a clk_put() and a fresh clk_get(), which
++ * only a re-probe performs.
++ *
++ * Link to the device that really supplies the clocks instead.
++ * __device_release_driver() unbinds consumers before it calls the supplier's
++ * remove callback, so the codec releases *live* clocks on the way down, and
++ * DL_FLAG_AUTOPROBE_CONSUMER has the core probe it again once the DSP is back.
++ *
++ * Absent or non-DSP providers are not an error: platforms whose macros take
++ * their clocks from an always-on block have nothing to depend on here.
++ */
++int lpass_macro_link_clk_provider(struct device *dev)
++{
++	struct device_node *provider, *service;
++	struct device_link *link;
++	struct device *supplier;
++
++	provider = of_parse_phandle(dev->of_node, "clocks", 0);
++	if (!provider)
++		return 0;
++
++	/*
++	 * The provider is a clock-controller child node of the packet-router
++	 * service; the service is what owns a struct device.
++	 */
++	service = of_get_parent(provider);
++	of_node_put(provider);
++	if (!service)
++		return 0;
++
++	supplier = bus_find_device_by_of_node(&aprbus, service);
++	of_node_put(service);
++	if (!supplier)
++		return 0;
++
++	link = device_link_add(dev, supplier, DL_FLAG_AUTOPROBE_CONSUMER);
++	put_device(supplier);
++	if (!link) {
++		/*
++		 * Not fatal. Without the link this codec behaves as it did
++		 * before: it works until the DSP is restarted and is then
++		 * stuck in runtime PM error. That is strictly better than
++		 * refusing to probe and leaving the card with no codecs.
++		 */
++		dev_warn(dev, "no link to the clock provider; a DSP restart will break this codec\n");
++		return 0;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(lpass_macro_link_clk_provider);
++
+ void lpass_macro_pds_exit(struct lpass_macro *pds)
+ {
+ 	if (pds) {
+--- a/sound/soc/codecs/lpass-va-macro.c
++++ b/sound/soc/codecs/lpass-va-macro.c
+@@ -1558,6 +1558,10 @@
+ 	if (IS_ERR(va->mclk))
+ 		return dev_err_probe(dev, PTR_ERR(va->mclk), "unable to get mclk clock\n");
+ 
++	ret = lpass_macro_link_clk_provider(dev);
++	if (ret)
++		return ret;
++
+ 	va->pds = lpass_macro_pds_init(dev);
+ 	if (IS_ERR(va->pds))
+ 		return PTR_ERR(va->pds);
+--- a/sound/soc/codecs/lpass-rx-macro.c
++++ b/sound/soc/codecs/lpass-rx-macro.c
+@@ -3786,6 +3786,10 @@
+ 	if (IS_ERR(rx->mclk))
+ 		return dev_err_probe(dev, PTR_ERR(rx->mclk), "unable to get mclk clock\n");
+ 
++	ret = lpass_macro_link_clk_provider(dev);
++	if (ret)
++		return ret;
++
+ 	if (flags & LPASS_MACRO_FLAG_HAS_NPL_CLOCK) {
+ 		rx->npl = devm_clk_get(dev, "npl");
+ 		if (IS_ERR(rx->npl))
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -2700,6 +2700,10 @@
+ 	if (IS_ERR(wsa->mclk))
+ 		return dev_err_probe(dev, PTR_ERR(wsa->mclk), "unable to get mclk clock\n");
+ 
++	ret = lpass_macro_link_clk_provider(dev);
++	if (ret)
++		return ret;
++
+ 	if (flags & LPASS_MACRO_FLAG_HAS_NPL_CLOCK) {
+ 		wsa->npl = devm_clk_get(dev, "npl");
+ 		if (IS_ERR(wsa->npl))
+--- a/sound/soc/codecs/lpass-tx-macro.c
++++ b/sound/soc/codecs/lpass-tx-macro.c
+@@ -2265,6 +2265,10 @@
+ 	if (IS_ERR(tx->mclk))
+ 		return dev_err_probe(dev, PTR_ERR(tx->mclk), "unable to get mclk clock\n");
+ 
++	ret = lpass_macro_link_clk_provider(dev);
++	if (ret)
++		return ret;
++
+ 	if (tx->data->flags & LPASS_MACRO_FLAG_HAS_NPL_CLOCK) {
+ 		tx->npl = devm_clk_get(dev, "npl");
+ 		if (IS_ERR(tx->npl))

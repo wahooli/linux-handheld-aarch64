@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Wed, 10 Sep 2026 17:30:00 +0300
+Subject: [PATCH 77/77] local: spmi: pmic-arb: restore per-interrupt type and
+ polarity after hibernation
+
+After a cross-boot hibernate resume on x1e80100, all eight PMIC temp-alarm
+interrupts assert continuously at ~2400/s each, every one dispatched in the
+same pmic_arb_chained_irq() pass, pinning cpu0 at ~90% hardirq until the
+machine is unusable. The same happens at EL1 with the plain device tree, so
+it is not specific to booting the kernel at EL2.
+
+Dumping the peripheral's own registers at probe and again on restore
+(identical on all eight) names the lost state exactly:
+
+  probe:   status=80 shdn_ctl1=08 alarm_ctl=80 rt_sts=00 set_type=01 pol_hi=01 pol_lo=01 en_set=01 latched=00
+  restore: status=80 shdn_ctl1=08 alarm_ctl=80 rt_sts=00 set_type=00 pol_hi=00 pol_lo=00 en_set=01 latched=01
+
+The peripheral is fine: status, shutdown control and alarm control read back
+byte-identical, and RT_STS is clear, so nothing is actually asserting. What
+changed is the interrupt configuration. SET_TYPE and both POLARITY registers
+came back at power-on defaults, while irq_desc came back from the image: Linux
+still has handle_edge_irq installed and believes the line is edge-triggered on
+both edges, but the hardware is now level with no polarity selected.
+handle_edge_irq acks LATCHED_CLR, the level input re-latches immediately, and
+the cycle repeats forever -- which is exactly what latched=01 shows.
+
+QPNPINT_REG_SET_TYPE, POLARITY_HIGH and POLARITY_LOW are only ever written
+from qpnpint_irq_set_type(), which runs when the interrupt is requested and
+never again. spmi-pmic-arb declares no PM ops at all, so nothing replays it.
+That also explains two earlier observations: unbinding and rebinding a PMIC
+driver clears the storm on its lines, because the driver re-requests its
+interrupt; while re-running the peripheral's own init does not, and made it
+worse, because the peripheral was never the problem.
+
+Replay the programming for every interrupt this controller owns.
+irq_set_irq_type() takes the descriptor and bus locks and calls
+chip->irq_set_type() unconditionally, so re-applying the type Linux already
+believes in is enough to reprogram the hardware, and no state has to be saved
+across the image. .restore_noirq runs before resume_device_irqs() unmasks
+anything, so no interrupt is ever delivered against the stale configuration.
+
+This is not thermal-specific. Every interrupt behind this controller loses the
+same configuration -- pmic_glink/UCSI, the power key and the RTC alarm
+included -- so other post-resume PMIC misbehaviour may share this cause.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+ drivers/spmi/spmi-pmic-arb.c | 69 ++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+
+--- a/drivers/spmi/spmi-pmic-arb.c
++++ b/drivers/spmi/spmi-pmic-arb.c
+@@ -2167,12 +2167,81 @@
+ };
+ MODULE_DEVICE_TABLE(of, spmi_pmic_arb_match_table);
+ 
++/*
++ * Hibernate restore: the PMIC comes back from the reboot with its
++ * per-interrupt configuration at power-on defaults, while irq_desc comes back
++ * from the hibernation image still describing what probe programmed. Measured
++ * on x1e80100 across a cross-boot resume, identically on all eight PMIC
++ * temp-alarm interrupts:
++ *
++ *   probe:   set_type=01 pol_hi=01 pol_lo=01 en_set=01 latched=00 rt_sts=00
++ *   restore: set_type=00 pol_hi=00 pol_lo=00 en_set=01 latched=01 rt_sts=00
++ *
++ * The peripheral itself is untouched -- its status, shutdown-control and
++ * alarm-control registers all read back identical -- and RT_STS is clear, so
++ * nothing is actually asserting. But SET_TYPE and both POLARITY registers were
++ * reset: Linux still has handle_edge_irq installed and believes the line is
++ * edge-triggered, while the hardware is level with no polarity selected.
++ * handle_edge_irq acks LATCHED_CLR, the level input re-latches immediately,
++ * and the interrupt repeats at ~2400/s per line, pinning a CPU at ~90% hardirq
++ * until the machine is unusable.
++ *
++ * Those registers are only ever written by qpnpint_irq_set_type(), i.e. once,
++ * when the interrupt is requested. That is why unbinding and rebinding a PMIC
++ * driver clears the storm on its lines -- it re-requests the interrupt -- while
++ * re-initialising the peripheral does not.
++ *
++ * Replay it for every interrupt this controller owns. irq_set_irq_type() takes
++ * the descriptor and bus locks and calls chip->irq_set_type() unconditionally,
++ * so re-applying the type Linux already believes in is enough to reprogram the
++ * hardware. This runs in .restore_noirq, before resume_device_irqs() unmasks
++ * anything, so no interrupt is ever delivered against the stale configuration.
++ *
++ * Not thermal-specific: every interrupt behind this controller is affected,
++ * pmic_glink/UCSI, the power key and the RTC alarm included.
++ */
++static int spmi_pmic_arb_restore_noirq(struct device *dev)
++{
++	struct spmi_pmic_arb *pmic_arb = dev_get_drvdata(dev);
++	unsigned int nr = irq_get_nr_irqs();
++	unsigned int virq;
++
++	for (virq = 0; virq < nr; virq++) {
++		struct irq_data *d = irq_get_irq_data(virq);
++		unsigned int type;
++		int i;
++
++		if (!d)
++			continue;
++
++		for (i = 0; i < PMIC_ARB_MAX_BUSES; i++)
++			if (pmic_arb->buses[i] &&
++			    d->domain == pmic_arb->buses[i]->domain)
++				break;
++		if (i == PMIC_ARB_MAX_BUSES)
++			continue;
++
++		type = irqd_get_trigger_type(d);
++		if (type == IRQ_TYPE_NONE)
++			continue;
++
++		irq_set_irq_type(virq, type);
++	}
++
++	return 0;
++}
++
++static const struct dev_pm_ops spmi_pmic_arb_pm_ops = {
++	.restore_noirq = pm_sleep_ptr(spmi_pmic_arb_restore_noirq),
++};
++
+ static struct platform_driver spmi_pmic_arb_driver = {
+ 	.probe		= spmi_pmic_arb_probe,
+ 	.remove		= spmi_pmic_arb_remove,
+ 	.driver		= {
+ 		.name	= "spmi_pmic_arb",
+ 		.of_match_table = spmi_pmic_arb_match_table,
++		.pm	= pm_sleep_ptr(&spmi_pmic_arb_pm_ops),
+ 	},
+ };
+ module_platform_driver(spmi_pmic_arb_driver);

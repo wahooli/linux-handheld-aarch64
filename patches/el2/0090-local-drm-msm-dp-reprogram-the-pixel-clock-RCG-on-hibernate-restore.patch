@@ -1,0 +1,228 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Thu, 11 Sep 2026 23:30:00 +0300
+Subject: [PATCH 90/90] local: drm/msm/dp: reprogram the pixel clock RCG on
+ hibernate restore
+
+THE eDP PANEL BUG. Confirmed on hardware: after a cross-boot hibernate resume
+the eDP pixel clock runs at EXACTLY DOUBLE its programmed rate, so the panel is
+driven at 120 Hz instead of 60 and presents nothing at all.
+
+Read straight out of silicon at disp_cc + 0x82a0
+(disp_cc_mdss_dptx3_pixel0_clk_src, mnd_width 16, hid_width 5):
+
+                    M       N          resulting rate
+  healthy  CFG=00002301  2903 / 15000  ->  261,270,000 Hz
+  resumed  CFG=00002301  2903 /  7500  ->  522,540,000 Hz   exactly 2.000x
+
+N is halved; M, CFG, src_sel and src_div are identical. The two values are
+semantically exact: 261,273,600 is the 2944x1840@60 pixel rate divided by two
+for DP widebus (2 pixels per clock), and 522,547,200 is the same mode at one
+pixel per clock. So the clock is programmed for NON-widebus while the INTF
+timing is widebus-halved (INTF_HSYNC_CTL=05e80010, htotal 1512, identical on
+both boots). The arithmetic closes against measurement:
+
+  frame = htotal 1512 * vtotal 2880 / rate
+  healthy  16.67 ms -> 60.0 Hz     measured 16.72 ms / 59.8 Hz
+  resumed   8.33 ms -> 120.0 Hz    measured  8.34 ms / 119.9 Hz
+
+(measured two ways: modetest -v reported 59.8 vs 119.9 Hz, and 903 vs 1802
+dpu_enc_frame_done_cb tracepoint intervals agreed.)
+
+MECHANISM. msm_dp_ctrl_on_stream() and msm_dp_ctrl_on_stream_phy_test_report()
+both call clk_set_rate(ctrl->pixel_clk, ...) with the correct rate on every
+modeset. clk_core_set_rate_nolock() bails first:
+
+	rate = clk_core_req_round_rate_nolock(core, req_rate);
+	/* bail early if nothing to do */
+	if (rate == clk_core_get_rate_nolock(core))
+		return 0;
+
+clk_core_get_rate_nolock() returns core->rate -- the CACHE, which came back
+inside the hibernation image and therefore already equals the request. The RCG
+is never reprogrammed and keeps whatever the loading kernel left in it.
+
+Same defect class as 0034, 0068, 0069, 0077, 0079/0080, 0081 and 0083: cached
+software state matching by construction while the silicon was reset underneath.
+
+WHY IT HID FOR SO LONG. An early sweep reported "78/78 display clocks match
+healthy" and killed the clock theory. It was measuring the cache:
+clk_core_get_rate_recalc() only re-reads hardware when CLK_GET_RATE_NOCACHE is
+set, and the kernel says so outright -- "Simply returns the cached rate of the
+clk, unless CLK_GET_RATE_NOCACHE flag is set". debugfs clk_rate is NOT a
+hardware read. Forcing 90 Hz did not help either, and that was filed as a red
+herring; in fact both of this panel's modes share one pixel clock
+(3024x1920x90 = 3024x2880x60 = 522,547,200), so a mode switch never changes the
+request and never forces a reprogram. This hypothesis predicts that.
+
+EVERY REMAINING SYMPTOM FOLLOWS. The panel locks the LINK (symbol lock, CR/EQ
+done, interlane align, zero symbol errors over 10 s -- all measured) and refuses
+to present an out-of-range timing, hence black. The external monitor showed a
+partial picture because it is a 240 Hz-capable display fed at 240. The sink's own
+frame CRC changed on a static image because frames really were arriving, just
+unpresentable. Every DPU and DP register is byte-identical because the registers
+are right -- the clock feeding them was not. And an mdss_gdsc power cycle could
+not help: the RCG lives in disp_cc, outside the MDSS power domain.
+
+CONFIRMED BY REPAIR, not just by reading: writing the healthy M/N back and
+triggering CMD_UPDATE by hand made the panel present a picture for the first
+time in this hunt.
+
+THE FIX. Give the DP controller a real .restore that makes the framework's
+cached rate disagree with the hardware, so the next modeset's clk_set_rate()
+actually reprograms the RCG. The stream clock is off and the link is down at
+.restore time, so parking the RCG at another rate briefly cannot glitch
+anything. The remaining five system-sleep callbacks are spelled out rather than
+left to SET_SYSTEM_SLEEP_PM_OPS() so .restore can differ from .resume; they keep
+exactly the behaviour they had. Same shape as 0069.
+
+The dev_info() is load-bearing: one resumed boot says whether the cache was
+actually poisoned, and dev_warn() fires if it was not.
+
+KNOWN REMAINING ISSUE, NOT ADDRESSED HERE. With the rate corrected the panel
+presents, and what it presents is a strip of correct pixels at the top then
+INTF_UNDERFLOW_COLOR blue -- a genuine DPU underrun, exactly what the external
+monitor showed all along. That is a SECOND, independent fault which was simply
+invisible on the eDP while nothing could be presented at all. mdss_mdp_clk_src
+is NOT the cause: its RCG reads CFG=00000105, src_div=5 on both boots.
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c    | 66 ++++++++++++++++++++++++++
+ drivers/gpu/drm/msm/dp/dp_ctrl.h    |  1 +
+ drivers/gpu/drm/msm/dp/dp_display.c | 25 +++++++++--
+ 3 files changed, 90 insertions(+), 2 deletions(-)
+
+diff -ur a4/drivers/gpu/drm/msm/dp/dp_ctrl.c b4/drivers/gpu/drm/msm/dp/dp_ctrl.c
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c	2026-09-11 20:12:27.435914036 +0300
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c	2026-09-11 20:12:27.457558875 +0300
+@@ -202,6 +202,70 @@
+ /*
+  * NOTE: resetting DP controller will also clear any pending HPD related interrupts
+  */
++/*
++ * Force the next clk_set_rate() on the pixel clock to actually reprogram the
++ * RCG, by making the clk framework's cached rate disagree with it.
++ *
++ * After a cross-boot hibernate restore the cache comes back inside the
++ * hibernation image, so it already equals whatever the next modeset will ask
++ * for, and clk_core_set_rate_nolock() short-circuits:
++ *
++ *	rate = clk_core_req_round_rate_nolock(core, req_rate);
++ *	// bail early if nothing to do
++ *	if (rate == clk_core_get_rate_nolock(core))
++ *		return 0;
++ *
++ * clk_core_get_rate_nolock() returns core->rate, the cache -- not the hardware.
++ * So the RCG keeps whatever the loading kernel left in it.
++ *
++ * Measured on x1e80100 (Yoga Slim 7x, eDP on dptx3), reading disp_cc + 0x82a0
++ * straight out of silicon:
++ *
++ *	healthy   M=2903 N=15000 -> 261,270,000 Hz   widebus, 2 px/clock
++ *	resumed   M=2903 N= 7500 -> 522,540,000 Hz   1 px/clock, exactly 2.000x
++ *
++ * The INTF timing is widebus-halved on both boots (INTF_HSYNC_CTL=05e80010,
++ * htotal 1512), so htotal * vtotal / rate gives 16.67 ms against 8.33 ms --
++ * matching a measured 59.8 Hz against 119.9 Hz. 120 Hz is out of range for this
++ * 90 Hz panel: the sink locks the LINK (symbol lock, CR/EQ done, zero symbol
++ * errors, all measured) and simply never presents the video. Writing the healthy
++ * M/N back by hand and triggering CMD_UPDATE made the panel light up.
++ *
++ * Called from .restore, where the stream clock is off and the link is down, so
++ * briefly parking the RCG at another rate cannot glitch anything.
++ */
++void msm_dp_ctrl_pixel_clk_invalidate(struct msm_dp_ctrl *msm_dp_ctrl)
++{
++	struct msm_dp_ctrl_private *ctrl;
++	unsigned long cached, parked;
++
++	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
++
++	if (!ctrl->pixel_clk)
++		return;
++
++	cached = clk_get_rate(ctrl->pixel_clk);
++	if (!cached)
++		return;
++
++	/*
++	 * A DP pixel RCG computes M/N for arbitrary rates, so half the cached
++	 * value is always representable and always differs. Verify it, because
++	 * a silent no-op here would leave the original bug in place.
++	 */
++	clk_set_rate(ctrl->pixel_clk, cached / 2);
++	parked = clk_get_rate(ctrl->pixel_clk);
++
++	if (parked == cached)
++		dev_warn(ctrl->dev,
++			 "hibernate restore: pixel clk cache stuck at %lu Hz; the 2x RCG bug may persist\n",
++			 cached);
++	else
++		dev_info(ctrl->dev,
++			 "hibernate restore: pixel clk cache %lu -> %lu Hz, next modeset will reprogram the RCG\n",
++			 cached, parked);
++}
++
+ void msm_dp_ctrl_reset(struct msm_dp_ctrl *msm_dp_ctrl)
+ {
+ 	struct msm_dp_ctrl_private *ctrl =
+diff -ur a4/drivers/gpu/drm/msm/dp/dp_ctrl.h b4/drivers/gpu/drm/msm/dp/dp_ctrl.h
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.h	2026-09-11 20:12:27.439871010 +0300
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.h	2026-09-11 20:12:27.457633094 +0300
+@@ -32,6 +32,7 @@
+ 				    void __iomem *link_base);
+ 
+ void msm_dp_ctrl_reset(struct msm_dp_ctrl *msm_dp_ctrl);
++void msm_dp_ctrl_pixel_clk_invalidate(struct msm_dp_ctrl *msm_dp_ctrl);
+ void msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl);
+ void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl);
+ void msm_dp_ctrl_irq_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl);
+diff -ur a4/drivers/gpu/drm/msm/dp/dp_display.c b4/drivers/gpu/drm/msm/dp/dp_display.c
+--- a/drivers/gpu/drm/msm/dp/dp_display.c	2026-09-11 20:12:27.443573918 +0300
++++ b/drivers/gpu/drm/msm/dp/dp_display.c	2026-09-11 20:12:27.457702731 +0300
+@@ -1244,10 +1244,42 @@
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_PM_SLEEP
++/*
++ * Hibernate restore. The clk framework's cached rates came back in the image
++ * and already match what the next modeset will request, so clk_set_rate() on
++ * the pixel clock short-circuits and the RCG keeps whatever the loading kernel
++ * left in it -- measured at exactly 2x on x1e80100, which drives the panel at
++ * 120 Hz and makes it present nothing at all. See
++ * msm_dp_ctrl_pixel_clk_invalidate().
++ *
++ * Doing this in .restore rather than .resume keeps it off the s2idle path,
++ * where one kernel owns the hardware throughout and the cache is honest.
++ */
++static int msm_dp_pm_restore(struct device *dev)
++{
++	struct msm_dp_display_private *dp = dev_get_dp_display_private(dev);
++
++	msm_dp_ctrl_pixel_clk_invalidate(dp->ctrl);
++
++	return pm_runtime_force_resume(dev);
++}
++#endif
++
++/*
++ * Spelled out rather than using SET_SYSTEM_SLEEP_PM_OPS() so .restore can
++ * differ from .resume; the other five keep exactly the behaviour they had.
++ */
+ static const struct dev_pm_ops msm_dp_pm_ops = {
+ 	SET_RUNTIME_PM_OPS(msm_dp_pm_runtime_suspend, msm_dp_pm_runtime_resume, NULL)
+-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
+-				pm_runtime_force_resume)
++#ifdef CONFIG_PM_SLEEP
++	.suspend  = pm_runtime_force_suspend,
++	.resume   = pm_runtime_force_resume,
++	.freeze   = pm_runtime_force_suspend,
++	.thaw     = pm_runtime_force_resume,
++	.poweroff = pm_runtime_force_suspend,
++	.restore  = msm_dp_pm_restore,
++#endif
+ };
+ 
+ static struct platform_driver msm_dp_display_driver = {
+-- 
+2.51.0

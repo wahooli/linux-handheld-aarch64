@@ -1,0 +1,203 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] ASoC: qcom: q6apm: poll for SPF readiness instead of one long wait
+
+The sound card does not exist until five seconds after it could:
+
+    [ 7.025467] Adding APR/GPR dev: gprsvc:service:2:1
+    [12.261674] qcom-apm gprsvc:service:2:1: CMD timeout for [1001021] opcode
+    [12.296548] wsa_macro 6b00000.codec: ...              <- macro codecs bind
+    [12.329706] input: ... Headset Jack ... card0/input15  <- card exists
+
+apm_probe() sends APM_CMD_GET_SPF_STATE as soon as its GPR service device is
+created, which is tens of milliseconds after the remoteproc reports the ADSP
+up. The audio protection domain being announced is evidently not the same
+thing as SPF answering, so on a boot where SPF is even slightly late the
+command waits out its full five seconds. Everything downstream is behind that
+one probe: the macro codecs are populated from it, and the card is built from
+them. Here the macros bind 35 ms after the wait gives up and the card appears
+70 ms after that, so the whole five seconds is dead time.
+
+It is not a constant. When SPF happens to answer immediately the probe logs
+its state and the card is up seconds earlier, so this is a race with SPF
+startup rather than a fixed cost.
+
+Poll instead: short waits, retried until the answer arrives or a bounded
+budget runs out. That costs the same when SPF is already up and finishes as
+soon as it appears when it is not, instead of always paying the worst case.
+
+To do that without turning the log into a wall of timeouts,
+audioreach_send_cmd_sync() grows a variant taking the caller's timeout, and
+misses shorter than the standard one are logged at debug level -- a caller
+that asked for less is polling and expects to miss. The old entry point keeps
+its signature and its five seconds, so every other command is unchanged, as is
+q6apm_is_adsp_ready(), which q6prm uses to gate its own probe.
+
+---
+--- a/sound/soc/qcom/qdsp6/audioreach.h
++++ b/sound/soc/qcom/qdsp6/audioreach.h
+@@ -930,9 +930,17 @@
+ 
+ /* Module specific */
+ void audioreach_graph_free_buf(struct q6apm_graph *graph);
++/* How long a command waits for its reply unless the caller says otherwise. */
++#define AUDIOREACH_CMD_TIMEOUT		(5 * HZ)
++
+ int audioreach_send_cmd_sync(struct device *dev, gpr_device_t *gdev, struct gpr_ibasic_rsp_result_t *result,
+ 			     struct mutex *cmd_lock, gpr_port_t *port, wait_queue_head_t *cmd_wait,
+ 			     const struct gpr_pkt *pkt, uint32_t rsp_opcode);
++int audioreach_send_cmd_sync_timeout(struct device *dev, gpr_device_t *gdev,
++				     struct gpr_ibasic_rsp_result_t *result,
++				     struct mutex *cmd_lock, gpr_port_t *port,
++				     wait_queue_head_t *cmd_wait, const struct gpr_pkt *pkt,
++				     uint32_t rsp_opcode, unsigned long timeout);
+ int audioreach_graph_send_cmd_sync(struct q6apm_graph *graph, const struct gpr_pkt *pkt,
+ 				   uint32_t rsp_opcode);
+ int audioreach_set_media_format(struct q6apm_graph *graph,
+--- a/sound/soc/qcom/qdsp6/audioreach.c
++++ b/sound/soc/qcom/qdsp6/audioreach.c
+@@ -576,10 +576,11 @@
+ }
+ EXPORT_SYMBOL_GPL(audioreach_alloc_graph_pkt);
+ 
+-int audioreach_send_cmd_sync(struct device *dev, gpr_device_t *gdev,
+-			     struct gpr_ibasic_rsp_result_t *result, struct mutex *cmd_lock,
+-			     gpr_port_t *port, wait_queue_head_t *cmd_wait,
+-			     const struct gpr_pkt *pkt, uint32_t rsp_opcode)
++int audioreach_send_cmd_sync_timeout(struct device *dev, gpr_device_t *gdev,
++				     struct gpr_ibasic_rsp_result_t *result,
++				     struct mutex *cmd_lock, gpr_port_t *port,
++				     wait_queue_head_t *cmd_wait, const struct gpr_pkt *pkt,
++				     uint32_t rsp_opcode, unsigned long timeout)
+ {
+ 
+ 	const struct gpr_hdr *hdr = &pkt->hdr;
+@@ -601,12 +602,19 @@
+ 
+ 	if (rsp_opcode)
+ 		rc = wait_event_timeout(*cmd_wait, (result->opcode == hdr->opcode) ||
+-					(result->opcode == rsp_opcode),	5 * HZ);
++					(result->opcode == rsp_opcode), timeout);
+ 	else
+-		rc = wait_event_timeout(*cmd_wait, (result->opcode == hdr->opcode), 5 * HZ);
++		rc = wait_event_timeout(*cmd_wait, (result->opcode == hdr->opcode), timeout);
+ 
+ 	if (!rc) {
+-		dev_err(dev, "CMD timeout for [%x] opcode\n", hdr->opcode);
++		/*
++		 * A caller asking for less than the standard timeout is
++		 * polling and expects to miss; do not shout about those.
++		 */
++		if (timeout < AUDIOREACH_CMD_TIMEOUT)
++			dev_dbg(dev, "CMD timeout for [%x] opcode\n", hdr->opcode);
++		else
++			dev_err(dev, "CMD timeout for [%x] opcode\n", hdr->opcode);
+ 		rc = -ETIMEDOUT;
+ 	} else if (result->status > 0) {
+ 		dev_err(dev, "DSP returned error[%x] %x\n", hdr->opcode, result->status);
+@@ -620,6 +628,16 @@
+ 	mutex_unlock(cmd_lock);
+ 	return rc;
+ }
++EXPORT_SYMBOL_GPL(audioreach_send_cmd_sync_timeout);
++
++int audioreach_send_cmd_sync(struct device *dev, gpr_device_t *gdev,
++			     struct gpr_ibasic_rsp_result_t *result, struct mutex *cmd_lock,
++			     gpr_port_t *port, wait_queue_head_t *cmd_wait,
++			     const struct gpr_pkt *pkt, uint32_t rsp_opcode)
++{
++	return audioreach_send_cmd_sync_timeout(dev, gdev, result, cmd_lock, port, cmd_wait,
++						pkt, rsp_opcode, AUDIOREACH_CMD_TIMEOUT);
++}
+ EXPORT_SYMBOL_GPL(audioreach_send_cmd_sync);
+ 
+ int audioreach_graph_send_cmd_sync(struct q6apm_graph *graph, const struct gpr_pkt *pkt,
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -40,6 +40,15 @@
+ 					NULL, &apm->wait, pkt, rsp_opcode);
+ }
+ 
++static int q6apm_send_cmd_sync_timeout(struct q6apm *apm, const struct gpr_pkt *pkt,
++				       uint32_t rsp_opcode, unsigned long timeout)
++{
++	gpr_device_t *gdev = apm->gdev;
++
++	return audioreach_send_cmd_sync_timeout(&gdev->dev, gdev, &apm->result, &apm->lock,
++						NULL, &apm->wait, pkt, rsp_opcode, timeout);
++}
++
+ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, uint32_t graph_id)
+ {
+ 	struct audioreach_graph_info *info;
+@@ -142,7 +151,7 @@
+ }
+ 
+ 
+-static int q6apm_get_apm_state(struct q6apm *apm)
++static int q6apm_get_apm_state(struct q6apm *apm, unsigned long timeout)
+ {
+ 	int ret;
+ 
+@@ -151,17 +160,51 @@
+ 	if (IS_ERR(pkt))
+ 		return PTR_ERR(pkt);
+ 
+-	ret = q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
++	ret = q6apm_send_cmd_sync_timeout(apm, pkt, APM_CMD_RSP_GET_SPF_STATE, timeout);
+ 	if (ret)
+ 		return ret;
+ 
+ 	return apm->state;
+ }
+ 
++/*
++ * Wait for the DSP's audio service to come up, polling rather than parking on
++ * one long timeout.
++ *
++ * The GPR service devices are created when the audio protection domain is
++ * announced, but SPF inside the DSP is not necessarily answering yet -- this
++ * probe runs tens of milliseconds after the remoteproc reports the ADSP up.
++ * A single wait therefore costs the full timeout on every boot where SPF is
++ * even slightly late, and nothing downstream can proceed: the macro codecs
++ * bind out of this probe, the card is built from them, and it has been
++ * measured arriving 5 s later than it needed to.
++ *
++ * Short waits retried until the answer arrives cost the same when SPF is
++ * already up and finish as soon as it appears when it is not. The per-attempt
++ * misses are logged at debug level; only the overall failure is an error.
++ */
++#define APM_STATE_POLL_INTERVAL		msecs_to_jiffies(200)
++#define APM_STATE_POLL_TIMEOUT_MS	10000
++
++static int q6apm_wait_for_apm_state(struct q6apm *apm)
++{
++	unsigned long deadline = jiffies + msecs_to_jiffies(APM_STATE_POLL_TIMEOUT_MS);
++	int ret;
++
++	for (;;) {
++		ret = q6apm_get_apm_state(apm, APM_STATE_POLL_INTERVAL);
++		if (ret > 0 || (ret < 0 && ret != -ETIMEDOUT))
++			return ret;
++
++		if (time_after(jiffies, deadline))
++			return ret;
++	}
++}
++
+ bool q6apm_is_adsp_ready(void)
+ {
+ 	if (g_apm)
+-		return q6apm_get_apm_state(g_apm) > 0;
++		return q6apm_get_apm_state(g_apm, AUDIOREACH_CMD_TIMEOUT) > 0;
+ 
+ 	return false;
+ }
+@@ -900,7 +943,7 @@
+ 
+ 	g_apm = apm;
+ 
+-	ret = q6apm_get_apm_state(apm);
++	ret = q6apm_wait_for_apm_state(apm);
+ 	if (ret < 0)
+ 		dev_warn(dev, "APM state query failed: %d\n", ret);
+ 	else

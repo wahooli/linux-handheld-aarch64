@@ -1,0 +1,328 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] pinctrl: qcom: lpass-lpi: hand the clocks back before the provider goes
+
+Cycling the audio DSP leaves six messages behind, every time:
+
+    # echo stop  > /sys/class/remoteproc/remoteproc0/state
+    clk_unregister: unregistering prepared clock: LPASS_HW_DCODEC
+    clk_unregister: unregistering prepared clock: LPASS_HW_MACRO
+    WARNING: drivers/clk/clk.c:4482 at clk_core_disable+0x74/0x1a8
+    WARNING: drivers/clk/clk.c:4482 at clk_core_unprepare+0x84/0x230
+      clk_disable <- pm_clk_suspend <- pm_generic_runtime_suspend <- rpm_suspend
+    # echo start > /sys/class/remoteproc/remoteproc0/state
+    6e80000.pinctrl: __pm_clk_enable: failed to enable clk ..., error -6
+    6e80000.pinctrl: __pm_clk_enable: failed to enable clk ..., error -6
+
+All six are one defect. This pin controller takes its two clocks from a
+controller on the audio DSP's packet-router bus --
+
+    lpass_tlmm: pinctrl@6e80000 {
+        clocks = <&q6prmcc LPASS_HW_MACRO_VOTE  ...>,
+                 <&q6prmcc LPASS_HW_DCODEC_VOTE ...>;
+        clock-names = "core", "audio";
+    };
+
+-- and that provider is destroyed and recreated every time the DSP restarts.
+pm_clk holds its clk_get() references for the lifetime of the driver, so
+clk_unregister() runs with them still held and, rather than failing, hands
+every one of them clk_nodrv_ops. From then on .prepare and .enable return
+-ENXIO for good, which is the -6 above and means this device's vote on the
+LPASS block is dead for the rest of the boot; .disable and .unprepare are a
+WARN_ON_ONCE(), which the autosuspend following the teardown walks into twice.
+
+Nothing has broken so far only because pm_clk_resume() ignores enable failures
+-- it marks the entry PCE_STATUS_ERROR and returns 0 regardless -- and because
+the LPASS macro codecs hold the very same two votes on fresh handles. The
+pin controller's vote is redundant while any macro is bound. It stops being
+redundant the moment they all go away.
+
+Give the clocks back before they are unregistered. BUS_NOTIFY_UNBIND_DRIVER
+reaches us from __device_release_driver() before it calls device_remove(), so
+the provider's clocks are still live and registered, and pm_clk_destroy()
+releases them properly -- __pm_clk_remove() disables, unprepares and puts each
+entry according to its status. clk_unregister() then finds no consumer left,
+no handle is ever retired under us, and BUS_NOTIFY_BOUND_DRIVER on the
+replacement provider gets fresh ones.
+
+Both halves switch runtime PM off across the swap rather than taking a
+reference. Taking one would force a resume, and a resume at unbind time means
+clk_prepare_enable() on a DSP that has already gone down: it fails and
+__pm_clk_enable() reports it, trading these messages for a new one. Disabling
+instead turns a racing pm_runtime_resume_and_get() from a pin access into
+-EACCES for the few microseconds this takes, and waits for a callback already
+in flight, without driving the device through a transition itself.
+
+Deliberately NOT a device link to the provider, which is the obvious
+alternative and is what the macro codecs use (they are consumers of the same
+controller). It works, and it was tried: it also makes this device unbind, and
+unbinding a pin controller force-unbinds everything under its GPIO chip --
+including the reset.gpio.* auxiliary devices behind the speakers' reset-gpios,
+which never come back, because force-unbound devices do not reach the
+deferred-probe list. wsa884x takes that reset with
+devm_reset_control_get_optional_shared(), so it probes happily with no reset
+controller and never deasserts: all four WSA8845s stay in reset, every device
+still reads BOUND, nothing defers and nothing errors. Here no bind state
+changes at all.
+
+Platforms whose LPI pin controller takes its clocks from an always-on block
+resolve a provider that never unbinds, so the notifier never fires.
+
+Not hibernation-specific: a plain SSR reproduces it, and the hibernate path
+merely performs a stop/start.
+
+Revision 2. Revision 1 also called pm_clk_resume() from the bind half, to put
+the freshly acquired entries back to PCE_STATUS_ENABLED. That is wrong, and on
+hardware it is worse than the problem it was fixing.
+
+These clocks have no .enable/.disable, so clk_is_enabled_when_prepared() is
+true, pm_clk defers the clk_prepare() to the first pm_clk_resume() -- and
+clk_prepare() here is a synchronous GPR vote to a DSP that has only just
+reported up. It is not reliably ready to answer:
+
+    qcom-prm gprsvc:service:2:2: CMD timeout for [100100f] opcode
+    6e80000.pinctrl: __pm_clk_enable: failed to enable clk ..., error -110
+
+Those five seconds are spent inside the bus notifier, with this device's
+runtime PM disabled and pctrl->lock held, so every pin access stalls behind
+them. It fails va_macro's probe outright and delays the PDR ack far enough
+that the ADSP crashes on its own servreg_monitor.c:537 timeout and the whole
+cycle repeats. One stop/start in four took the fast path and looked clean,
+which is exactly how it got through review.
+
+So re-acquire only and never enable. pm_clk_suspend() acts solely on
+PCE_STATUS_ENABLED entries, so entries left acquired are balanced whatever
+state the device is in, and the vote is taken by the next ordinary runtime
+resume -- off the notifier, and on a path that already tolerates failure.
+
+---
+--- a/drivers/pinctrl/qcom/pinctrl-lpass-lpi.c
++++ b/drivers/pinctrl/qcom/pinctrl-lpass-lpi.c
+@@ -37,6 +37,10 @@
+ 	struct mutex lock;
+ 	DECLARE_BITMAP(ever_gpio, MAX_NR_GPIO);
+ 	const struct lpi_pinctrl_variant_data *data;
++	/* See lpi_pinctrl_clk_notify() */
++	struct notifier_block clk_nb;
++	struct device_node *clk_provider;
++	bool clks_held;
+ };
+ 
+ static void __iomem *lpi_gpio_reg(struct lpi_pinctrl *state,
+@@ -496,6 +500,193 @@
+ 	return ret;
+ }
+ 
++/*
++ * Hand our clocks back before the provider unregisters them.
++ *
++ * On the x1e80100 family these come from a clock controller that sits on the
++ * audio DSP's packet-router bus, so the provider is destroyed and recreated
++ * every time that DSP restarts -- an SSR does it, and so does the stop/start a
++ * hibernation cycle performs. pm_clk holds its clk_get() references for the
++ * lifetime of this driver, so clk_unregister() runs with them still held and,
++ * rather than failing, hands every one of them clk_nodrv_ops:
++ *
++ *   clk_unregister: unregistering prepared clock: LPASS_HW_MACRO
++ *
++ * From there .prepare and .enable return -ENXIO for good, so this device's
++ * vote on the LPASS block is dead for the rest of the boot --
++ *
++ *   6e80000.pinctrl: __pm_clk_enable: failed to enable clk ..., error -6
++ *
++ * -- and .disable/.unprepare are a WARN_ON_ONCE(), which the autosuspend
++ * following the teardown walks into twice:
++ *
++ *   WARNING: drivers/clk/clk.c:4482 at clk_core_disable+0x74/0x1a8
++ *   WARNING: drivers/clk/clk.c:4482 at clk_core_unprepare+0x84/0x230
++ *     clk_disable <- pm_clk_suspend <- pm_generic_runtime_suspend <- rpm_suspend
++ *
++ * Nothing has broken so far only because pm_clk_resume() ignores enable
++ * failures -- it marks the entry PCE_STATUS_ERROR and returns 0 regardless --
++ * and because the LPASS macro codecs hold the same votes on fresh handles.
++ * That stops being true the moment they all go away.
++ *
++ * BUS_NOTIFY_UNBIND_DRIVER reaches us from __device_release_driver() before it
++ * calls device_remove(), so the provider's clocks are still live and
++ * registered: pm_clk_destroy() releases them properly, __pm_clk_remove()
++ * disabling, unpreparing and putting each entry according to its status.
++ * clk_unregister() then finds no consumer left, no handle is ever retired
++ * under us, and BUS_NOTIFY_BOUND_DRIVER on the replacement gets us new ones.
++ *
++ * Deliberately NOT a device link to the provider, which is the obvious
++ * alternative and is what the LPASS macro codecs use. That works, but it makes
++ * this device unbind -- and unbinding a pin controller force-unbinds
++ * everything under its GPIO chip, including the reset.gpio.* auxiliary devices
++ * behind the speakers' reset-gpios. Force-unbound devices never reach the
++ * deferred-probe list, so those never come back, and wsa884x takes its reset
++ * with devm_reset_control_get_optional_shared() and so probes happily without
++ * one and never deasserts: silent, permanent loss of the speakers. Here no
++ * bind state changes at all.
++ *
++ * Both halves below shut runtime PM off across the swap rather than taking a
++ * reference. Taking one would force a resume, and a resume at unbind time
++ * means pm_clk_resume() -> clk_prepare_enable() on a DSP that has already gone
++ * down: it fails and __pm_clk_enable() reports it, trading these messages for
++ * a new one. Disabling instead turns a racing pm_runtime_resume_and_get() from
++ * a pin access into -EACCES for the few microseconds this takes, and waits for
++ * a callback already in flight, without driving the device through a
++ * transition itself.
++ */
++static void lpi_pinctrl_put_clks(struct lpi_pinctrl *pctrl)
++{
++	struct device *dev = pctrl->dev;
++
++	guard(mutex)(&pctrl->lock);
++
++	if (!pctrl->clks_held)
++		return;
++
++	pm_runtime_disable(dev);
++
++	/*
++	 * pm_clk_destroy() unwinds each entry by its status: an enabled one is
++	 * disabled, unprepared and put, an acquired one just put. The provider
++	 * has not been removed yet, so every one of those lands on a live
++	 * clock and clk_unregister() will find nothing held.
++	 */
++	pm_clk_destroy(dev);
++	pctrl->clks_held = false;
++
++	pm_runtime_enable(dev);
++}
++
++static void lpi_pinctrl_get_clks(struct lpi_pinctrl *pctrl)
++{
++	struct device *dev = pctrl->dev;
++	int ret;
++
++	guard(mutex)(&pctrl->lock);
++
++	if (pctrl->clks_held)
++		return;
++
++	pm_runtime_disable(dev);
++
++	ret = pm_clk_create(dev);
++	if (ret)
++		goto out;
++
++	ret = of_pm_clk_add_clks(dev);
++	if (ret < 0 && ret != -ENODEV) {
++		pm_clk_destroy(dev);
++		goto out;
++	}
++
++	pctrl->clks_held = true;
++	ret = 0;
++
++	/*
++	 * Re-acquire only, never enable. These clocks have no .enable/.disable,
++	 * so clk_is_enabled_when_prepared() is true and pm_clk defers the
++	 * prepare to the first pm_clk_resume() -- and clk_prepare() on them is a
++	 * synchronous GPR vote to a DSP that has only just come up and is not
++	 * reliably ready to answer. When it is not, that command eats the full
++	 * 5 s AUDIOREACH_CMD_TIMEOUT inside this notifier, with runtime PM
++	 * disabled and pctrl->lock held, stalling every pin access behind it:
++	 * long enough to fail va_macro's probe and to delay the PDR ack until
++	 * the ADSP itself crashes on servreg_monitor.c:537.
++	 *
++	 * Left PCE_STATUS_ACQUIRED the vote is taken by the next ordinary
++	 * runtime resume, off this path and already tolerant of failure, and
++	 * pm_clk_suspend() only ever acts on PCE_STATUS_ENABLED entries, so
++	 * this is balanced whatever state the device is in.
++	 */
++out:
++	if (ret)
++		dev_warn(dev, "no clock vote after the provider returned: %d\n", ret);
++
++	pm_runtime_enable(dev);
++}
++
++static int lpi_pinctrl_clk_notify(struct notifier_block *nb,
++				  unsigned long action, void *data)
++{
++	struct lpi_pinctrl *pctrl = container_of(nb, struct lpi_pinctrl, clk_nb);
++	struct device *dev = data;
++
++	/*
++	 * The provider device is destroyed and recreated rather than merely
++	 * unbound, so match on the device tree node, which outlives both.
++	 */
++	if (dev->of_node != pctrl->clk_provider)
++		return NOTIFY_DONE;
++
++	switch (action) {
++	case BUS_NOTIFY_UNBIND_DRIVER:
++		lpi_pinctrl_put_clks(pctrl);
++		break;
++	case BUS_NOTIFY_BOUND_DRIVER:
++		lpi_pinctrl_get_clks(pctrl);
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
++static void lpi_pinctrl_unwatch_clk_provider(void *data)
++{
++	struct lpi_pinctrl *pctrl = data;
++
++	bus_unregister_notifier(&platform_bus_type, &pctrl->clk_nb);
++	of_node_put(pctrl->clk_provider);
++}
++
++/*
++ * Watch whoever provides our first clock. A provider that never goes away
++ * simply never notifies, so this costs nothing on platforms where these clocks
++ * come from an always-on block.
++ */
++static int lpi_pinctrl_watch_clk_provider(struct lpi_pinctrl *pctrl)
++{
++	struct of_phandle_args args;
++	int ret;
++
++	if (of_parse_phandle_with_args(pctrl->dev->of_node, "clocks",
++				       "#clock-cells", 0, &args))
++		return 0;
++
++	pctrl->clk_provider = args.np;
++	pctrl->clk_nb.notifier_call = lpi_pinctrl_clk_notify;
++
++	ret = bus_register_notifier(&platform_bus_type, &pctrl->clk_nb);
++	if (ret) {
++		of_node_put(pctrl->clk_provider);
++		pctrl->clk_provider = NULL;
++		return ret;
++	}
++
++	return devm_add_action_or_reset(pctrl->dev,
++					lpi_pinctrl_unwatch_clk_provider, pctrl);
++}
++
+ int lpi_pinctrl_probe(struct platform_device *pdev)
+ {
+ 	const struct lpi_pinctrl_variant_data *data;
+@@ -539,6 +730,8 @@
+ 	if (ret < 0 && ret != -ENODEV)
+ 		return ret;
+ 
++	pctrl->clks_held = true;
++
+ 	pm_runtime_set_autosuspend_delay(dev, 100);
+ 	pm_runtime_use_autosuspend(dev);
+ 	ret = devm_pm_runtime_enable(dev);
+@@ -578,6 +771,14 @@
+ 		goto err_pinctrl;
+ 	}
+ 
++	/*
++	 * Last: the handlers take pctrl->lock and cycle runtime PM, so nothing
++	 * may be able to call them before the device is fully built.
++	 */
++	ret = lpi_pinctrl_watch_clk_provider(pctrl);
++	if (ret)
++		goto err_pinctrl;
++
+ 	return 0;
+ 
+ err_pinctrl:

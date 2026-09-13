@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Wed, 10 Sep 2026 21:00:00 +0300
+Subject: [PATCH 80/80] local: pinctrl: qcom: x1e80100: wire up
+ msm_pinctrl_dev_pm_ops
+
+The x1e80100 TLMM driver never set .pm, so none of the pinctrl PM callbacks
+run on this SoC -- not msm_pinctrl_suspend/resume, and not the .restore_noirq
+added by the companion patch. Found the direct way: that patch logs every
+interrupt it reprograms, and after a resume it printed nothing at all while
+input stayed dead.
+
+Only 5 of the 86 qcom pinctrl drivers wire this up (sc7180, sc7280, sdm845
+and friends); the rest, x1e80100 included, silently have no pinctrl PM at
+all. sc7280 is the pattern copied here.
+
+On its own this restores the pin mux across a sleep transition, which is what
+msm_pinctrl_resume() has always been for. Combined with the companion patch it
+also restores the per-interrupt configuration, which is what makes the
+keyboard, touchpad, embedded controller and lid switch work after a
+cross-boot hibernate resume.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+ drivers/pinctrl/qcom/pinctrl-x1e80100.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/drivers/pinctrl/qcom/pinctrl-x1e80100.c
++++ b/drivers/pinctrl/qcom/pinctrl-x1e80100.c
+@@ -1856,6 +1856,7 @@
+ static struct platform_driver x1e80100_pinctrl_driver = {
+ 	.driver = {
+ 		.name = "x1e80100-tlmm",
++		.pm = &msm_pinctrl_dev_pm_ops,
+ 		.of_match_table = x1e80100_pinctrl_of_match,
+ 	},
+ 	.probe = x1e80100_pinctrl_probe,

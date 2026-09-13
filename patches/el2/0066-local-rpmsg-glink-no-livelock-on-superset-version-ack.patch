@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Wed, 10 Sep 2026 18:00:00 +0300
+Subject: [PATCH 66/66] local: rpmsg: glink: don't livelock version negotiation
+ against a superset ack
+
+qcom_glink_receive_version_ack() resends VERSION whenever the acked feature
+mask differs from ours, after intersecting the two. If the remote acks with a
+SUPERSET of what we offered, the intersection changes nothing, the resent
+VERSION is byte-identical, and the remote's reply is identical too -- an
+unbounded VERSION/VERSION_ACK ping-pong with no possible exit.
+
+Observed on x1e80100 at EL2 when re-registering the ADSP glink edge after a
+cross-boot hibernate restore. We advertise GLINK_FEATURE_INTENT_REUSE (0x1),
+the ADSP acks 0x7 (INTENT_REUSE|MIGRATION|TRACER_PKT):
+
+  cmd_version     tx: lpass version: 1 features: 0x1
+  cmd_version_ack rx: lpass version: 1 features: 0x7
+  cmd_version     tx: lpass version: 1 features: 0x1
+  cmd_version_ack rx: lpass version: 1 features: 0x7
+
+3-4 us per iteration. After ~65 ms of this the remote died with
+"fatal error received: EX:kernel:0x1:ipcc_irq121" -- the doorbell storm took
+out the firmware.
+
+The exit condition (features == glink->features) assumes the remote echoes the
+negotiated intersection. Nothing enforces that, and it is not needed: once
+intersecting is a no-op our mask is already the final one, so there is nothing
+left to negotiate and resending cannot make progress. Break instead.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+ drivers/rpmsg/qcom_glink_native.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -671,6 +671,19 @@
+ 		if (features == glink->features)
+ 			break;
+ 
++		/*
++		 * Only resend if intersecting actually narrowed our mask.
++		 * A remote that acks with a superset of what we offered
++		 * (seen from the ADSP after a hibernate restore: we offer
++		 * 0x1, it acks 0x7) leaves glink->features unchanged, so
++		 * resending produces an identical ack and the handshake
++		 * livelocks -- microsecond-interval VERSION/VERSION_ACK
++		 * that storms the IPCC doorbell until the remote takes a
++		 * fatal exception. Our mask is already final here.
++		 */
++		if ((glink->features & features) == glink->features)
++			break;
++
+ 		glink->features &= features;
+ 		fallthrough;
+ 	default:

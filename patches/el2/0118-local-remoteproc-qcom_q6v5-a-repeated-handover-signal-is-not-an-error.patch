@@ -1,0 +1,57 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] remoteproc: qcom_q6v5: a repeated handover signal is not an error
+
+Every audio DSP stop opens with an error that describes normal SMP2P
+behaviour:
+
+    # echo stop > /sys/class/remoteproc/remoteproc0/state
+    qcom_q6v5_pas 6800000.remoteproc: Handover signaled, but it already happened
+
+fatal, ready, handover and stop-ack are four bits of one inbound SMP2P entry,
+and qcom_smp2p_notify_in() raises an interrupt for a bit whose value differs
+from entry->last_value. Once the SSR-ack feature has been negotiated,
+qcom_smp2p_check_ssr() zeroes last_value on *every* scan, not only on a
+restart, so each doorbell computes its edges against zero and re-delivers
+every bit the remote still has set.
+
+The doorbell in question is the remote acknowledging the stop request this
+driver just made. ready, handover and stop-ack are all still asserted at that
+point, so all three are delivered: stop-ack is the one being waited for, ready
+merely completes an already-complete completion, and handover lands in a
+handler that has nothing left to do, because the proxy regulators, clocks and
+power domains were dropped when it first fired.
+
+The guard is right -- calling ->handover() twice would be an unbalanced
+disable of all of those -- but the condition it guards against is routine
+here, not a misbehaving remote. Demote the message.
+
+Deliberately not fixed in SMP2P, where the unconditional reset arguably
+belongs inside the restart check: on this SoC the resulting re-delivery is
+what raises the ready edge after a restart at all. Making it conditional risks
+every start falling back to 0084's line-level path and paying a full 5 s
+timeout, for no gain beyond this one log line.
+
+Not hibernation-specific: a plain SSR reproduces it, and the hibernate path
+merely performs a stop/start.
+
+---
+--- a/drivers/remoteproc/qcom_q6v5.c
++++ b/drivers/remoteproc/qcom_q6v5.c
+@@ -229,7 +229,16 @@
+ 	struct qcom_q6v5 *q6v5 = data;
+ 
+ 	if (q6v5->handover_issued) {
+-		dev_err(q6v5->dev, "Handover signaled, but it already happened\n");
++		/*
++		 * Not an error, and routine on SMP2P: once the SSR-ack feature
++		 * is negotiated, qcom_smp2p_check_ssr() drops the cached copy
++		 * of every inbound entry on each scan, so the next doorbell --
++		 * the remote acknowledging a stop, for one -- computes its
++		 * edges against zero and re-delivers every bit the remote
++		 * still has set, handover included. The proxy resources were
++		 * released the first time round; there is nothing left to do.
++		 */
++		dev_dbg(q6v5->dev, "handover signaled again, already handled\n");
+ 		return IRQ_HANDLED;
+ 	}
+ 

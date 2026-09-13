@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Fri, 11 Sep 2026 10:30:00 +0300
+Subject: [PATCH 82/82] local: remoteproc: qcom_q6v5_pas: restart the DSP across
+ hibernation
+
+After a cross-boot hibernate resume on x1e80100 the ADSP glink edge is dead:
+"intent request timed out" every ~10 s, and battery, charging, thermal
+reporting, audio and UCSI all fail with -110.
+
+0081 is not the fix. Measured on a real cross-boot run (hibtest mode=reboot,
+342 platform_pm_restore / 0 platform_pm_thaw):
+
+  20:31:13  qcom-ipcc 408000.mailbox: re-armed 2 receive signal(s)
+  20:31:18  power_supply qcom-battmgr-bat: ... `status' property: -110
+  20:31:49  6800000.remoteproc:glink-edge: intent request timed out 3 times,
+            treating remote as gone
+
+The IPCC receive enable really is cleared by the reboot and 0081 really does
+restore it, but the doorbell was only half the problem. The reboot also resets
+the DSP, so it comes back with no glink channels open, while the restored image
+still describes the edge as it was at snapshot time -- ten open channels with
+their own rcids and outstanding intents. Every request after the resume is
+addressed to a channel the remote has never heard of. Keep 0081; it is
+necessary, it is just not sufficient.
+
+That desync cannot be repaired from this side, which is what the four recovery
+attempts in docs.local/ADSP-EL2.md were all really hitting: a fresh VERSION
+draws silence, a GLINK SSR do_cleanup is never answered, and stopping the
+remoteproc afterwards fails too, because the SMP2P handshake comes out of the
+image so the remote never acks it and qcom_scm_pas_shutdown() then returns
+-EINVAL ("failed to shutdown dtb: -22" / "can't stop rproc: -22").
+
+So do it from the other end, while the DSP is still healthy. Measured on a
+running EL1 machine, stop then start is clean and repeatable: the edge goes to
+zero channels and comes back with all ten, and battmgr and UCSI recover.
+
+  remoteproc0: stopped remote processor adsp     (no shutdown errors -- TZ
+  remoteproc0: powering up adsp                   still holds a valid record)
+  remoteproc0: remote processor adsp is now up
+
+rproc_shutdown() before the snapshot unregisters the glink edge and every rpmsg
+device on it, so the image has no stale channel state to be wrong about, and
+rproc_boot() afterwards renegotiates the edge against the DSP that is actually
+running. This works at EL1, where the DSPs are kernel-loaded via TZ/PAS
+(state=running). At EL2 they are attach-only and qcom_pas_ops_no_reset has no
+.start, so rproc->state is never RPROC_RUNNING there and the notifier is inert.
+
+A PM notifier rather than dev_pm_ops on purpose: PM_HIBERNATION_PREPARE runs
+before freeze_processes(), in plain process context, so unregistering the rpmsg
+devices is safe. From a .freeze callback it would mutate dpm_list while the PM
+core is walking it.
+
+Known limitation, pre-existing and not introduced here: after any ADSP restart
+Linux fails to ack the PDR indication for msm/adsp/audio_pd, so the DSP faults
+~10 s later ("servreg_monitor.c:537:Servreg ack timedout"), takes the CDSP with
+it, and both auto-recover. Audio does not come back ("can't create pcm
+MultiMedia2 Playback :-110"). pdr_indack_work() ignores pdr_send_indack_msg()'s
+return entirely, so the failure is silent. Battery, charging, thermal and UCSI
+do come back, and audio is dead after a resume today regardless.
+
+Set qcom_q6v5_pas.hibernate_restart=0 to disable.
+---
+ drivers/remoteproc/qcom_q6v5_pas.c | 112 +++++++++++++++++++++++++++++
+ 1 file changed, 112 insertions(+)
+
+--- a/drivers/remoteproc/qcom_q6v5_pas.c
++++ b/drivers/remoteproc/qcom_q6v5_pas.c
+@@ -26,6 +26,7 @@
+ #include <linux/soc/qcom/mdt_loader.h>
+ #include <linux/soc/qcom/smem.h>
+ #include <linux/soc/qcom/smem_state.h>
++#include <linux/suspend.h>
+ 
+ #include "qcom_common.h"
+ #include "qcom_pil_info.h"
+@@ -117,6 +118,9 @@
+ 
+ 	struct qcom_scm_pas_context *pas_ctx;
+ 	struct qcom_scm_pas_context *dtb_pas_ctx;
++
++	struct notifier_block pm_notifier;
++	bool hibernate_restart;
+ };
+ 
+ static void qcom_pas_segment_dump(struct rproc *rproc,
+@@ -773,6 +777,106 @@
+ 	}
+ }
+ 
++static bool qcom_pas_hibernate_restart = true;
++module_param_named(hibernate_restart, qcom_pas_hibernate_restart, bool, 0644);
++MODULE_PARM_DESC(hibernate_restart,
++		 "Stop the remote processor before the hibernation image is taken and boot it again on restore (default: y)");
++
++/*
++ * Hibernation: take the remote processor down before the image is written and
++ * boot it again afterwards.
++ *
++ * A cross-boot resume resets the DSP: the bootloader of the resuming kernel
++ * starts it from scratch, so it comes back with no GLINK channels open. The
++ * restored image, however, still describes the edge as it was at snapshot time
++ * -- ten open channels with their own rcids and outstanding intents. Every
++ * request after the resume is then addressed to a channel the remote has never
++ * heard of, which is why the edge looks dead in one direction while the DSP is
++ * demonstrably alive: "intent request timed out", and battery, charging,
++ * thermal reporting, audio and UCSI all fail with -110.
++ *
++ * The desync cannot be repaired after the fact. Re-arming the IPCC receive
++ * signals is necessary but not sufficient (it restores the doorbell, not the
++ * channel state), and nothing can be renegotiated from this side: a fresh
++ * VERSION draws silence and a GLINK SSR do_cleanup is never answered. Stopping
++ * the remoteproc afterwards does not work either -- the SMP2P handshake comes
++ * out of the image, so the remote never acks it, and qcom_scm_pas_shutdown()
++ * then returns -EINVAL.
++ *
++ * So do it from the other end. rproc_shutdown() while the DSP is still healthy
++ * unregisters the GLINK edge and every rpmsg device on it, so the image simply
++ * has no stale channel state to be wrong about, and the TrustZone shutdown
++ * succeeds because TZ still holds a valid record of the image we loaded. On the
++ * way back rproc_boot() authenticates the firmware again and the edge is
++ * negotiated from scratch against the DSP that is actually running.
++ */
++static int qcom_pas_pm_notify(struct notifier_block *nb, unsigned long action,
++			      void *data)
++{
++	struct qcom_pas *pas = container_of(nb, struct qcom_pas, pm_notifier);
++	struct rproc *rproc = pas->rproc;
++	int ret;
++
++	if (!qcom_pas_hibernate_restart)
++		return NOTIFY_DONE;
++
++	switch (action) {
++	case PM_HIBERNATION_PREPARE:
++	case PM_RESTORE_PREPARE:
++		/*
++		 * Runs before freeze_processes(), so this is plain process
++		 * context: unregistering the rpmsg devices here is safe, which
++		 * it would not be from a .freeze callback walking dpm_list.
++		 */
++		if (rproc->state != RPROC_RUNNING)
++			break;
++
++		ret = rproc_shutdown(rproc);
++		if (ret) {
++			dev_err(pas->dev, "hibernate: shutdown failed: %d\n", ret);
++			break;
++		}
++
++		pas->hibernate_restart = true;
++		dev_info(pas->dev, "hibernate: stopped before the image\n");
++		break;
++
++	case PM_POST_HIBERNATION:
++	case PM_POST_RESTORE:
++		if (!pas->hibernate_restart)
++			break;
++
++		pas->hibernate_restart = false;
++
++		/*
++		 * Reached both after an ordinary hibernate and, in the restored
++		 * kernel, after a cross-boot resume -- hibernate() delivers
++		 * PM_POST_HIBERNATION once hibernation_snapshot() returns,
++		 * which is where the restored image resumes.
++		 *
++		 * In the cross-boot case the DSP now running was started by the
++		 * resuming kernel's bootloader, and TrustZone holds a record
++		 * for that image rather than for ours, so authenticating on top
++		 * of it would fail. Drop it first. This is an SCM-only
++		 * shutdown on purpose: qcom_pas_stop()'s SMP2P handshake cannot
++		 * work here. Shutting down a stopped PAS is a no-op, so it is
++		 * harmless on the paths where we really did stop it ourselves.
++		 */
++		qcom_pas_shutdown(pas->pas_id, pas->lite_pas_id);
++		if (pas->dtb_pas_id)
++			qcom_pas_shutdown(pas->dtb_pas_id, pas->lite_dtb_pas_id);
++
++		ret = rproc_boot(rproc);
++		if (ret)
++			dev_err(pas->dev, "hibernate: boot after restore failed: %d\n", ret);
++		else
++			dev_info(pas->dev, "hibernate: booted after restore\n");
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
+ static int qcom_pas_probe(struct platform_device *pdev)
+ {
+ 	const struct qcom_pas_data *desc;
+@@ -934,8 +1038,15 @@
+ 	if (ret)
+ 		goto remove_ssr_sysmon;
+ 
++	pas->pm_notifier.notifier_call = qcom_pas_pm_notify;
++	ret = register_pm_notifier(&pas->pm_notifier);
++	if (ret)
++		goto del_rproc;
++
+ 	return 0;
+ 
++del_rproc:
++	rproc_del(rproc);
+ remove_ssr_sysmon:
+ 	qcom_remove_ssr_subdev(rproc, &pas->ssr_subdev);
+ 	qcom_remove_sysmon_subdev(pas->sysmon);
+@@ -963,6 +1074,7 @@
+ 	if (!pas->rproc)
+ 		return;
+ 
++	unregister_pm_notifier(&pas->pm_notifier);
+ 	rproc_del(pas->rproc);
+ 
+ 	qcom_q6v5_deinit(&pas->q6v5);
+-- 
+2.51.0

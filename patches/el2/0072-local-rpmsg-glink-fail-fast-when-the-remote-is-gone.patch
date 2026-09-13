@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Thu, 11 Sep 2026 12:00:00 +0300
+Subject: [PATCH 72/72] local: rpmsg: glink: stop paying 10s per request to a
+ remote that is gone
+
+Containment, not a repair: it does not bring the remote back.
+
+After a cross-boot hibernate restore on x1e80100 at EL2 the ADSP glink edge is
+permanently stale, and cannot be recovered from Linux -- rebuilding the edge
+(rproc detach/attach, or unregister/re-register of the glink subdev alone)
+makes the DSP assert in its own glink core and die. So every consumer behind
+that edge -- qcom-battmgr, the thermal zone it backs, audio, pmic_glink/UCSI --
+issues an intent request, waits the full 10 s in
+qcom_glink_request_intent(), fails, and immediately tries again.
+
+The result is not merely missing features; the machine becomes unusable.
+Measured on a resumed system: load average 3.38 with no runnable task, and
+upowerd, the thermal kworker and systemd-journald all parked in D state, while
+"intent request timed out" repeats every 10.24 s forever.
+
+Count consecutive timeouts per edge and, after three (30 seconds without a
+single answer), fail further requests immediately instead of waiting. Any
+successful request resets the count, and a re-registered edge starts from zero,
+so a remote that genuinely comes back is picked up again.
+
+This is deliberately conservative: it only engages once the remote has ignored
+three full 10 s windows, which on healthy hardware does not happen.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+ drivers/rpmsg/qcom_glink_native.c | 35 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 35 insertions(+), 1 deletions(-)
+
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -126,7 +126,29 @@
+ 	bool sent_read_notify;
+ 
+ 	bool abort_tx;
++
++	/*
++	 * Consecutive intent-request timeouts on this edge. See
++	 * qcom_glink_request_intent().
++	 */
++	atomic_t intent_req_timeouts;
+ };
++
++/*
++ * Each intent request that goes unanswered costs the caller a full 10 second
++ * wait. After a cross-boot hibernate restore the ADSP edge is permanently
++ * stale -- the remote cannot be recovered from Linux at all -- so every
++ * consumer (battery, thermal, audio, UCSI) blocks for 10 s, fails, and
++ * immediately tries again, leaving processes parked in D state indefinitely:
++ * upowerd, the thermal kworker and journald were all stuck this way, with a
++ * load average above 3 and no runnable task.
++ *
++ * Three consecutive timeouts is 30 seconds without a single answer; treat the
++ * remote as gone and fail subsequent requests immediately. Any successful
++ * request clears the count, and a re-registered edge starts from zero, so a
++ * remote that does come back is picked up again.
++ */
++#define GLINK_INTENT_REQ_MAX_TIMEOUTS	3
+ 
+ enum {
+ 	GLINK_STATE_CLOSED,
+@@ -1451,6 +1473,11 @@
+ 
+ 	mutex_lock(&channel->intent_req_lock);
+ 
++	if (atomic_read(&glink->intent_req_timeouts) >= GLINK_INTENT_REQ_MAX_TIMEOUTS) {
++		ret = -ETIMEDOUT;
++		goto unlock;
++	}
++
+ 	WRITE_ONCE(channel->intent_req_result, -1);
+ 	WRITE_ONCE(channel->intent_received, false);
+ 
+@@ -1473,11 +1500,18 @@
+ 				 glink->abort_tx,
+ 				 10 * HZ);
+ 	if (!ret) {
+-		dev_err(glink->dev, "intent request timed out\n");
++		if (atomic_inc_return(&glink->intent_req_timeouts) >=
++		    GLINK_INTENT_REQ_MAX_TIMEOUTS)
++			dev_err(glink->dev,
++				"intent request timed out %d times, treating remote as gone\n",
++				GLINK_INTENT_REQ_MAX_TIMEOUTS);
++		else
++			dev_err(glink->dev, "intent request timed out\n");
+ 		ret = -ETIMEDOUT;
+ 	} else if (glink->abort_tx) {
+ 		ret = -ECANCELED;
+ 	} else {
++		atomic_set(&glink->intent_req_timeouts, 0);
+ 		ret = READ_ONCE(channel->intent_req_result) ? 0 : -EAGAIN;
+ 	}
+ 

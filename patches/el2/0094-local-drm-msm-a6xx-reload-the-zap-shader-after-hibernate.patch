@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Fri, 12 Sep 2026 02:40:00 +0300
+Subject: [PATCH 94/94] local: drm/msm/a6xx: reload the zap shader after
+ hibernate
+
+VERIFIED ON HARDWARE 2026-09-12, on both power states. The desktop now survives
+a cross-boot hibernate resume and stays usable; this was the last fault in the
+resume path after 0090/0086 fixed the display and 0093 the RSC sequencer.
+
+    [ 38.668993] qcom_scm firmware:scm: PM: platform_pm_restore returned 0
+    [ 38.697375] adreno 3d00000.gpu: hibernate: zap shader will be reloaded
+    [ 45.193333] 3d6a000.gmu: RSC sequencer unprogrammed (STATUS0_DRV0=0)
+                 -- reprogramming after restore
+    [ 45.193360] 3d6a000.gmu: rpmh start:entry  STATUS0_DRV0=01000000
+
+and then nothing: zero "CP ucode error", zero "hw_init: timeout", zero "gpu
+fault", zero hangcheck, zero "cx gdsc didn't collapse" for the rest of the
+session. Note the ordering -- qcom_scm is restored at 38.669, before the flag is
+cleared at 38.697, so the reload has a working SCM to talk to.
+
+Positive evidence that the GPU really is rendering, not merely quiet: devfreq
+logged 1850 transitions reaching the top 1250 MHz OPP. (trans_stat is cumulative
+and carries over inside the image, but its ~135 s total far exceeds the 38.7 s
+that elapsed before the image was written, so most of that work is post-resume.)
+
+Tested on battery AND on external power, which exercise different paths -- see
+the note on adreno_pm_ops below.
+
+a6xx_zap_shader_init() tracks whether the zap shader has been handed to the
+secure world in a function-local
+
+	static bool loaded;
+
+which is plain kernel data and therefore comes back SET out of the hibernation
+image. The reboot that loads that image reset the secure world, so the shader
+is *not* loaded in hardware -- but the next hw_init() takes the early return,
+concludes the GPU has been brought out of secure mode, and emits
+CP_SET_SECURE_MODE to a GPU that is still secure. The in-tree comment at the
+call site predicts the outcome:
+
+	/*
+	 * Try to load a zap shader into the secure world. If successful
+	 * we can use the CP to switch out of secure mode. If not then we
+	 * have no resource but to try to switch ourselves out manually. If we
+	 * guessed wrong then access to the RBBM_SECVID_TRUST_CNTL register will
+	 * be blocked and a permissions violation will soon follow.
+	 */
+
+Measured on x1e80100 (Yoga Slim 7x), on battery so that the local
+runtime-PM-pinning udev rule could not mask it. The restored framebuffer stays
+on screen until the first submit, then:
+
+	[drm:a6xx_idle] *ERROR* 43050c01: hw_init: timeout waiting for GPU to
+	                idle: status 00800005 irq 00800200 rptr/wptr 12/12
+	adreno 3d00000.gpu: gpu fault ring 0 fence 339 status 00800005 rb 000c/000c
+	adreno 3d00000.gpu: CP ucode error interrupt
+
+and hangcheck then recovers in a loop. rptr == wptr == 12 says the CP consumed
+the packets and stopped; the fault lands on the packet after the secure-mode
+switch, which is what a refused RBBM_SECVID_TRUST_CNTL access looks like.
+
+Move the flag to file scope and add a6xx_zap_shader_forget() to clear it, then
+spell out adreno_pm_ops so that .restore -- and only .restore -- clears it
+before chaining to adreno_system_resume(). s2idle and runtime PM keep the
+flag: there the same kernel owned the hardware throughout, so it is honest,
+and re-loading the shader on every resume would be a needless round trip to
+the secure world.
+
+The prototype goes in adreno_gpu.h rather than a6xx_gpu.h so adreno_device.c
+does not have to pull in the a6xx-private header; both objects are built
+unconditionally into the msm module, so the cross-file call needs no guards.
+
+Both power states had to be tested because they take different restore paths on
+this machine, which pins the GPU runtime-active on external power via a local
+udev rule. power/control=on is pm_runtime_forbid(), which holds a usage_count,
+so pm_runtime_need_not_resume() (usage_count <= 1) is false and
+pm_runtime_force_suspend() sets needs_force_resume instead of marking the device
+suspended -- the GMU is then booted eagerly inside pm_runtime_force_resume()
+during the restore, and zero rpmh sleep/wake handshakes follow. On battery the
+device stays suspended across the restore and the GMU comes up lazily at the
+first submit, after which it cycles normally. Clearing the flag in .restore is
+correct for both: it happens before adreno_system_resume() either way, and
+hw_init() -- the only caller of a6xx_zap_shader_init() -- runs from
+msm_gpu_submit() regardless.
+
+Sixth instance in this machine's resume path of a single defect: one-shot
+software state that survives in the hibernation image and matches the
+requested value by construction, while the silicon was reset underneath it.
+See 0090 (clk rate cache), 0086 (OPP cache), 0093 (RSC sequencer), 0068
+(GMU_STATUS_PDC_SLEEP), 0069 (SMMU).
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -1120,17 +1120,58 @@
+ 	return 0;
+ }
+ 
++/*
++ * "Has the zap shader been loaded into the secure world?"
++ *
++ * File scope rather than a function-local static so a hibernate restore can
++ * clear it -- see a6xx_zap_shader_forget().
++ */
++static bool zap_shader_loaded;
++
++/*
++ * Forget that the zap shader was loaded, so the next hw_init loads it again.
++ *
++ * Called from the adreno .restore path. After a cross-boot hibernate resume
++ * this flag comes back SET, out of the hibernation image, while the reboot
++ * reset the secure world -- so the zap shader is not actually loaded in
++ * hardware. a6xx_zap_shader_init() then returns 0 without loading anything and
++ * hw_init believes the GPU has been taken out of secure mode:
++ *
++ *	ret = a6xx_zap_shader_init(gpu);
++ *	if (!ret) {
++ *		OUT_PKT7(gpu->rb[0], CP_SET_SECURE_MODE, 1);
++ *
++ * The comment above that call already predicts the result -- "if we guessed
++ * wrong then access to the RBBM_SECVID_TRUST_CNTL register will be blocked and
++ * a permissions violation will soon follow". Measured on x1e80100, on battery
++ * so the local runtime-PM pin could not mask it:
++ *
++ *	hw_init: timeout waiting for GPU to idle: status 00800005
++ *	         irq 00800200 rptr/wptr 12/12
++ *	gpu fault ring 0 fence 339 status 00800005
++ *	CP ucode error interrupt
++ *	hangcheck recover! ... and again, and again
++ *
++ * Sixth instance in this machine's resume path of one defect: one-shot software
++ * state that survives in the hibernation image while the silicon was reset
++ * underneath it. See 0090 (clk cache), 0086 (OPP cache), 0093 (RSC sequencer),
++ * 0068 (GMU_STATUS_PDC_SLEEP), 0069 (SMMU).
++ */
++void a6xx_zap_shader_forget(void)
++{
++	zap_shader_loaded = false;
++}
++
+ int a6xx_zap_shader_init(struct msm_gpu *gpu)
+ {
+-	static bool loaded;
+ 	int ret;
+ 
+-	if (loaded)
++	if (zap_shader_loaded)
+ 		return 0;
+ 
+ 	ret = adreno_zap_shader_load(gpu, GPU_PAS_ID);
+ 
+-	loaded = !ret;
++	zap_shader_loaded = !ret;
+ 	return ret;
+ }
+ 
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c
+@@ -400,8 +400,35 @@
+ 	return pm_runtime_force_resume(dev);
+ }
+ 
++/*
++ * Hibernate restore. The zap shader's "already loaded" flag is plain software
++ * state and comes back set out of the image, while the reboot reset the secure
++ * world -- so hw_init would skip loading it and then tell a still-secure GPU to
++ * leave secure mode, which ends in a CP ucode error. Forget it here so the next
++ * hw_init reloads it. See a6xx_zap_shader_forget().
++ *
++ * Deliberately .restore only: on s2idle and on runtime PM one kernel owns the
++ * hardware throughout and the flag is honest.
++ */
++static int adreno_system_restore(struct device *dev)
++{
++	a6xx_zap_shader_forget();
++	dev_info(dev, "hibernate: zap shader will be reloaded\n");
++
++	return adreno_system_resume(dev);
++}
++
++/*
++ * SYSTEM_SLEEP_PM_OPS() spelled out, so that .restore can differ from .resume;
++ * the other five keep exactly the behaviour they had.
++ */
+ static const struct dev_pm_ops adreno_pm_ops = {
+-	SYSTEM_SLEEP_PM_OPS(adreno_system_suspend, adreno_system_resume)
++	.suspend  = pm_sleep_ptr(adreno_system_suspend),
++	.resume   = pm_sleep_ptr(adreno_system_resume),
++	.freeze   = pm_sleep_ptr(adreno_system_suspend),
++	.thaw     = pm_sleep_ptr(adreno_system_resume),
++	.poweroff = pm_sleep_ptr(adreno_system_suspend),
++	.restore  = pm_sleep_ptr(adreno_system_restore),
+ 	RUNTIME_PM_OPS(adreno_runtime_suspend, adreno_runtime_resume, NULL)
+ };
+ 
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+@@ -669,6 +669,7 @@
+  * out of secure mode
+  */
+ int adreno_zap_shader_load(struct msm_gpu *gpu, u32 pasid);
++void a6xx_zap_shader_forget(void);
+ 
+ /* ringbuffer helpers (the parts that are adreno specific) */
+ 
+-- 
+2.51.0

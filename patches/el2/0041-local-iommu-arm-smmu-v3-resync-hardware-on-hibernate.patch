@@ -1,0 +1,137 @@
+From 6a2d9c4e8b13f7a05d2c1e9f4b8a3d6205c7e194 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Tue, 8 Sep 2026 21:30:00 +0300
+Subject: [PATCH 41/41] local: iommu: arm-smmu-v3: resync hardware on
+ hibernate restore
+
+The SMMUv3 driver has no hibernate support at all. After the image is
+restored, the software queue indices, stream table and io-pgtables belong
+to the restored kernel while the hardware still holds the boot kernel's
+programming -- or, in test_resume, state that advanced past the snapshot
+(the image write/read is tens of seconds of DMA traffic issuing CMDQ
+commands). The mismatched command-queue indices make the SMMU consume
+garbage: "CMDQ error (cons 0x0101a76c): Illegal command" storms, the CMDQ
+sticks in error state skipping every subsequent command, and any device
+mapped afterwards faults forever (observed: F_TRANSLATION storm on
+0004:01:00.0 and ath12k stuck in a reset loop after an otherwise
+successful restore). How much CMDQ traffic lands in the snapshot-restore
+window decides whether a given run survives, which is why resume seemed
+to work "randomly".
+
+Re-run arm_smmu_device_reset() from a .restore_noirq callback: it
+disables the SMMU, rewrites the stream table base and queue base/prod/cons
+registers from the restored kernel's state, re-enables, and invalidates
+cached configuration and TLBs. The noirq phase orders it before the PCIe
+root complex resume and any DMA master. The only probe-only piece is the
+Linux IRQ request, so give setup_irqs/device_reset a 'resume' flag that
+skips re-requesting while still reprogramming IRQ_CTRL. CMD_SYNC on this
+path completes by polling, so running without IRQs is fine.
+
+Only the el2 boot hits this: the plain dtb leaves pcie_smmu to the
+firmware hypervisor. Upstream has carried unmerged SMMUv3 suspend/resume
+patches with this same shape for years; this is the minimal
+hibernate-only cut.
+
+Refresh the probe hunk for cachyos-7.2.5-1, which disables the device
+and returns directly on reset failure instead of jumping to err_disable.
+Keep that cleanup unchanged.
+---
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c | 43 +++++++++++++++++++--
+ 1 file changed, 39 insertions(+), 4 deletions(-)
+
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+@@ -4664,7 +4664,7 @@
+ 	}
+ }
+ 
+-static int arm_smmu_setup_irqs(struct arm_smmu_device *smmu)
++static int arm_smmu_setup_irqs(struct arm_smmu_device *smmu, bool resume)
+ {
+ 	int ret, irq;
+ 	u32 irqen_flags = IRQ_CTRL_EVTQ_IRQEN | IRQ_CTRL_GERROR_IRQEN;
+@@ -4677,6 +4677,10 @@
+ 		return ret;
+ 	}
+ 
++	/* The Linux IRQs survive a resume; only re-request them on probe */
++	if (resume)
++		goto enable_irqs;
++
+ 	irq = smmu->combined_irq;
+ 	if (irq) {
+ 		/*
+@@ -4693,6 +4697,8 @@
+ 	} else
+ 		arm_smmu_setup_unique_irqs(smmu);
+ 
++enable_irqs:
++
+ 	if (smmu->features & ARM_SMMU_FEAT_PRI)
+ 		irqen_flags |= IRQ_CTRL_PRIQ_IRQEN;
+ 
+@@ -4740,7 +4746,7 @@
+ 	writel_relaxed(reg, smmu->base + ARM_SMMU_STRTAB_BASE_CFG);
+ }
+ 
+-static int arm_smmu_device_reset(struct arm_smmu_device *smmu)
++static int arm_smmu_device_reset(struct arm_smmu_device *smmu, bool resume)
+ {
+ 	int ret;
+ 	u32 reg, enables;
+@@ -4842,7 +4848,7 @@
+ 		}
+ 	}
+ 
+-	ret = arm_smmu_setup_irqs(smmu);
++	ret = arm_smmu_setup_irqs(smmu, resume);
+ 	if (ret) {
+ 		dev_err(smmu->dev, "failed to setup irqs\n");
+ 		return ret;
+@@ -4871,6 +4877,29 @@
+ 	return 0;
+ }
+ 
++/*
++ * Hibernation restore: the image just replaced all of memory, so the software
++ * queue indices, stream table and io-pgtables belong to the restored kernel
++ * while the SMMU hardware still holds the boot kernel's programming (or, for
++ * test_resume, state that advanced past the snapshot). Consuming the command
++ * queue from mismatched indices puts it in an unrecoverable "Illegal command"
++ * error state and every mapping made afterwards silently never reaches the
++ * hardware. Re-run the reset sequence to resynchronise the hardware with the
++ * restored kernel's state; runs in the noirq phase so it precedes the PCIe
++ * root complex and every DMA master behind it. The CMD_SYNC waits below poll,
++ * so no IRQs are needed.
++ */
++static int arm_smmu_pm_restore_noirq(struct device *dev)
++{
++	struct arm_smmu_device *smmu = dev_get_drvdata(dev);
++
++	return arm_smmu_device_reset(smmu, true);
++}
++
++static const struct dev_pm_ops arm_smmu_pm_ops = {
++	.restore_noirq = pm_sleep_ptr(arm_smmu_pm_restore_noirq),
++};
++
+ #define IIDR_IMPLEMENTER_ARM		0x43b
+ #define IIDR_PRODUCTID_ARM_MMU_600	0x483
+ #define IIDR_PRODUCTID_ARM_MMU_700	0x487
+@@ -5515,7 +5544,7 @@
+ 	arm_smmu_rmr_install_bypass_ste(smmu);
+ 
+ 	/* Reset the device */
+-	ret = arm_smmu_device_reset(smmu);
++	ret = arm_smmu_device_reset(smmu, false);
+ 	if (ret) {
+ 		arm_smmu_device_disable(smmu);
+ 		return ret;
+@@ -5545,6 +5574,7 @@
+ 		.name			= "arm-smmu-v3",
+ 		.of_match_table		= arm_smmu_of_match,
+ 		.suppress_bind_attrs	= true,
++		.pm			= pm_sleep_ptr(&arm_smmu_pm_ops),
+ 	},
+ 	.probe	= arm_smmu_device_probe,
+ 	.remove = arm_smmu_device_remove,

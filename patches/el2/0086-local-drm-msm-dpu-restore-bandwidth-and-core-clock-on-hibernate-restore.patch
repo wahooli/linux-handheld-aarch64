@@ -1,0 +1,317 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Fri, 11 Sep 2026 20:00:00 +0300
+Subject: [PATCH 86/86] local: drm/msm/dpu: restore the bandwidth vote and core
+ clock on hibernate restore
+
+VERIFIED ON HARDWARE 2026-09-12. Squash of the original 0086 (the .restore hook
+and the bandwidth re-vote) and 0091 (making the core-clock restore actually
+program something). They are kept together because 0091 was nothing but a repair
+to the one call 0086 introduced, and the pair read as "add a no-op, then fix it".
+
+THE GAP. SET_SYSTEM_SLEEP_PM_OPS() points .restore at pm_runtime_force_resume(),
+which returns immediately unless the device is runtime-suspended AND
+needs_force_resume is set. On a cross-boot restore neither holds -- both come out
+of the hibernation image -- so dpu_runtime_resume() never runs, and with it
+nothing that 0034 restores. Observed as
+
+	msm_dpu ae01000.display-controller: PM: platform_pm_restore
+	        returned 0 after 0 usecs
+
+Re-vote before chaining to pm_runtime_force_resume(), in the order
+dpu_core_perf_crtc_update() documents: bandwidth before clock.
+
+THE SECOND TRAP, and why a plain OPP set is not enough. dev_pm_opp_set_rate()
+computes
+
+	forced = opp_table->current_rate_single_clk != freq;
+
+and _set_opp() then does
+
+	/* Return early if nothing to do */
+	if (!forced && old_opp == opp && opp_table->enabled)
+		return 0;
+
+Both current_rate_single_clk and current_opp come back inside the hibernation
+image and already equal what we are about to ask for, so forced is false and
+NOTHING is programmed -- not the clock, not the required-opps genpd performance
+state. This is the same defect 0090 defeats for the pixel clock, one layer up:
+OPP cache rather than clk cache. Step through another OPP first so the cache
+disagrees; CLK_SET_RATE_PARENT on mdss_mdp_clk_src then propagates the real set
+down into the PLL.
+
+It matters because the hardware really is wrong. Read out of silicon at
+disp_cc + 0x0 (disp_cc_pll0, LUCID_OLE):
+
+	healthy   L_VAL=00440059 ALPHA=0000d800 -> (89 + 0.84375) * 19.2 = 1725.0 MHz
+	resumed   L_VAL=00440032 ALPHA=0000c800 -> (50 + 0.78125) * 19.2 =  975.0 MHz
+
+Every other PLL register is identical. disp_cc_mdss_mdp_clk_src is pll0/3
+(src_div=5), so the DPU core clock comes back at 325 MHz instead of 575 -- 56% of
+what the mode needs. That is the underrun: one strip of correct pixels at the top
+of the frame where the FIFO was prefilled during vblank, then
+INTF_UNDERFLOW_COLOR for the rest. On the internal OLED the same thing reads as a
+dead panel, which is why every register, the link training and the sink's DPCD
+all measured perfect.
+
+Verified on a real resume:
+
+	hibernate: core clock forced to 534159360 Hz (rc=0)
+
+and the panel presents a correct image instead of blue.
+
+RETRACTED PREMISES -- the original 0086 argued for itself with three pieces of
+evidence, all since disproved on hardware. Recorded so nobody re-walks them:
+
+  1. "bw_ctl=0 after resume vs 2441871360 healthy" was a `tail -6` ARTIFACT.
+     Every zero line was timestamped inside a ~10 ms window at the END of the
+     capture -- modetest being killed and CRTCs 110..114 tearing down at once.
+     Measured DURING operation with the bw_debug knob this patch adds, the
+     calculation is healthy: plane_mask=0x1 sum=2034892800, both mode sources
+     agreeing.
+
+  2. "half the VBIF QoS remapper at 0x550-0x5c0 comes back zeroed" was
+     COMPOSITOR RESIDUE. dpu_vbif_set_qos_remap() runs per ACTIVE PLANE, so a
+     capture with two planes differs from one with one in exactly those upper 16
+     bits. A three-way control (healthy with no compositor ever / healthy with
+     one / resumed) showed the no-compositor healthy boot matching the resumed
+     boot: 00000030, not 00300030.
+
+  3. "the dark panel is a permanent DPU underrun" was WRONG. The dark panel was
+     the eDP pixel clock RCG left at exactly 2x after a restore, driving a 90 Hz
+     panel at 120 Hz so it never presented anything. See 0090. With the rate
+     corrected the panel presents -- and only then does the real underrun above
+     become visible.
+
+The bw_debug module parameter in dpu_core_perf.c is what disproved premise 1 and
+is kept for that reason.
+
+Notes on what is and is not repeated: icc_set_bw() has no unchanged-value short
+circuit and qcom_icc_bcm_voter_add() re-adds on every aggregate, so the bw
+re-vote does apply. dpu_vbif_init_memtypes() and
+dpu_encoder_virt_runtime_resume() are safe to repeat.
+clk_bulk_prepare_enable() is deliberately NOT repeated -- the clocks are already
+on and refcounted.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+@@ -1497,10 +1497,157 @@
+ 	return rc;
+ }
+ 
++/*
++ * Hibernate restore: force the runtime-resume path.
++ *
++ * SET_SYSTEM_SLEEP_PM_OPS() points .restore at pm_runtime_force_resume(), which
++ * returns immediately unless the device is runtime-suspended AND
++ * needs_force_resume is set. On the cross-boot restore path neither holds --
++ * both come out of the hibernation image -- so dpu_runtime_resume() never runs,
++ * and with it neither the bandwidth vote nor the core clock that patch 0034
++ * restores. Observed as "msm_dpu ... pm_runtime_force_resume returned 0 after
++ * 0 usecs".
++ *
++ * Scanout restarts anyway, starved, and the mixers paint INTF_UNDERFLOW_COLOR
++ * for every frame. Measured after a cross-boot resume, with sddm stopped and a
++ * plain modetest driving eDP:
++ *
++ *   dpu_perf_crtc_update: crtc=110 bw_ctl=0          clk_rate=534159360
++ *   dpu_enc_underrun_cb:  id=42, val=129 ... 136     (continuous)
++ *
++ * against the same capture on a healthy boot:
++ *
++ *   dpu_perf_crtc_update: crtc=110 bw_ctl=2441871360 clk_rate=534159360
++ *   dpu_enc_underrun_cb:  no events
++ *
++ * On an external monitor driven in that state the result is visible directly:
++ * one strip of correct pixels at the top of the frame, where the FIFO was
++ * prefilled during vblank, and INTF_UNDERFLOW_COLOR for the rest. On the
++ * internal OLED the same thing reads as a dead panel, which is why every
++ * register, the link training and the sink's DPCD all measured perfect.
++ *
++ * Re-vote before chaining to pm_runtime_force_resume(), in the order
++ * dpu_core_perf_crtc_update() documents: bandwidth before clock.
++ */
++static int __maybe_unused dpu_pm_restore(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct msm_drm_private *priv = platform_get_drvdata(pdev);
++	struct drm_encoder *encoder;
++	struct dpu_kms *dpu_kms;
++	int i;
++
++	if (!priv || !priv->kms)
++		return pm_runtime_force_resume(dev);
++
++	dpu_kms = to_dpu_kms(priv->kms);
++
++	for (i = 0; i < dpu_kms->num_paths; i++)
++		icc_set_bw(dpu_kms->path[i], dpu_kms->avg_bw, dpu_kms->peak_bw);
++
++	if (dpu_kms->core_clk_rate) {
++		int rc;
++
++		/*
++		 * A plain dev_pm_opp_set_rate() here programs NOTHING after a
++		 * cross-boot hibernate. It computes
++		 *
++		 *	forced = opp_table->current_rate_single_clk != freq;
++		 *
++		 * and _set_opp() then does
++		 *
++		 *	// Return early if nothing to do
++		 *	if (!forced && old_opp == opp && opp_table->enabled)
++		 *		return 0;
++		 *
++		 * Both current_rate_single_clk and current_opp come back inside
++		 * the hibernation image and therefore already equal what we are
++		 * about to ask for, so neither the clock nor the required-opps
++		 * genpd performance state is touched. Same defect the pixel
++		 * clock has in 0090, one layer up: OPP cache rather than clk
++		 * cache.
++		 *
++		 * That matters because the hardware really is wrong. Read out
++		 * of silicon at disp_cc + 0x0 (disp_cc_pll0, LUCID_OLE):
++		 *
++		 *	healthy   L_VAL=00440059 ALPHA=0000d800
++		 *		  -> (89 + 0.84375) * 19.2 MHz = 1725.0 MHz
++		 *	resumed   L_VAL=00440032 ALPHA=0000c800
++		 *		  -> (50 + 0.78125) * 19.2 MHz =  975.0 MHz
++		 *
++		 * Every other PLL register is identical. disp_cc_mdss_mdp_clk_src
++		 * is pll0/3 (src_div=5), so the DPU core clock comes back at
++		 * 325 MHz instead of 575 -- 56% of what the mode needs. That is
++		 * the underrun: a strip of correct pixels at the top of the
++		 * frame where the FIFO was prefilled during vblank, then
++		 * INTF_UNDERFLOW_COLOR for the rest.
++		 *
++		 * The RCG's own divider is correct on both boots, which is why
++		 * dumping it proves nothing -- it is the PLL feeding it that
++		 * drifted. mdss_mdp_clk_src carries CLK_SET_RATE_PARENT, so
++		 * genuinely setting the rate here propagates back down into the
++		 * PLL and fixes L_VAL/ALPHA with it.
++		 *
++		 * Step through a different OPP first so the cache disagrees,
++		 * then set the real rate. The OPP layer rounds up to the
++		 * nearest entry, so half the target is always a valid, lower
++		 * OPP. The brief dip is harmless here: this runs before the
++		 * restored modeset, and the alternative is running the whole
++		 * session at 325 MHz.
++		 */
++		dev_pm_opp_set_rate(dev, dpu_kms->core_clk_rate / 2);
++
++		rc = dev_pm_opp_set_rate(dev, dpu_kms->core_clk_rate);
++		if (rc)
++			DPU_ERROR("restore: core clock %llu failed: %d\n",
++				  dpu_kms->core_clk_rate, rc);
++		else
++			dpu_kms->perf.core_clk_rate = dpu_kms->core_clk_rate;
++
++		dev_info(dev, "hibernate: core clock forced to %llu Hz (rc=%d)\n",
++			 dpu_kms->core_clk_rate, rc);
++	}
++
++	/*
++	 * The vote alone is not sufficient -- measured. With only the two
++	 * restores above, bw_debug showed the bandwidth calculation producing
++	 * the correct 2034892800 with plane_mask=0x1 on every commit, both mode
++	 * sources agreeing, and the encoder still underran.
++	 *
++	 * dpu_runtime_resume() does two more things, and a register diff across
++	 * the resume points at the first: half the VBIF QoS remapper fields at
++	 * vbif 0x550-0x5c0 come back zeroed (00300030 healthy, 00000030 after).
++	 * Nothing else reprograms them, so the DPU's bus transactions carry the
++	 * wrong memory type and the pipes starve no matter how much bandwidth
++	 * has been voted.
++	 *
++	 * Both calls are safe to repeat: set_mem_type() is a plain register
++	 * write loop, and dpu_encoder_virt_runtime_resume() takes enc_lock and
++	 * returns immediately unless the encoder is enabled.
++	 *
++	 * clk_bulk_prepare_enable() from dpu_runtime_resume() is deliberately
++	 * NOT repeated: the clocks are already on here -- scanout is running --
++	 * and they are refcounted, so calling it again would leak an enable.
++	 */
++	dpu_vbif_init_memtypes(dpu_kms);
++
++	if (dpu_kms->dev)
++		drm_for_each_encoder(encoder, dpu_kms->dev)
++			dpu_encoder_virt_runtime_resume(encoder);
++
++	dev_info(dev, "hibernate: re-voted bw avg=%u peak=%u over %d path(s), clk=%llu; vbif memtypes + encoders restored\n",
++		 dpu_kms->avg_bw, dpu_kms->peak_bw, dpu_kms->num_paths,
++		 dpu_kms->core_clk_rate);
++
++	return pm_runtime_force_resume(dev);
++}
++
+ static const struct dev_pm_ops dpu_pm_ops = {
+ 	SET_RUNTIME_PM_OPS(dpu_runtime_suspend, dpu_runtime_resume, NULL)
+ 	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
+ 				pm_runtime_force_resume)
++	/* after the macro, so this wins over the .restore it installs */
++	.restore = pm_sleep_ptr(dpu_pm_restore),
+ 	.prepare = msm_kms_pm_prepare,
+ 	.complete = msm_kms_pm_complete,
+ };
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
+@@ -11,6 +11,7 @@
+ #include <linux/sort.h>
+ #include <linux/clk.h>
+ #include <linux/bitmap.h>
++#include <linux/moduleparam.h>
+ 
+ #include "dpu_kms.h"
+ #include "dpu_trace.h"
+@@ -57,6 +58,11 @@
+  * @crtc: pointer to a crtc
+  * Return: returns aggregated BW for all planes in crtc.
+  */
++static bool dpu_perf_bw_debug;
++module_param_named(bw_debug, dpu_perf_bw_debug, bool, 0644);
++MODULE_PARM_DESC(bw_debug,
++		 "log the inputs to the DPU bandwidth calculation (debug)");
++
+ static u64 _dpu_core_perf_calc_bw(const struct dpu_perf_cfg *perf_cfg,
+ 		struct drm_crtc *crtc)
+ {
+@@ -71,6 +77,35 @@
+ 			continue;
+ 
+ 		crtc_plane_bw += pstate->plane_fetch_bw;
++
++		if (dpu_perf_bw_debug)
++			pr_info_ratelimited("dpu bw: crtc=%d plane=%d fetch_bw=%llu\n",
++					    crtc->base.id, plane->base.id,
++					    pstate->plane_fetch_bw);
++	}
++
++	/*
++	 * This sum has no mode-based fallback, so it is zero whenever no plane
++	 * contributes -- which is what a starved post-hibernate DPU reports
++	 * while the core clock, computed from state->adjusted_mode, still looks
++	 * correct. Log both mode sources: dpu_plane_sspp_atomic_update() feeds
++	 * _dpu_plane_calc_bw() from crtc->mode (legacy) while
++	 * _dpu_core_perf_calc_clk() uses state->adjusted_mode, so a stale
++	 * crtc->mode would zero the bandwidth and leave the clock right.
++	 */
++	if (dpu_perf_bw_debug) {
++		const struct drm_display_mode *lm = &crtc->mode;
++		const struct drm_display_mode *am =
++			crtc->state ? &crtc->state->adjusted_mode : NULL;
++
++		pr_info_ratelimited(
++			"dpu bw: crtc=%d plane_mask=0x%x sum=%llu | crtc->mode %dx%d vtot=%d vref=%d | adjusted %dx%d vtot=%d vref=%d\n",
++			crtc->base.id,
++			crtc->state ? crtc->state->plane_mask : 0,
++			crtc_plane_bw,
++			lm->hdisplay, lm->vdisplay, lm->vtotal, drm_mode_vrefresh(lm),
++			am ? am->hdisplay : -1, am ? am->vdisplay : -1,
++			am ? am->vtotal : -1, am ? drm_mode_vrefresh(am) : -1);
+ 	}
+ 
+ 	bw_factor = perf_cfg->bw_inefficiency_factor;
+-- 
+2.51.0

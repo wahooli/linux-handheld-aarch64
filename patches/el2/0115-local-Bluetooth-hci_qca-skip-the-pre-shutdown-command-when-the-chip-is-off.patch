@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Sat, 13 Sep 2026 18:00:00 +0300
+Subject: [PATCH 115/115] local: Bluetooth: hci_qca: skip the pre-shutdown
+ command when the chip is off
+
+qca_hci_shutdown() sends a vendor pre-shutdown command and then powers the
+controller down. On the hibernate restore path the chip is already down --
+qca_freeze() powered it off before the snapshot -- but the HCI core still runs
+hdev->shutdown from hci_dev_shutdown(), because HCI_UP is set. The command goes
+into an unpowered UART and burns the full HCI_INIT_TIMEOUT:
+
+  [62] Injecting HCI hardware error event
+  [64] command 0x0c01 tx timeout
+  [75] QCA preshutdown_cmd failed (-110)          <- ten seconds
+  [75] setting up wcn7850
+  [85] Reading QCA version information failed (-110)
+  [85] Retry BT power ON:0                        <- ten more
+  [87] QCA setup on UART is completed
+
+Twenty of the twenty-eight seconds between the restore callback and a working
+controller. The retry is the same fault twice over: the first read after a
+close that talked to a dead chip fails, and the retry path closes and reopens
+the port before it succeeds. Cold boot needs no retry.
+
+qca_power_on() clears QCA_BT_OFF, so an ordinary Bluetooth-off power-down is
+unaffected -- it reaches this with the bit clear and sends the command as
+before.
+
+0114 revision 2 made this change and was reverted; see the comment for why that
+revert is not thought to apply any more.
+
+Not upstream. Candidate: the guard is correct on its own terms regardless of
+hibernate -- there is never a reason to send a VSC to a powered-off chip.
+---
+ drivers/bluetooth/hci_qca.c | 25 ++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@ -2324,9 +2324,30 @@
+ 	timer_delete_sync(&qca->wake_retrans_timer);
+ 	timer_delete_sync(&qca->tx_idle_timer);
+ 
+-	/* Stop sending shutdown command if soc crashes. */
++	/*
++	 * Stop sending shutdown command if soc crashes, or if the chip is
++	 * already powered off. Nothing answers a VSC sent to an unpowered
++	 * chip, so it only burns HCI_INIT_TIMEOUT -- ten seconds, and on the
++	 * hibernate restore path the first qca_read_soc_version() after it
++	 * then times out too and has to retry, for ten more.
++	 *
++	 * qca_power_on() clears QCA_BT_OFF, so an ordinary power-down still
++	 * sends the command. The only caller that gets here with the bit set
++	 * is the close that follows qca_freeze() having powered the chip down
++	 * already, which is the case this skips.
++	 *
++	 * 0114 revision 2 made this same change and was reverted, because the
++	 * resume stopped working and the reason was not understood. Revision 2
++	 * still carried the hdev->flush use-after-free that revision 4 fixed --
++	 * the one that panicked in ttyport_write_flush() with no journal, which
++	 * is exactly what "resume stopped working" looked like from outside.
++	 * The ten second wait widened the close/open window that bug lived in,
++	 * so removing it made the panic reliable; it was never doing work of
++	 * its own.
++	 */
+ 	if (soc_type != QCA_ROME
+-		&& qca->memdump_state == QCA_MEMDUMP_IDLE) {
++		&& qca->memdump_state == QCA_MEMDUMP_IDLE
++		&& !test_bit(QCA_BT_OFF, &qca->flags)) {
+ 		qca_send_pre_shutdown_cmd(hdev);
+ 		usleep_range(8000, 10000);
+ 	}

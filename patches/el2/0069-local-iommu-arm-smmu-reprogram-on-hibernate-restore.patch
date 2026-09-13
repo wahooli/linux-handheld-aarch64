@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Thu, 11 Sep 2026 04:00:00 +0300
+Subject: [PATCH 69/69] local: iommu/arm-smmu: reprogram the SMMU on hibernate
+ restore
+
+The same defect patch 0041 fixed for SMMUv3, in the v2 driver, and the reason
+the GPU stays dead after a cross-boot hibernate restore on x1e80100 at EL2.
+
+arm_smmu_pm_ops uses SET_SYSTEM_SLEEP_PM_OPS(), so .restore is an alias of
+arm_smmu_pm_resume(), which begins:
+
+	ret = clk_bulk_prepare(smmu->num_clks, smmu->clks);
+	if (ret)
+		return ret;
+	if (pm_runtime_suspended(dev))
+		return 0;
+
+That early return is right for s2idle: one kernel owns the hardware throughout,
+and a runtime-suspended SMMU genuinely has nothing to restore. It is wrong for a
+hibernate restore, where "runtime-suspended" is a property of the restored IMAGE
+rather than of the silicon. The reboot reset the SMMU; the stream mappings,
+context banks and io-pgtables came back from the image; and because the GPU is
+idle when hibernation freezes devices its SMMU is runtime-suspended, so
+arm_smmu_device_reset() never runs and the hardware is never told any of it.
+
+Evidence. Holding the GPU runtime-active across the hibernate (sysfs
+power/control=on) stops adreno's .restore being a 5 us no-op and makes it run
+the real GMU bring-up inside dpm_resume, where it fails with -110.
+Instrumentation then eliminated the two obvious causes: pm_runtime_get_sync()
+on the GMU succeeds, and reading the RSC sequencer uCode straight back after
+writing it returns 0xeaaae5a0 as expected -- so the CX domain is powered and the
+RSCC is both writable and readable. The following bring-up takes the warm path,
+skips a6xx_rpmh_start() entirely, and fails with "GMU firmware initialization
+timed out": the GMU cannot fetch its firmware. That is a DMA failure, not a
+power or register-programming one.
+
+Add a .restore that forces arm_smmu_device_reset(), spelling out dev_pm_ops so
+.restore can differ from .resume. Clocks are left exactly as
+arm_smmu_pm_resume() leaves them -- prepared and enabled when the device is
+runtime-active, prepared only when it is not -- so runtime PM accounting is
+unchanged. Ordering relies on the iommu device links placing the SMMU ahead of
+its masters in the dpm list; 0041 needed .restore_noirq only because it sits
+ahead of a PCIe root complex.
+
+Signed-off-by: Waltteri Hooli <wahooli@localhost>
+---
+ drivers/iommu/arm/arm-smmu/arm-smmu.c | 50 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 50 insertions(+), 1 deletions(-)
+
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu.c
+@@ -2348,8 +2348,57 @@
+ 	return ret;
+ }
+ 
++/*
++ * Hibernation restore. The reboot reset the SMMU, but our stream mappings,
++ * context banks and io-pgtables all came back from the image, so the hardware
++ * knows nothing about them until arm_smmu_device_reset() reprograms it.
++ *
++ * arm_smmu_pm_resume() cannot be reused here: it returns early whenever the
++ * device is runtime-suspended, which it is whenever its masters are idle. That
++ * is correct for s2idle, where one kernel owns the hardware throughout and a
++ * runtime-suspended SMMU genuinely has nothing to restore. It is wrong for a
++ * restore, where "runtime-suspended" describes the image rather than the
++ * silicon: the reset is skipped, the hardware is never reprogrammed, and every
++ * master behind it faults or hangs. On x1e80100 that master is the GPU -- the
++ * GMU cannot fetch its firmware and a6xx_gmu_fw_start() times out.
++ *
++ * Force the reset, leaving the clocks exactly as arm_smmu_pm_resume() would so
++ * runtime PM accounting is unchanged.
++ */
++static int __maybe_unused arm_smmu_pm_restore(struct device *dev)
++{
++	struct arm_smmu_device *smmu = dev_get_drvdata(dev);
++	int ret;
++
++	ret = clk_bulk_prepare(smmu->num_clks, smmu->clks);
++	if (ret)
++		return ret;
++
++	ret = clk_bulk_enable(smmu->num_clks, smmu->clks);
++	if (ret) {
++		clk_bulk_unprepare(smmu->num_clks, smmu->clks);
++		return ret;
++	}
++
++	arm_smmu_device_reset(smmu);
++
++	if (pm_runtime_suspended(dev))
++		clk_bulk_disable(smmu->num_clks, smmu->clks);
++
++	return 0;
++}
++
++/*
++ * Spelled out rather than using SET_SYSTEM_SLEEP_PM_OPS() so .restore can
++ * differ from .resume; that macro aliases all six onto the suspend/resume pair.
++ */
+ static const struct dev_pm_ops arm_smmu_pm_ops = {
+-	SET_SYSTEM_SLEEP_PM_OPS(arm_smmu_pm_suspend, arm_smmu_pm_resume)
++	.suspend = pm_sleep_ptr(arm_smmu_pm_suspend),
++	.resume = pm_sleep_ptr(arm_smmu_pm_resume),
++	.freeze = pm_sleep_ptr(arm_smmu_pm_suspend),
++	.thaw = pm_sleep_ptr(arm_smmu_pm_resume),
++	.poweroff = pm_sleep_ptr(arm_smmu_pm_suspend),
++	.restore = pm_sleep_ptr(arm_smmu_pm_restore),
+ 	SET_RUNTIME_PM_OPS(arm_smmu_runtime_suspend,
+ 			   arm_smmu_runtime_resume, NULL)
+ };

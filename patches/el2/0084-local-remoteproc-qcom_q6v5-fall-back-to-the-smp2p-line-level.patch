@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Fri, 11 Sep 2026 16:00:00 +0300
+Subject: [PATCH 84/84] local: remoteproc: qcom_q6v5: fall back to the SMP2P
+ line level when waiting for start
+
+With 0082 and 0083 in place a cross-boot hibernate resume brings the CDSP back
+but not the ADSP, and the difference between the two is an accident of timing
+that points straight at the remaining bug:
+
+  qcom_smp2p smp2p-adsp: hibernate: resynced smem,
+      in 235b9885->235b9885 out 6982e7ab->6982e7ab, 2 inbound entries
+  qcom_smp2p smp2p-cdsp: hibernate: resynced smem,
+      in 9f2681d5->0000000000000000 out 3e48e268->3e48e268, 0 inbound entries
+
+  qcom_q6v5_pas 32300000.remoteproc: hibernate: booted after restore
+  qcom_q6v5_pas 6800000.remoteproc: hibernate: boot after restore failed: -110
+
+Note what the pointers say: nothing moved. The SMEM items are exactly where
+they were, so the "stale pointer" theory 0083 was written on is wrong as a
+description of the ADSP. What actually differs is entry->last_value.
+
+For the CDSP the remote had not published its item yet, so qcom_smem_get()
+failed, smp2p->in stayed NULL and last_value stayed 0. The first doorbell then
+went through the normal qcom_smp2p_intr() acquire path and computed
+status = val ^ 0 = val, which is a change, so the ready sub-interrupt fired.
+
+For the ADSP the item was already there -- the bootloader started that DSP --
+so qcom_smp2p_start_in() latched last_value = readl(entry->value), capturing
+the *previous* incarnation's asserted ready bit. When the instance we then
+authenticated asserted ready again, status was 0, no edge was raised, and
+qcom_q6v5_wait_for_start() timed out on a remote that was already running.
+
+Latching the current value is the right thing for smp2p to do -- zeroing it
+instead would re-deliver every set bit as a rising edge, including fatal and
+stop -- so fix it where the assumption actually lives. On timeout, consult the
+line level before declaring failure: smp2p_irq_get_irqchip_state() reads the
+bit straight out of the shared item with readl(), so it is immune to whatever
+last_value happens to hold. This is the same source qcom_q6v5_read_smp2p_state()
+already uses to detect a remote that was running at probe.
+
+The fatal and stop bits are required to be clear as well. Without that, a ready
+bit left behind in SMEM by a remote that did *not* come back would read as a
+successful start; with it, only a remote that is genuinely up and not in error
+passes.
+
+Costs one full timeout on the affected path, which is the price of the edge
+having been missed. Nothing changes on a normal boot, where the edge arrives
+and wait_for_completion_timeout() returns early.
+---
+ drivers/remoteproc/qcom_q6v5.c | 35 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 34 insertions(+), 1 deletion(-)
+
+--- a/drivers/remoteproc/qcom_q6v5.c
++++ b/drivers/remoteproc/qcom_q6v5.c
+@@ -183,10 +183,44 @@
+  */
+ int qcom_q6v5_wait_for_start(struct qcom_q6v5 *q6v5, int timeout)
+ {
++	bool ready = false;
++	bool fatal = false;
++	bool stop = false;
+ 	int ret;
+ 
+ 	ret = wait_for_completion_timeout(&q6v5->start_done, timeout);
+-	return !ret ? -ETIMEDOUT : 0;
++	if (ret)
++		return 0;
++
++	/*
++	 * The start signal is an edge on an SMP2P bit, and SMP2P only raises
++	 * one when the bit differs from the value it cached the last time it
++	 * looked. After a cross-boot hibernate resume that cache describes the
++	 * *previous* incarnation of the remote: if that one had already
++	 * asserted ready -- and it had, the resuming kernel's bootloader
++	 * started it -- then the instance we just authenticated asserting it
++	 * again is not a change, no interrupt is delivered, and this wait
++	 * times out even though the remote is up.
++	 *
++	 * The line level does not have that problem; SMP2P reads it straight
++	 * out of the shared item. So before giving up, ask for it -- the same
++	 * source qcom_q6v5_read_smp2p_state() uses to spot a remote that was
++	 * already running at probe. Require the error bits to be clear as
++	 * well, so a stale ready left behind by a remote that did not come
++	 * back cannot be mistaken for a successful start.
++	 */
++	if (irq_get_irqchip_state(q6v5->ready_irq, IRQCHIP_STATE_LINE_LEVEL, &ready))
++		return -ETIMEDOUT;
++
++	irq_get_irqchip_state(q6v5->fatal_irq, IRQCHIP_STATE_LINE_LEVEL, &fatal);
++	irq_get_irqchip_state(q6v5->stop_irq, IRQCHIP_STATE_LINE_LEVEL, &stop);
++
++	if (!ready || fatal || stop)
++		return -ETIMEDOUT;
++
++	dev_info(q6v5->dev, "start signalled without an edge, took the line level\n");
++
++	return 0;
+ }
+ EXPORT_SYMBOL_GPL(qcom_q6v5_wait_for_start);
+ 
+-- 
+2.51.0

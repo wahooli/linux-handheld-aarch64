@@ -1,0 +1,168 @@
+From 6b2d94f7a0c85e13d47fa26b9c0e83517d2af4b9 Mon Sep 17 00:00:00 2001
+From: Waltteri Hooli <wahooli@localhost>
+Date: Tue, 9 Sep 2026 17:30:00 +0300
+Subject: [PATCH 57/57] local: PCI: dwc/qcom: force the RC teardown at hibernate
+ freeze (default off)
+
+Fix candidate, not instrumentation. Default off; opt in on the kernel command
+line for one run.
+
+Why op-level chasing is finished. The crumb trail through the cross-boot
+restore of pcie4 now reads:
+
+	0x40-0x47  dw_pcie_setup_rc(), every DBI read and write
+	0x48-0x4a  both dw_pcie_remove_capability() calls, including the
+		   capability-list walks and the next-pointer byte writes
+	0x4b       dw_pcie_setup_rc() about to return 0
+	0x3b       never lands
+
+Between 0x4b and 0x3b there is no hardware access at all -- setup_rc returns
+and its caller writes the next crumb. So either the machine was killed
+asynchronously at that instant, or the SPMI crumb channel died and execution
+carried on (which an earlier callback-completed instrument said it did, with
+the hang then in start_link/wait_for_link). Either way, the entire heavy
+re-init completes and the machine still dies, and the blamed operation has
+moved every time the surrounding code changed: 0x3a, then the capability
+removal, then here. That is not a lethal register write. It is the state.
+
+Where the state goes wrong. The kernel that reads the image back quiesces its
+own devices before jumping. pcie4's endpoint is the WCN7850, and the initramfs
+has no ath12k, so it is driverless: dw_pcie_suspend_noirq() takes the
+pci_host_common_d3cold_possible() early return, skips dw_pcie_stop_link() and
+ops->deinit(), and leaves the controller, PHY and link RUNNING -- and does not
+set pci->suspended. The restored image meanwhile carries suspended = true,
+because its own freeze happened with ath12k bound and did tear the RC down. So
+the restored kernel runs the full re-init against warm hardware.
+
+Both configurations that have ever survived a cross-boot resume are the two
+CONSISTENT ones: test_resume, where the same kernel tore the RC down and
+re-inits cold hardware, and the ath12k-unloaded case, where nothing tore it
+down and restore leaves the inherited controller alone. pcie6a (NVMe) never
+wedges, and the initramfs does have nvme, so that RC is torn down cold at
+quiesce every single time.
+
+So make the freeze consistent: tear the RC down even for a driverless
+endpoint, and let the restored kernel re-init from cold -- the state the
+proven test_resume path re-inits from.
+
+	pcie_qcom.hib_force_teardown=1
+
+Command line, not sysfs: sysfs only reaches the kernel that WRITES the image,
+where this changes nothing, because ath12k is bound there and D3cold is
+already possible. The kernel that READS the image is the initramfs one.
+
+An earlier, larger version of this idea (shelved 0054, which also carried a
+second mutually exclusive candidate and defaulted ON) did move the failure:
+restore walked pcie4's whole subtree and beyond before stopping elsewhere.
+This is that idea alone, defaulting off.
+
+Expected reading if it works: the device crumb stops naming 1c08000.pci.
+---
+ drivers/pci/controller/dwc/pcie-designware.h | 1 +
+ drivers/pci/controller/dwc/pcie-designware-host.c | 9 ++++++++-
+ drivers/pci/controller/dwc/pcie-qcom.c | 46 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 55 insertions(+), 1 deletions(-)
+
+--- a/drivers/pci/controller/dwc/pcie-designware.h
++++ b/drivers/pci/controller/dwc/pcie-designware.h
+@@ -468,12 +468,13 @@
+ 	struct pci_eq_presets	presets;
+ 	struct pci_config_window *cfg;
+ 	bool			ecam_enabled;
+ 	bool			native_ecam;
+ 	bool                    skip_l23_ready;
+ 	bool			skip_pwrctrl_off;
++	bool			hib_force_teardown;
+ };
+ 
+ struct dw_pcie_ep_ops {
+ 	void	(*pre_init)(struct dw_pcie_ep *ep);
+ 	void	(*init)(struct dw_pcie_ep *ep);
+ 	int	(*raise_irq)(struct dw_pcie_ep *ep, u8 func_no,
+--- a/drivers/pci/controller/dwc/pcie-designware-host.c
++++ b/drivers/pci/controller/dwc/pcie-designware-host.c
+@@ -1243,13 +1243,20 @@
+ 	int ret = 0;
+ 	u32 val;
+ 
+ 	if (!dw_pcie_link_up(pci))
+ 		goto stop_link;
+ 
+-	if (!pci_host_common_d3cold_possible(pci->pp.bridge, &pme_capable))
++	/*
++	 * hib_force_teardown: tear the RC down even when the endpoint cannot do
++	 * D3cold. Only the hibernate freeze/quiesce sets it. Leaving a
++	 * driverless RC running here is what hands a warm controller across the
++	 * resume jump, and re-initialising that warm state is what fails.
++	 */
++	if (!pci_host_common_d3cold_possible(pci->pp.bridge, &pme_capable) &&
++	    !pci->pp.hib_force_teardown)
+ 		return 0;
+ 
+ 	if (pci->pp.ops->pme_turn_off) {
+ 		pci->pp.ops->pme_turn_off(&pci->pp);
+ 	} else {
+ 		ret = dw_pcie_pme_turn_off(pci);
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -2336,14 +2336,60 @@
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x0106, qcom_fixup_class);
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x0107, qcom_fixup_class);
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x0302, qcom_fixup_class);
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x1000, qcom_fixup_class);
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x1001, qcom_fixup_class);
+ 
++/*
++ * Cross-boot hibernate: the kernel that reads the image back quiesces its own
++ * devices before jumping. For a root complex whose endpoint has no driver
++ * bound -- the initramfs has no ath12k, so pcie4's WCN7850 is driverless --
++ * dw_pcie_suspend_noirq() takes the pci_host_common_d3cold_possible() early
++ * return and leaves the controller, PHY and link RUNNING. The restored image,
++ * whose own freeze did tear the RC down, then re-initialises warm hardware.
++ *
++ * That re-init now runs to completion (SDAM crumb 0x4b: dw_pcie_setup_rc()
++ * returns, every DBI read and write in it having succeeded) and the machine
++ * dies anyway, in a window whose only content is a function return. No single
++ * register operation is lethal; the inherited state is.
++ *
++ * hib_force_teardown makes the hibernate freeze/quiesce tear the RC down
++ * regardless, so the restored kernel re-inits genuinely cold hardware -- the
++ * state the working test_resume path re-inits from. Default off. It has to be
++ * in effect in the kernel that READS the image, and that kernel is only
++ * reachable from the command line:
++ *
++ *	pcie_qcom.hib_force_teardown=1
++ *
++ * Setting it via sysfs only reaches the kernel that WRITES the image, where it
++ * changes nothing (ath12k is bound there, so D3cold is already possible).
++ */
++static bool hib_force_teardown;
++module_param(hib_force_teardown, bool, 0644);
++MODULE_PARM_DESC(hib_force_teardown,
++		 "hibernate: tear the RC down at freeze even for a driverless endpoint (default 0)");
++
++static int qcom_pcie_freeze_noirq(struct device *dev)
++{
++	struct qcom_pcie *pcie = dev_get_drvdata(dev);
++	int ret;
++
++	if (!pcie)
++		return 0;
++
++	pcie->pci->pp.hib_force_teardown = hib_force_teardown;
++	ret = qcom_pcie_suspend_noirq(dev);
++	pcie->pci->pp.hib_force_teardown = false;
++
++	return ret;
++}
++
+ static const struct dev_pm_ops qcom_pcie_pm_ops = {
+ 	NOIRQ_SYSTEM_SLEEP_PM_OPS(qcom_pcie_suspend_noirq, qcom_pcie_resume_noirq)
++	.freeze_noirq = pm_sleep_ptr(qcom_pcie_freeze_noirq),
++	.poweroff_noirq = pm_sleep_ptr(qcom_pcie_freeze_noirq),
+ };
+ 
+ static struct platform_driver qcom_pcie_driver = {
+ 	.probe = qcom_pcie_probe,
+ 	.driver = {
+ 		.name = "qcom-pcie",

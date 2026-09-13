@@ -1,0 +1,87 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] soundwire: qcom: drop the irq mapping on unbind
+
+Re-probing this driver always fails:
+
+    irq: type mismatch, failed to map hwirq-203 for interrupt-controller@17000000!
+    qcom-soundwire 6ab0000.soundwire: error -EINVAL: request_irq(0) 0x0 qcom_swrm_irq_handler
+    qcom-soundwire 6ab0000.soundwire: Failed to request soundwire irq
+    qcom-soundwire 6ab0000.soundwire: probe with driver qcom-soundwire failed with error -22
+
+of_irq_get() creates the virq mapping from the device tree, which says
+IRQ_TYPE_LEVEL_HIGH, and the driver then requests the handler with
+IRQF_TRIGGER_RISING, overriding it. That is harmless exactly once.
+
+The mapping outlives an unbind. On the next probe of_irq_get() asks the domain
+for a level-high mapping, irq_create_fwspec_mapping() finds the surviving
+edge-rising one, and refuses it -- returning virq 0 rather than an error. The
+driver only rejects negative values, so 0 goes straight into
+devm_request_threaded_irq() and comes back as a confusing -EINVAL.
+
+Dispose of the mapping when the driver lets go, so the next probe builds a
+fresh one from the device tree and is free to override the type again. The
+action is registered before the handler is requested, so devres unwinds them
+in the right order: free_irq() first, then the dispose.
+
+Also reject virq 0 where it is obtained, so a future mapping failure is
+reported as itself instead of as a request_irq() error.
+
+Nothing unbinds this driver on a Qualcomm SoC today, which is why this has
+never been hit. It becomes reachable as soon as the audio DSP restarting
+takes the SoundWire masters down with the clock provider they depend on.
+
+---
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -1530,6 +1530,31 @@
+ DEFINE_SHOW_ATTRIBUTE(swrm_reg);
+ #endif
+ 
++/*
++ * of_irq_get() creates the virq mapping, and this driver then overrides the
++ * trigger type the device tree asked for -- the nodes say IRQ_TYPE_LEVEL_HIGH
++ * while the handler below is requested IRQF_TRIGGER_RISING. That is harmless
++ * exactly once. The mapping outlives an unbind, so on the next probe
++ * of_irq_get() asks the domain for a level-high mapping, finds the surviving
++ * edge-rising one, and irq_create_fwspec_mapping() rejects it:
++ *
++ *   irq: type mismatch, failed to map hwirq-203 for interrupt-controller@...
++ *
++ * It reports that as virq 0, not as an error, so the driver would go on to
++ * request_irq(0) and fail with a misleading -EINVAL.
++ *
++ * Drop the mapping when the driver lets go, so the next probe builds a fresh
++ * one from the device tree and is free to override the type again. Registered
++ * before the handler is requested, so devres releases them in the right order:
++ * free_irq() first, then this.
++ */
++static void qcom_swrm_dispose_irq(void *data)
++{
++	struct qcom_swrm_ctrl *ctrl = data;
++
++	irq_dispose_mapping(ctrl->irq);
++}
++
+ static int qcom_swrm_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -1577,11 +1602,17 @@
+ 	}
+ 
+ 	ctrl->irq = of_irq_get(dev->of_node, 0);
+-	if (ctrl->irq < 0) {
+-		ret = ctrl->irq;
++	if (ctrl->irq <= 0) {
++		/* 0 means the mapping failed; it is not a usable interrupt. */
++		ret = ctrl->irq ? ctrl->irq : -EINVAL;
++		dev_err_probe(dev, ret, "failed to map the soundwire irq\n");
+ 		goto err_init;
+ 	}
+ 
++	ret = devm_add_action_or_reset(dev, qcom_swrm_dispose_irq, ctrl);
++	if (ret)
++		goto err_init;
++
+ 	ctrl->hclk = devm_clk_get(dev, "iface");
+ 	if (IS_ERR(ctrl->hclk)) {
+ 		ret = dev_err_probe(dev, PTR_ERR(ctrl->hclk), "unable to get iface clock\n");

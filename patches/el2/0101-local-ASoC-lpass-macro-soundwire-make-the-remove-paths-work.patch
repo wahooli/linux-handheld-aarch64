@@ -1,0 +1,184 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] ASoC: lpass-macro, soundwire: qcom: make the remove paths work
+
+Nothing unbinds these drivers on a Qualcomm SoC, so their remove paths have
+never run. Once the LPASS macro codecs are linked to the audio DSP that
+provides their clocks, a DSP restart unbinds and rebinds the whole stack, and
+three latent bugs surface at once.
+
+**The clock registration leaks.** wsa_macro registers its mclk output with
+clk_hw_register() where va, rx and tx all use devm_clk_hw_register(), so it is
+never unregistered. The next probe then trips over the name it left behind:
+
+    wsa_macro 6aa0000.codec: error -EEXIST: failed to register clk 'wsa2-mclk'
+    wsa_macro 6aa0000.codec: probe with driver wsa_macro failed with error -17
+
+Both wsa_macro instances stay unbound and the sound card never appears.
+
+**Runtime PM is left enabled.** No remove calls pm_runtime_disable(), so the
+next probe complains and the device starts from a stale state:
+
+    va_macro 6d44000.codec: Unbalanced pm_runtime_enable!
+
+**Every runtime-managed clock is disabled twice.** __device_release_driver()
+runtime-suspends a device before calling .remove():
+
+    pm_runtime_put_sync(dev);        /* runtime suspend drops the clocks */
+    device_remove(dev);              /* .remove() drops them again */
+
+so remove double-disables everything its runtime_suspend already released,
+giving a WARN per clock per unbind:
+
+    LPASS_CLK_ID_WSA2_CORE_TX_MCLK already disabled
+    LPASS_CLK_ID_WSA2_CORE_TX_MCLK already unprepared
+
+and the same in qcom_swrm_remove() for hclk, which is where it is loudest
+because panic_on_warn turns it into a panic. Nothing is corrupted --
+clk_core_disable() returns before decrementing -- but it is a genuine
+imbalance.
+
+Disable runtime PM first, drop the runtime-managed clocks only when the device
+is not already suspended, and mark it suspended for the next probe. The clocks
+taken in probe and never touched by runtime PM -- macro and dcodec, and
+va_macro's equivalents -- are still released unconditionally.
+
+Applies on top of the patch that links the macros to their clock provider;
+without it none of these paths are reachable.
+
+---
+--- a/sound/soc/codecs/lpass-va-macro.c
++++ b/sound/soc/codecs/lpass-va-macro.c
+@@ -1707,10 +1707,20 @@
+ {
+ 	struct va_macro *va = dev_get_drvdata(&pdev->dev);
+ 
+-	if (va->has_npl_clk)
+-		clk_disable_unprepare(va->npl);
++	/*
++	 * The driver core runtime-suspends a device before calling .remove(),
++	 * so the clocks the runtime suspend already dropped must not be
++	 * dropped a second time here. Only dcodec and macro are held
++	 * from probe and untouched by runtime PM.
++	 */
++	pm_runtime_disable(&pdev->dev);
++	if (!pm_runtime_status_suspended(&pdev->dev)) {
++		if (va->has_npl_clk)
++			clk_disable_unprepare(va->npl);
++		clk_disable_unprepare(va->mclk);
++	}
++	pm_runtime_set_suspended(&pdev->dev);
+ 
+-	clk_disable_unprepare(va->mclk);
+ 	clk_disable_unprepare(va->dcodec);
+ 	clk_disable_unprepare(va->macro);
+ 
+--- a/sound/soc/codecs/lpass-rx-macro.c
++++ b/sound/soc/codecs/lpass-rx-macro.c
+@@ -3939,9 +3939,20 @@
+ {
+ 	struct rx_macro *rx = dev_get_drvdata(&pdev->dev);
+ 
+-	clk_disable_unprepare(rx->mclk);
+-	clk_disable_unprepare(rx->npl);
+-	clk_disable_unprepare(rx->fsgen);
++	/*
++	 * The driver core runtime-suspends a device before calling .remove(),
++	 * so the clocks the runtime suspend already dropped must not be
++	 * dropped a second time here. Only macro and dcodec are held
++	 * from probe and untouched by runtime PM.
++	 */
++	pm_runtime_disable(&pdev->dev);
++	if (!pm_runtime_status_suspended(&pdev->dev)) {
++		clk_disable_unprepare(rx->mclk);
++		clk_disable_unprepare(rx->npl);
++		clk_disable_unprepare(rx->fsgen);
++	}
++	pm_runtime_set_suspended(&pdev->dev);
++
+ 	clk_disable_unprepare(rx->macro);
+ 	clk_disable_unprepare(rx->dcodec);
+ }
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -2656,7 +2656,7 @@
+ 	init.num_parents = 1;
+ 	wsa->hw.init = &init;
+ 	hw = &wsa->hw;
+-	ret = clk_hw_register(wsa->dev, hw);
++	ret = devm_clk_hw_register(wsa->dev, hw);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2846,11 +2846,22 @@
+ {
+ 	struct wsa_macro *wsa = dev_get_drvdata(&pdev->dev);
+ 
++	/*
++	 * The driver core runtime-suspends a device before calling .remove(),
++	 * so the clocks the runtime suspend already dropped must not be
++	 * dropped a second time here. Only macro and dcodec are held
++	 * from probe and untouched by runtime PM.
++	 */
++	pm_runtime_disable(&pdev->dev);
++	if (!pm_runtime_status_suspended(&pdev->dev)) {
++		clk_disable_unprepare(wsa->mclk);
++		clk_disable_unprepare(wsa->npl);
++		clk_disable_unprepare(wsa->fsgen);
++	}
++	pm_runtime_set_suspended(&pdev->dev);
++
+ 	clk_disable_unprepare(wsa->macro);
+ 	clk_disable_unprepare(wsa->dcodec);
+-	clk_disable_unprepare(wsa->mclk);
+-	clk_disable_unprepare(wsa->npl);
+-	clk_disable_unprepare(wsa->fsgen);
+ }
+ 
+ static int wsa_macro_runtime_suspend(struct device *dev)
+--- a/sound/soc/codecs/lpass-tx-macro.c
++++ b/sound/soc/codecs/lpass-tx-macro.c
+@@ -2394,11 +2394,22 @@
+ {
+ 	struct tx_macro *tx = dev_get_drvdata(&pdev->dev);
+ 
++	/*
++	 * The driver core runtime-suspends a device before calling .remove(),
++	 * so the clocks the runtime suspend already dropped must not be
++	 * dropped a second time here. Only macro and dcodec are held
++	 * from probe and untouched by runtime PM.
++	 */
++	pm_runtime_disable(&pdev->dev);
++	if (!pm_runtime_status_suspended(&pdev->dev)) {
++		clk_disable_unprepare(tx->mclk);
++		clk_disable_unprepare(tx->npl);
++		clk_disable_unprepare(tx->fsgen);
++	}
++	pm_runtime_set_suspended(&pdev->dev);
++
+ 	clk_disable_unprepare(tx->macro);
+ 	clk_disable_unprepare(tx->dcodec);
+-	clk_disable_unprepare(tx->mclk);
+-	clk_disable_unprepare(tx->npl);
+-	clk_disable_unprepare(tx->fsgen);
+ 
+ 	lpass_macro_pds_exit(tx->pds);
+ }
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -1698,7 +1698,15 @@
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(&pdev->dev);
+ 
+ 	sdw_bus_master_delete(&ctrl->bus);
+-	clk_disable_unprepare(ctrl->hclk);
++
++	/*
++	 * The driver core runtime-suspends a device before calling .remove(),
++	 * and swrm_runtime_suspend() has then already dropped hclk.
++	 */
++	pm_runtime_disable(&pdev->dev);
++	if (!pm_runtime_status_suspended(&pdev->dev))
++		clk_disable_unprepare(ctrl->hclk);
++	pm_runtime_set_suspended(&pdev->dev);
+ }
+ 
+ static int __maybe_unused swrm_runtime_resume(struct device *dev)

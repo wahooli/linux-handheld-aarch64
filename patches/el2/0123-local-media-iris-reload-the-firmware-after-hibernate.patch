@@ -1,0 +1,197 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] media: iris: reload the firmware after a hibernation restore
+
+Hardware video decode is dead for the rest of the boot after a cross-boot
+resume. Every open of the video node fails:
+
+    $ v4l2-ctl --device=/dev/video0 --info
+    Failed to open /dev/video0: Device or resource busy
+
+    qcom-iris aa00000.video-codec: video hw is power on
+    qcom-iris aa00000.video-codec: failed to resume
+
+The -EBUSY comes out of iris_hfi_pm_resume(), and it is the only thing that
+returns it. That function is the power-collapse exit path: it re-powers the
+block and re-boots the firmware already sitting in memory. It runs only when
+iris_pm_resume() finds core->state == IRIS_CORE_INIT.
+
+The firmware is loaded into the reserved region "memory-region" points at:
+
+    video_mem: video@87700000 {
+        reg = <0x0 0x87700000 0x0 0x700000>;
+        no-map;
+    };
+
+A no-map carveout has no struct page, so the hibernation image never carries
+it. The resuming kernel therefore comes back with core->state saying the
+firmware is loaded and booted, while the region itself holds whatever the
+reboot left in it. iris_vpu_boot_firmware() polls CTRL_STATUS for a firmware
+that is not there, one of the steps after it fails, and the resume is
+abandoned.
+
+It never recovers, which is what makes this fatal rather than transient.
+iris_core_init() begins with
+
+    if (core->state == IRIS_CORE_INIT) {
+        ret = 0;
+        goto exit;
+    }
+
+so the full path that would call iris_fw_load() again is never reached, and
+the only code that resets the state -- iris_core_deinit() -- runs from the
+release path of an open that cannot succeed.
+
+Put the core back to IRIS_CORE_DEINIT on .restore, so the next open performs a
+full init and loads the firmware again.
+
+Only the software side is undone. The HFI queues are plain DMA allocations and
+the firmware mapping belongs to the SMMU; neither needs the video block, and
+the block must not be touched at all, because the .freeze that preceded the
+snapshot powered it down. That is also why iris_fw_unload() is not reused --
+it opens by resetting the XTSS through core->reg_base, which would be an
+unpowered register access. iris_core_init() powers the block up and resets the
+CPU itself on the way back, so nothing is lost by skipping it.
+
+.restore only, not .thaw. Both are pm_runtime_force_resume() today, but .thaw
+runs on the kernel that took the snapshot, whose carveout was never disturbed.
+Only .restore comes back after a reboot.
+
+Also drops the SET_SYSTEM_SLEEP_PM_OPS() macro in favour of the six fields it
+expands to, since it assigns .restore as well.
+
+---
+--- a/drivers/media/platform/qcom/iris/iris_firmware.c
++++ b/drivers/media/platform/qcom/iris/iris_firmware.c
+@@ -166,6 +166,32 @@
+ 	return ret;
+ }
+ 
++/*
++ * Drop the firmware mapping without going near the video block.
++ *
++ * iris_fw_unload() is the normal counterpart to iris_fw_load(), but it starts
++ * by resetting the XTSS through core->reg_base, and there is one caller that
++ * must not: after a hibernation image is restored the block is already powered
++ * down by the .freeze that preceded the snapshot, so that write would land on
++ * an unpowered register. The IOMMU side still has to be undone -- the mapping
++ * itself lives in normal memory and comes back with the image, so a later
++ * iris_fw_load() would find IRIS_FW_START_ADDR already mapped.
++ */
++void iris_fw_unmap(struct iris_core *core)
++{
++	size_t unmapped;
++
++	if (!core->fw.mapped_mem_size)
++		return;
++
++	unmapped = iommu_unmap(core->fw.iommu_domain, IRIS_FW_START_ADDR,
++			       core->fw.mapped_mem_size);
++	if (unmapped != core->fw.mapped_mem_size)
++		dev_err(core->dev, "failed to unmap firmware in IOMMU\n");
++
++	core->fw.mapped_mem_size = 0;
++}
++
+ int iris_fw_unload(struct iris_core *core)
+ {
+ 	int ret;
+--- a/drivers/media/platform/qcom/iris/iris_firmware.h
++++ b/drivers/media/platform/qcom/iris/iris_firmware.h
+@@ -10,6 +10,7 @@
+ 
+ int iris_fw_load(struct iris_core *core);
+ int iris_fw_unload(struct iris_core *core);
++void iris_fw_unmap(struct iris_core *core);
+ int iris_set_hw_state(struct iris_core *core, bool resume);
+ 
+ int iris_fw_init(struct iris_core *core);
+--- a/drivers/media/platform/qcom/iris/iris_core.c
++++ b/drivers/media/platform/qcom/iris/iris_core.c
+@@ -26,6 +26,43 @@
+ 	pm_runtime_put_sync(core->dev);
+ }
+ 
++/*
++ * Put the core back to DEINIT after a hibernation image is restored.
++ *
++ * The firmware is loaded into the no-map reserved region the "memory-region"
++ * phandle points at. A no-map carveout has no struct page, so the hibernation
++ * image never carries it: across a cross-boot resume the region holds whatever
++ * the reboot left there, while core->state comes back from the image still
++ * saying the firmware is loaded and running.
++ *
++ * Everything then fails in the same place. iris_pm_resume() sees IRIS_CORE_INIT
++ * and takes the power-collapse exit path, which re-boots firmware that is no
++ * longer there and returns -EBUSY:
++ *
++ *   qcom-iris aa00000.video-codec: video hw is power on
++ *   qcom-iris aa00000.video-codec: failed to resume
++ *
++ * and it never recovers on its own, because iris_core_init() short-circuits on
++ * that same IRIS_CORE_INIT and returns success without reloading anything. Every
++ * open() of the video node fails -EBUSY for the rest of the boot.
++ *
++ * Only the software side is undone here: the queues are plain DMA allocations
++ * and the mapping belongs to the SMMU, neither of which needs the video block.
++ * Its registers must not be touched at all -- the .freeze before the snapshot
++ * powered it down -- and they do not need to be, because iris_core_init()
++ * powers it up and resets the CPU itself on the way back.
++ */
++void iris_core_reset_after_restore(struct iris_core *core)
++{
++	mutex_lock(&core->lock);
++	if (core->state != IRIS_CORE_DEINIT) {
++		iris_fw_unmap(core);
++		iris_hfi_queues_deinit(core);
++		core->state = IRIS_CORE_DEINIT;
++	}
++	mutex_unlock(&core->lock);
++}
++
+ static int iris_wait_for_system_response(struct iris_core *core)
+ {
+ 	int ret;
+--- a/drivers/media/platform/qcom/iris/iris_core.h
++++ b/drivers/media/platform/qcom/iris/iris_core.h
+@@ -133,5 +133,6 @@
+ 
+ int iris_core_init(struct iris_core *core);
+ void iris_core_deinit(struct iris_core *core);
++void iris_core_reset_after_restore(struct iris_core *core);
+ 
+ #endif
+--- a/drivers/media/platform/qcom/iris/iris_probe.c
++++ b/drivers/media/platform/qcom/iris/iris_probe.c
+@@ -360,9 +360,30 @@
+ 	return ret;
+ }
+ 
++/*
++ * .restore only, never .thaw. Both run pm_runtime_force_resume(), but .thaw
++ * runs on the kernel that took the snapshot, whose video block and firmware
++ * carveout were never disturbed. .restore is the one that comes back after a
++ * reboot with the carveout's contents gone.
++ */
++static int __maybe_unused iris_pm_restore(struct device *dev)
++{
++	iris_core_reset_after_restore(dev_get_drvdata(dev));
++
++	return pm_runtime_force_resume(dev);
++}
++
++/*
++ * Open-coded rather than SET_SYSTEM_SLEEP_PM_OPS(), which would assign .restore
++ * as well and leave this one overriding it.
++ */
+ static const struct dev_pm_ops iris_pm_ops = {
+-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
+-				pm_runtime_force_resume)
++	.suspend = pm_sleep_ptr(pm_runtime_force_suspend),
++	.resume = pm_sleep_ptr(pm_runtime_force_resume),
++	.freeze = pm_sleep_ptr(pm_runtime_force_suspend),
++	.thaw = pm_sleep_ptr(pm_runtime_force_resume),
++	.poweroff = pm_sleep_ptr(pm_runtime_force_suspend),
++	.restore = pm_sleep_ptr(iris_pm_restore),
+ 	SET_RUNTIME_PM_OPS(iris_pm_suspend, iris_pm_resume, NULL)
+ };
+ 
