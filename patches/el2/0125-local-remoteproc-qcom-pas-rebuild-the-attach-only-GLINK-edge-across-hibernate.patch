@@ -1,0 +1,618 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] remoteproc: qcom_q6v5_pas: rebuild the attach-only GLINK edge across hibernate
+
+X1E at EL2 attaches to DSPs the bootloader started, and the EL1
+hibernation notifier deliberately skips those RPROC_ATTACHED processors
+because Linux cannot restart them. After a cross-boot resume the restored
+GLINK channels and SMEM pointers describe the previous firmware instance,
+while GLINK's IRQF_NO_SUSPEND interrupt feeds the new firmware's messages
+straight into them: duplicate remote CIDs, intent timeouts, dead battery
+and audio. The image-loading initramfs carries neither the PAS driver nor
+the GLINK modules, so what the restored kernel needs is the same fresh
+host connection a cold boot makes -- not another DSP reset. The
+bridge-only PAS restart experiment failed on both DSPs with APPS force
+stop and a start timeout; do not reuse it here.
+
+Release the edge at PM_HIBERNATION_PREPARE, register it again after the
+image is restored.
+
+The side it is released on is the whole point. Removing the edge removes
+its rpmsg children, and the audio one pulls the entire q6prm consumer
+tree with it: apr_remove() joins the PDR notifier worker, which is in
+apr_pd_status(DOWN) unregistering q6prm, whose five active managed device
+links go to the LPASS macro codecs -- wsa2, rx, tx, wsa, va -- with the
+SoundWire masters and the sound card behind them.
+device_links_unbind_consumers() then releases each of those, and
+__device_release_driver() runtime-resumes every suspended macro on the
+way down.
+
+Done on the restore side that runs against the DSP the bootloader just
+started, so those clocks are unreachable. SDAM instrumentation caught it
+at exactly one point: an ACTIVE link selected, the consumer referenced,
+the links lock dropped, and device_release_driver_internal() never
+returning, on one of those codecs. No console, no shell, no dmesg -- the
+machine reset ~30 s later and took the evidence with it.
+
+At PM_HIBERNATION_PREPARE the DSP is still the one this image has been
+talking to, GPR still answers, and the notifier runs before
+freeze_processes(), so userspace can still close its ALSA files. That is
+the same teardown the SSR path takes, which 0099-0104 already made
+survivable, and it needs SYSTEMD_SLEEP_FREEZE_USER_SESSIONS=0 so systemd
+has not frozen the session before snd_card_disconnect_sync() waits on it.
+The image then holds no bound LPASS macros, device_links_busy(q6prm) is
+false on the restore side, and nothing is left to unbind where it cannot
+survive being unbound.
+
+POST keeps only the register half, which is fast -- the channel opens and
+the rebind happen asynchronously after it -- and runs from an ordered
+workqueue rather than inside hibernate(). The PM notifier executes under
+system_transition_mutex with the console already restored away, so
+anything that blocks there is unrecoverable; off the sleep path a stall
+costs audio and leaves a machine that can be read. One queue for every
+instance, not one per device: per-device queues would let the ADSP and
+CDSP rebuilds run concurrently where the notifier chain ran them in
+sequence. A new transition is refused while a rebuild is still running
+rather than flush_work()ed, because that wait would run under the sleep
+lock too.
+
+The freeze/abort machinery stays as the fallback for a device not torn
+down at entry: freeze_late masks RX and blocks TX after the children have
+suspended, rejecting an active control-message worker with -EBUSY rather
+than unregistering devices inside the PM traversal; restore_early leaves
+RX masked and aborts senders before child resume, so removing old
+endpoints cannot issue CLOSE or service shutdown into the new connection.
+qcom_glink_tx() rechecks abort after every wake -- the old loop could wake
+on teardown, see newly available space, and write anyway. It disengages by
+itself once the edge is gone at entry.
+
+hibernate_glink_async=n puts the rebuild back inside the POST notifier
+chain, where a failure stops the chain instead of outliving it; that is
+what an instrumentation round or a bisect wants. Only
+PM_HIBERNATION_PREPARE tears down -- PM_RESTORE_PREPARE belongs to a
+kernel whose edge is discarded when the image loads. Rollback is free: a
+failing later notifier delivers PM_POST_HIBERNATION, which registers
+again. EL1 is untouched, its PREPARE branch needing RPROC_RUNNING where
+this one needs RPROC_ATTACHED. rproc_detach/shutdown, sysmon shutdown, SSR
+cleanup and PAS reset are all avoided: the DSP stays attached.
+
+The four dev_info lines naming each rebuild stage are deliberate. They are
+what this path was debugged through once it stopped taking the machine
+down, and they distinguish a rebuild that ran from one that was skipped.
+
+Verified on hardware 2026-09-15: eight consecutive hibernate cycles, four
+on battery and four on AC with the GPU pinned power/control=on so both
+restore paths ran, then both DSPs attached, card0 present, all five LPASS
+macros rebound and all five q6prm links re-established. Audio, battery and
+USB-C glink go down at hibernate entry rather than surviving into the
+image; that is the design. A same-boot test_resume does not reset the peer
+and is not covered.
+---
+--- a/drivers/remoteproc/qcom_q6v5_pas.c
++++ b/drivers/remoteproc/qcom_q6v5_pas.c
+@@ -23,6 +23,7 @@
+ #include <linux/firmware/qcom/qcom_scm.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/remoteproc.h>
++#include <linux/rpmsg/qcom_glink.h>
+ #include <linux/soc/qcom/mdt_loader.h>
+ #include <linux/soc/qcom/smem.h>
+ #include <linux/soc/qcom/smem_state.h>
+@@ -121,6 +122,10 @@
+ 
+ 	struct notifier_block pm_notifier;
+ 	bool hibernate_restart;
++	bool hibernate_glink_frozen;
++	bool hibernate_glink_restore;
++	struct work_struct hibernate_glink_work;
++	bool hibernate_glink_torn;
+ };
+ 
+ static void qcom_pas_segment_dump(struct rproc *rproc,
+@@ -780,6 +785,25 @@
+ 		 "Stop the remote processor before the hibernation image is taken and boot it again on restore (default: y)");
+ 
+ /*
++ * Shared by every instance on purpose: a queue per device would let the ADSP
++ * and CDSP rebuilds run at once, where the notifier chain ran them in sequence.
++ */
++static struct workqueue_struct *qcom_pas_hib_wq;
++
++/*
++ * The restore-side rebuild removes every rpmsg child of the edge, and the audio
++ * one drags the whole q6prm consumer tree with it. Run from the PM notifier
++ * that happens inside hibernate(), under system_transition_mutex and with the
++ * console already gone, so anything that blocks there is unrecoverable: no log,
++ * no shell, watchdog reset. Off the sleep path a stall costs audio and leaves a
++ * machine that can be read.
++ */
++static bool qcom_pas_hibernate_glink_async = true;
++module_param_named(hibernate_glink_async, qcom_pas_hibernate_glink_async, bool, 0644);
++MODULE_PARM_DESC(hibernate_glink_async,
++		 "Rebuild the attach-only GLINK edge from a workqueue after hibernate() returns instead of inside it (default: y)");
++
++/*
+  * Hibernation: take the remote processor down before the image is written and
+  * boot it again afterwards.
+  *
+@@ -829,6 +853,179 @@
+ 	return ready && !stop && !fatal;
+ }
+ 
++/* Only attach-only X1E DSPs need a host-side GLINK rebuild on restore. */
++static int __maybe_unused qcom_pas_glink_freeze_late(struct device *dev)
++{
++	struct qcom_pas *pas = dev_get_drvdata(dev);
++	struct rproc *rproc;
++	int ret = 0;
++
++	if (!pas->rproc || !qcom_pas_hibernate_restart)
++		return 0;
++	if (!of_device_is_compatible(dev->of_node, "qcom,x1e80100-adsp-pas") &&
++	    !of_device_is_compatible(dev->of_node, "qcom,x1e80100-cdsp-pas"))
++		return 0;
++
++	rproc = pas->rproc;
++	mutex_lock(&rproc->lock);
++	if (!rproc->ops->start && rproc->state == RPROC_ATTACHED &&
++	    !IS_ERR_OR_NULL(pas->glink_subdev.edge)) {
++		ret = qcom_glink_smem_freeze(pas->glink_subdev.edge);
++		if (!ret)
++			pas->hibernate_glink_frozen = true;
++		else
++			dev_err(dev, "hibernate: GLINK freeze failed: %d\n", ret);
++	}
++	mutex_unlock(&rproc->lock);
++
++	return ret;
++}
++
++static int __maybe_unused qcom_pas_glink_thaw_early(struct device *dev)
++{
++	struct qcom_pas *pas = dev_get_drvdata(dev);
++
++	if (!pas->rproc)
++		return 0;
++
++	mutex_lock(&pas->rproc->lock);
++	if (pas->hibernate_glink_frozen) {
++		if (!IS_ERR_OR_NULL(pas->glink_subdev.edge))
++			qcom_glink_smem_thaw(pas->glink_subdev.edge);
++		pas->hibernate_glink_frozen = false;
++	}
++	mutex_unlock(&pas->rproc->lock);
++
++	return 0;
++}
++
++static int __maybe_unused qcom_pas_glink_restore_early(struct device *dev)
++{
++	struct qcom_pas *pas = dev_get_drvdata(dev);
++
++	if (!pas->rproc)
++		return 0;
++
++	mutex_lock(&pas->rproc->lock);
++	if (pas->hibernate_glink_frozen &&
++	    !IS_ERR_OR_NULL(pas->glink_subdev.edge)) {
++		/*
++		 * Leave RX disabled. The bootloader restarted the DSP, so neither
++		 * saved channels nor cached SMEM addresses may be used again.
++		 * Abort senders before the child devices' resume callbacks run.
++		 */
++		qcom_glink_smem_abort(pas->glink_subdev.edge);
++		pas->hibernate_glink_restore = true;
++	}
++	mutex_unlock(&pas->rproc->lock);
++
++	return 0;
++}
++
++static const struct dev_pm_ops qcom_pas_pm_ops = {
++	.freeze_late = qcom_pas_glink_freeze_late,
++	.thaw_early = qcom_pas_glink_thaw_early,
++	.restore_early = qcom_pas_glink_restore_early,
++};
++
++/*
++ * Release the attach-only edge before the snapshot rather than after it.
++ *
++ * Removing the edge removes its rpmsg children, and the audio one pulls the
++ * whole q6prm consumer tree with it: five LPASS macro codecs, two SoundWire
++ * masters, the sound card. On the restore side that runs against the DSP the
++ * bootloader just started, so the macros' clocks are unreachable -- it stopped
++ * in device_release_driver_internal() on one of those codecs and did not come
++ * back.
++ *
++ * Here the DSP is still the one this image has been talking to, GPR still
++ * answers, and PM_HIBERNATION_PREPARE runs before freeze_processes(), so
++ * userspace can still close its ALSA files. That makes this the same teardown
++ * the SSR path takes, which 0099-0104 already made survivable -- and a stall
++ * here leaves a live machine with a shell and a journal.
++ */
++static void qcom_pas_glink_teardown(struct qcom_pas *pas)
++{
++	struct qcom_rproc_glink *glink = &pas->glink_subdev;
++	struct rproc *rproc = pas->rproc;
++
++	if (!rproc || !qcom_pas_hibernate_restart)
++		return;
++	if (!of_device_is_compatible(pas->dev->of_node, "qcom,x1e80100-adsp-pas") &&
++	    !of_device_is_compatible(pas->dev->of_node, "qcom,x1e80100-cdsp-pas"))
++		return;
++
++	mutex_lock(&rproc->lock);
++	if (!rproc->ops->start && rproc->state == RPROC_ATTACHED &&
++	    !IS_ERR_OR_NULL(glink->edge)) {
++		dev_info(pas->dev, "hibernate: releasing GLINK before the image\n");
++		qcom_glink_smem_unregister(glink->edge);
++		glink->edge = NULL;
++		pas->hibernate_glink_torn = true;
++		dev_info(pas->dev, "hibernate: GLINK released\n");
++	}
++	mutex_unlock(&rproc->lock);
++}
++
++static void qcom_pas_glink_restore(struct qcom_pas *pas)
++{
++	struct qcom_rproc_glink *glink = &pas->glink_subdev;
++	struct qcom_glink_smem *edge;
++	struct rproc *rproc = pas->rproc;
++	bool torn;
++
++	dev_info(pas->dev, "hibernate: GLINK rebuild enter, waiting for rproc lock\n");
++
++	/* Serialize with sysfs stop and recovery, as the rproc core does. */
++	mutex_lock(&rproc->lock);
++	pas->hibernate_glink_restore = false;
++	pas->hibernate_glink_frozen = false;
++	torn = pas->hibernate_glink_torn;
++	pas->hibernate_glink_torn = false;
++	/* A torn edge is NULL by construction; only the register half is left. */
++	if (rproc->state != RPROC_ATTACHED ||
++	    (!torn && IS_ERR_OR_NULL(glink->edge))) {
++		dev_warn(pas->dev, "hibernate: GLINK rebuild skipped: state=%d edge_error=%ld\n",
++			 rproc->state, IS_ERR(glink->edge) ? PTR_ERR(glink->edge) : 0L);
++		goto unlock;
++	}
++
++	/*
++	 * The PM notifier runs after dpm_complete() and thaw_processes().
++	 * Removing rpmsg children here is safe; doing it from .restore
++	 * would modify the device list during the PM core's traversal.
++	 *
++	 * Do not use rproc_detach()/shutdown(): sysmon would ask the DSP
++	 * to stop, and attach-only operations cannot start it again.
++	 * TX was aborted before resume, so removing the old endpoints
++	 * cannot send CLOSE or service teardown requests to the new DSP.
++	 */
++	if (!IS_ERR_OR_NULL(glink->edge)) {
++		dev_info(pas->dev, "hibernate: GLINK rebuild unregister start\n");
++		qcom_glink_smem_unregister(glink->edge);
++		glink->edge = NULL;
++	}
++	dev_info(pas->dev, "hibernate: GLINK register start\n");
++	edge = qcom_glink_smem_register(glink->dev, glink->node);
++	if (IS_ERR(edge)) {
++		dev_err(pas->dev, "hibernate: GLINK reconnect failed: %ld\n",
++			PTR_ERR(edge));
++		goto unlock;
++	}
++	glink->edge = edge;
++	dev_info(pas->dev, "hibernate: reconnected GLINK to boot DSP\n");
++unlock:
++	mutex_unlock(&rproc->lock);
++}
++
++static void qcom_pas_glink_restore_work(struct work_struct *work)
++{
++	struct qcom_pas *pas = container_of(work, struct qcom_pas,
++					    hibernate_glink_work);
++
++	qcom_pas_glink_restore(pas);
++}
++
+ static int qcom_pas_pm_notify(struct notifier_block *nb, unsigned long action,
+ 			      void *data)
+ {
+@@ -837,6 +1034,31 @@
+ 	struct rproc *rproc = pas->rproc;
+ 	int ret;
+ 
++	/*
++	 * A deferred rebuild from the previous cycle must not still be holding
++	 * the edge. Refuse the transition rather than flush_work() here: this
++	 * runs under system_transition_mutex, so waiting on a rebuild that is
++	 * already stuck would wedge the machine that deferring it kept alive.
++	 */
++	if ((action == PM_HIBERNATION_PREPARE || action == PM_RESTORE_PREPARE) &&
++	    work_busy(&pas->hibernate_glink_work)) {
++		dev_err(pas->dev, "hibernate: previous GLINK rebuild still running\n");
++		return notifier_from_errno(-EBUSY);
++	}
++
++	/* Not PM_RESTORE_PREPARE: that kernel's edge is discarded anyway. */
++	if (action == PM_HIBERNATION_PREPARE)
++		qcom_pas_glink_teardown(pas);
++
++	/* Rebuild whether the edge was released at entry or frozen into the image. */
++	if ((action == PM_POST_HIBERNATION || action == PM_POST_RESTORE) &&
++	    (pas->hibernate_glink_restore || pas->hibernate_glink_torn)) {
++		if (qcom_pas_hibernate_glink_async)
++			queue_work(qcom_pas_hib_wq, &pas->hibernate_glink_work);
++		else
++			qcom_pas_glink_restore(pas);
++	}
++
+ 	if (!qcom_pas_hibernate_restart)
+ 		return NOTIFY_DONE;
+ 
+@@ -1100,6 +1322,7 @@
+ 	if (ret)
+ 		goto remove_ssr_sysmon;
+ 
++	INIT_WORK(&pas->hibernate_glink_work, qcom_pas_glink_restore_work);
+ 	pas->pm_notifier.notifier_call = qcom_pas_pm_notify;
+ 	ret = register_pm_notifier(&pas->pm_notifier);
+ 	if (ret)
+@@ -1137,6 +1360,7 @@
+ 		return;
+ 
+ 	unregister_pm_notifier(&pas->pm_notifier);
++	cancel_work_sync(&pas->hibernate_glink_work);
+ 	rproc_del(pas->rproc);
+ 
+ 	qcom_q6v5_deinit(&pas->q6v5);
+@@ -1916,9 +2140,31 @@
+ 	.driver = {
+ 		.name = "qcom_q6v5_pas",
+ 		.of_match_table = qcom_pas_of_match,
++		.pm = pm_sleep_ptr(&qcom_pas_pm_ops),
+ 	},
+ };
+ 
+-module_platform_driver(qcom_pas_driver);
++static int __init qcom_pas_init(void)
++{
++	int ret;
++
++	qcom_pas_hib_wq = alloc_ordered_workqueue("qcom_pas_hib", 0);
++	if (!qcom_pas_hib_wq)
++		return -ENOMEM;
++
++	ret = platform_driver_register(&qcom_pas_driver);
++	if (ret)
++		destroy_workqueue(qcom_pas_hib_wq);
++
++	return ret;
++}
++module_init(qcom_pas_init);
++
++static void __exit qcom_pas_exit(void)
++{
++	platform_driver_unregister(&qcom_pas_driver);
++	destroy_workqueue(qcom_pas_hib_wq);
++}
++module_exit(qcom_pas_exit);
+ MODULE_DESCRIPTION("Qualcomm Peripheral Authentication Service remoteproc driver");
+ MODULE_LICENSE("GPL v2");
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -100,6 +100,7 @@
+  * @intentless:	flag to indicate that there is no intent
+  * @tx_avail_notify: Waitqueue for pending tx tasks
+  * @sent_read_notify: flag to check cmd sent or not
++ * @frozen:	block TX until the hibernation snapshot is thawed or restored
+  * @abort_tx:	flag indicating that all tx attempts should fail
+  */
+ struct qcom_glink {
+@@ -125,6 +126,7 @@
+ 	wait_queue_head_t tx_avail_notify;
+ 	bool sent_read_notify;
+ 
++	bool frozen;
+ 	bool abort_tx;
+ 
+ 	/*
+@@ -375,23 +377,20 @@
+ 
+ 	spin_lock_irqsave(&glink->tx_lock, flags);
+ 
+-	if (glink->abort_tx) {
+-		ret = -EIO;
+-		goto out;
+-	}
+-
+-	while (qcom_glink_tx_avail(glink) < tlen) {
+-		if (!wait) {
+-			ret = -EAGAIN;
+-			goto out;
+-		}
+-
++	for (;;) {
++		/* Recheck after every wake, before touching possibly stale SMEM. */
+ 		if (glink->abort_tx) {
+ 			ret = -EIO;
+ 			goto out;
+ 		}
++		if (!glink->frozen && qcom_glink_tx_avail(glink) >= tlen)
++			break;
++		if (!wait) {
++			ret = -EAGAIN;
++			goto out;
++		}
+ 
+-		if (!glink->sent_read_notify) {
++		if (!glink->frozen && !glink->sent_read_notify) {
+ 			glink->sent_read_notify = true;
+ 			qcom_glink_send_read_notify(glink);
+ 		}
+@@ -400,11 +399,14 @@
+ 		spin_unlock_irqrestore(&glink->tx_lock, flags);
+ 
+ 		wait_event_timeout(glink->tx_avail_notify,
+-				   qcom_glink_tx_avail(glink) >= tlen, 10 * HZ);
++				   READ_ONCE(glink->abort_tx) ||
++				   (!READ_ONCE(glink->frozen) &&
++				    qcom_glink_tx_avail(glink) >= tlen), 10 * HZ);
+ 
+ 		spin_lock_irqsave(&glink->tx_lock, flags);
+ 
+-		if (qcom_glink_tx_avail(glink) >= tlen)
++		if (!glink->abort_tx && !glink->frozen &&
++		    qcom_glink_tx_avail(glink) >= tlen)
+ 			glink->sent_read_notify = false;
+ 	}
+ 
+@@ -1994,6 +1996,52 @@
+ 	return 0;
+ }
+ 
++/* The transport IRQ must be disabled and synchronized by the caller. */
++int qcom_glink_native_freeze(struct qcom_glink *glink)
++{
++	unsigned long flags;
++
++	/* Do not run rpmsg registration/removal from a device PM callback. */
++	if (work_busy(&glink->rx_work))
++		return -EBUSY;
++
++	spin_lock_irqsave(&glink->tx_lock, flags);
++	glink->frozen = true;
++	spin_unlock_irqrestore(&glink->tx_lock, flags);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(qcom_glink_native_freeze);
++
++void qcom_glink_native_thaw(struct qcom_glink *glink)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&glink->tx_lock, flags);
++	glink->frozen = false;
++	spin_unlock_irqrestore(&glink->tx_lock, flags);
++	wake_up_all(&glink->tx_avail_notify);
++}
++EXPORT_SYMBOL_GPL(qcom_glink_native_thaw);
++
++void qcom_glink_native_abort(struct qcom_glink *glink)
++{
++	struct glink_channel *channel;
++	unsigned long flags;
++	int cid;
++
++	spin_lock_irqsave(&glink->tx_lock, flags);
++	glink->abort_tx = true;
++	spin_unlock_irqrestore(&glink->tx_lock, flags);
++	wake_up_all(&glink->tx_avail_notify);
++
++	spin_lock_irqsave(&glink->idr_lock, flags);
++	idr_for_each_entry(&glink->lcids, channel, cid)
++		qcom_glink_intent_req_abort(channel);
++	spin_unlock_irqrestore(&glink->idr_lock, flags);
++}
++EXPORT_SYMBOL_GPL(qcom_glink_native_abort);
++
+ void qcom_glink_native_remove(struct qcom_glink *glink)
+ {
+ 	struct glink_channel *channel;
+--- a/drivers/rpmsg/qcom_glink_native.h
++++ b/drivers/rpmsg/qcom_glink_native.h
+@@ -35,6 +35,9 @@
+ 					   struct qcom_glink_pipe *rx,
+ 					   struct qcom_glink_pipe *tx,
+ 					   bool intentless);
++int qcom_glink_native_freeze(struct qcom_glink *glink);
++void qcom_glink_native_thaw(struct qcom_glink *glink);
++void qcom_glink_native_abort(struct qcom_glink *glink);
+ void qcom_glink_native_remove(struct qcom_glink *glink);
+ void qcom_glink_native_rx(struct qcom_glink *glink);
+ 
+--- a/drivers/rpmsg/qcom_glink_smem.c
++++ b/drivers/rpmsg/qcom_glink_smem.c
+@@ -39,6 +39,7 @@
+ 	struct device dev;
+ 
+ 	int irq;
++	bool frozen;
+ 	struct qcom_glink *glink;
+ 
+ 	struct mbox_client mbox_client;
+@@ -367,13 +368,52 @@
+ }
+ EXPORT_SYMBOL_GPL(qcom_glink_smem_register);
+ 
+-void qcom_glink_smem_unregister(struct qcom_glink_smem *smem)
++int qcom_glink_smem_freeze(struct qcom_glink_smem *smem)
+ {
+-	struct qcom_glink *glink = smem->glink;
++	int ret;
++
++	if (smem->frozen)
++		return 0;
+ 
+ 	disable_irq(smem->irq);
++	ret = qcom_glink_native_freeze(smem->glink);
++	if (ret) {
++		enable_irq(smem->irq);
++		return ret;
++	}
++	smem->frozen = true;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(qcom_glink_smem_freeze);
++
++void qcom_glink_smem_thaw(struct qcom_glink_smem *smem)
++{
++	if (!smem->frozen)
++		return;
++
++	qcom_glink_native_thaw(smem->glink);
++	smem->frozen = false;
++	enable_irq(smem->irq);
++}
++EXPORT_SYMBOL_GPL(qcom_glink_smem_thaw);
++
++void qcom_glink_smem_abort(struct qcom_glink_smem *smem)
++{
++	qcom_glink_native_abort(smem->glink);
++}
++EXPORT_SYMBOL_GPL(qcom_glink_smem_abort);
++
++void qcom_glink_smem_unregister(struct qcom_glink_smem *smem)
++{
++	/* Re-registration can fail after a hibernation restore. */
++	if (!smem)
++		return;
++
++	if (!smem->frozen)
++		disable_irq(smem->irq);
+ 
+-	qcom_glink_native_remove(glink);
++	qcom_glink_native_remove(smem->glink);
+ 
+ 	mbox_free_channel(smem->mbox_chan);
+ 	device_unregister(&smem->dev);
+--- a/include/linux/rpmsg/qcom_glink.h
++++ b/include/linux/rpmsg/qcom_glink.h
+@@ -18,6 +18,9 @@
+ struct qcom_glink_smem *qcom_glink_smem_register(struct device *parent,
+ 						 struct device_node *node);
+ void qcom_glink_smem_unregister(struct qcom_glink_smem *glink);
++int qcom_glink_smem_freeze(struct qcom_glink_smem *glink);
++void qcom_glink_smem_thaw(struct qcom_glink_smem *glink);
++void qcom_glink_smem_abort(struct qcom_glink_smem *glink);
+ 
+ #else
+ 
+@@ -29,6 +32,9 @@
+ }
+ 
+ static inline void qcom_glink_smem_unregister(struct qcom_glink_smem *glink) {}
++static inline int qcom_glink_smem_freeze(struct qcom_glink_smem *glink) { return 0; }
++static inline void qcom_glink_smem_thaw(struct qcom_glink_smem *glink) {}
++static inline void qcom_glink_smem_abort(struct qcom_glink_smem *glink) {}
+ #endif
+ 
+ #endif

@@ -1,0 +1,396 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: clocksource: arm_arch_timer_mmio: RTC alarm on the
+ physical timer
+
+Gives x1e80100 a timed wake source, which it otherwise does not have at all.
+
+The PMK8550 RTC alarm is owned by the ADSP: dropping qcom,no-alarm makes
+request_irq() return -EPERM, because the SPMI arbiter will not hand peripheral
+0x6200 to EE 0. Without an RTC alarm there is no alarmtimer device, nothing
+backs CLOCK_BOOTTIME_ALARM, and logind reports CanSuspendThenHibernate as "na".
+The EC exposes no timer, the battery has no trip point, and nothing else in the
+DT is a wakeup-capable timer.
+
+The memory-mapped QTIMER frame is unused and in the always-on domain.
+find_best_frame() prefers a virt-capable frame and takes the *virtual* timer for
+the clockevent, so on this board CNTP_CVAL, CNTP_CTL and frame->phys_irq are
+free -- irq 26 (arch_mem_timer, hwirq 38 = SPI 6) is the virtual one, while
+SPI 8 is unclaimed. CNTACR was already probed with CNTACR_RWPT and read back
+during frame selection, so the physical comparator is known writable from EE 0,
+and the frame registers are known mappable because the clocksource
+(arch_mmio_counter) registered.
+
+So: register a second RTC whose set_alarm programs CNTP_CVAL and whose wake irq
+is the frame's physical interrupt. alarmtimer binds the first RTC with
+RTC_FEATURE_ALARM whose parent may wake; rtc0 (pm8xxx) has the feature bit
+cleared and is skipped, so this one is taken.
+
+The exposed clock is monotonic since boot, not wall-clock. That is sufficient
+for the only consumer that matters: alarmtimer_suspend() reads the RTC and arms
+at now + delta, so it needs self-consistency rather than correctness.
+RTC_HCTOSYS_DEVICE stays rtc0, which keeps real time and simply has no alarm.
+
+Registration is best-effort and cannot fail the probe, and is skipped entirely
+if the clockevent took the physical timer, since then nothing in the frame is
+spare. It runs from late_initcall rather than from probe: this driver probes at
+~0.30 s and rtc-pm8xxx at ~0.35 s, so registering inline would take rtc0 and
+push the platform RTC to rtc1, pointing CONFIG_RTC_HCTOSYS_DEVICE and
+RTC_SYSTOHC_DEVICE at this counter instead of the PMIC.
+
+Off by default and gated behind arm_arch_timer_mmio.rtc_alarm=1. Every
+arm,armv7-timer-mem platform reaches this code -- sc8280xp (ThinkPad X13s) has
+the same node -- and a board whose platform RTC has a working alarm must not
+suddenly grow a second one for alarmtimer to bind instead. Only x1e80100 wants
+this, and only because its PMIC alarm is unreachable.
+
+Deliberately local, not for upstream: the upstream answer is "use the RTC", and
+the RTC is exactly what the ADSP took.
+
+Not-signed-off-by: local build
+---
+ drivers/clocksource/arm_arch_timer_mmio.c | 303 ++++++++++
+ 1 file changed, 303 insertions(+), 0 deletions(-)
+
+--- a/drivers/clocksource/arm_arch_timer_mmio.c
++++ b/drivers/clocksource/arm_arch_timer_mmio.c
+@@ -13,9 +13,13 @@
+ #include <linux/clockchips.h>
+ #include <linux/interrupt.h>
+ #include <linux/io-64-nonatomic-lo-hi.h>
++#include <linux/math64.h>
++#include <linux/moduleparam.h>
+ #include <linux/of_irq.h>
+ #include <linux/of_address.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_wakeirq.h>
++#include <linux/rtc.h>
+ 
+ #include <clocksource/arm_arch_timer.h>
+ 
+@@ -43,6 +47,8 @@
+ 	VIRT_ACCESS,
+ };
+ 
++struct arch_timer_rtc;
++
+ struct arch_timer {
+ 	struct clock_event_device	evt;
+ 	struct clocksource		cs;
+@@ -50,6 +56,7 @@
+ 	void __iomem			*base;
+ 	enum arch_timer_access		access;
+ 	u32				rate;
++	struct arch_timer_rtc		*rtc;
+ };
+ 
+ #define evt_to_arch_timer(e) container_of(e, struct arch_timer, evt)
+@@ -277,6 +284,299 @@
+ 	clocksource_register_hz(&at->cs, at->rate);
+ }
+ 
++/*
++ * local: an RTC alarm backed by this frame's *physical* timer.
++ *
++ * Why this exists: on x1e80100 the PMK8550 RTC alarm is owned by the ADSP --
++ * dropping qcom,no-alarm makes request_irq() return -EPERM, because the SPMI
++ * arbiter will not hand peripheral 0x6200 to EE 0. With no RTC alarm there is
++ * no alarmtimer, no CLOCK_BOOTTIME_ALARM backing, and logind reports
++ * CanSuspendThenHibernate as "na". There is no other timed wake source on the
++ * board.
++ *
++ * This frame is in the always-on domain and nothing else uses it: find_best_frame()
++ * picks the *virtual* timer for the clockevent when the frame is virt-capable,
++ * which leaves CNTP_CVAL/CNTP_CTL and frame->phys_irq free. CNTACR was already
++ * probed with CNTACR_RWPT and read back, so the physical comparator is writable.
++ *
++ * The clock this exposes is monotonic since boot, not wall-clock. That is fine
++ * for the only consumer that matters: alarmtimer reads the RTC and arms at
++ * now + delta, so it needs self-consistency, not correctness. RTC_HCTOSYS_DEVICE
++ * stays rtc0 (pm8xxx), which keeps real time and simply has no alarm. alarmtimer
++ * binds the first RTC with RTC_FEATURE_ALARM whose parent may wake, so it skips
++ * rtc0 and takes this one.
++ *
++ * Deliberately local: upstream's answer is "use the RTC", and the RTC is exactly
++ * what the ADSP took.
++ */
++static bool rtc_alarm;
++module_param(rtc_alarm, bool, 0444);
++MODULE_PARM_DESC(rtc_alarm,
++	"Register an RTC alarm on this frame's physical timer (default off). "
++	"Only wanted where the platform RTC has no usable alarm -- on x1e80100 "
++	"the PMIC alarm is owned by the ADSP, so there is otherwise no timed "
++	"wake source at all. Enable with arm_arch_timer_mmio.rtc_alarm=1.");
++
++struct arch_timer_rtc {
++	struct rtc_device	*rtc;
++	void __iomem		*base;
++	u32			rate;
++	int			irq;
++	time64_t		offset;		/* reported time - counter seconds */
++	time64_t		alarm;		/* armed alarm, in reported time */
++	bool			armed;
++	spinlock_t		lock;		/* CNTP_CTL/CVAL are not atomic */
++};
++
++static u64 arch_timer_rtc_counter(struct arch_timer_rtc *r)
++{
++	u32 lo, hi, tmp;
++
++	do {
++		hi  = readl_relaxed(r->base + CNTPCT_LO + 4);
++		lo  = readl_relaxed(r->base + CNTPCT_LO);
++		tmp = readl_relaxed(r->base + CNTPCT_LO + 4);
++	} while (hi != tmp);
++
++	return ((u64)hi << 32) | lo;
++}
++
++static time64_t arch_timer_rtc_now(struct arch_timer_rtc *r)
++{
++	return (time64_t)div_u64(arch_timer_rtc_counter(r), r->rate) + r->offset;
++}
++
++/* Caller holds r->lock. Disabling is what deasserts the level irq. */
++static void arch_timer_rtc_disarm(struct arch_timer_rtc *r)
++{
++	writel_relaxed(0, r->base + CNTP_CTL);
++	r->armed = false;
++}
++
++static int arch_timer_rtc_read_time(struct device *dev, struct rtc_time *tm)
++{
++	struct arch_timer *at = dev_get_drvdata(dev);
++
++	rtc_time64_to_tm(arch_timer_rtc_now(at->rtc), tm);
++	return 0;
++}
++
++static int arch_timer_rtc_set_time(struct device *dev, struct rtc_time *tm)
++{
++	struct arch_timer *at = dev_get_drvdata(dev);
++	struct arch_timer_rtc *r = at->rtc;
++	unsigned long flags;
++
++	spin_lock_irqsave(&r->lock, flags);
++	r->offset = rtc_tm_to_time64(tm) -
++		    (time64_t)div_u64(arch_timer_rtc_counter(r), r->rate);
++	spin_unlock_irqrestore(&r->lock, flags);
++	return 0;
++}
++
++static int arch_timer_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *alrm)
++{
++	struct arch_timer *at = dev_get_drvdata(dev);
++	struct arch_timer_rtc *r = at->rtc;
++	unsigned long flags;
++
++	spin_lock_irqsave(&r->lock, flags);
++	rtc_time64_to_tm(r->alarm, &alrm->time);
++	alrm->enabled = r->armed;
++	spin_unlock_irqrestore(&r->lock, flags);
++	return 0;
++}
++
++static int arch_timer_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alrm)
++{
++	struct arch_timer *at = dev_get_drvdata(dev);
++	struct arch_timer_rtc *r = at->rtc;
++	time64_t target = rtc_tm_to_time64(&alrm->time);
++	unsigned long flags;
++	u64 cnt;
++	s64 delta;
++
++	spin_lock_irqsave(&r->lock, flags);
++
++	/* CNTP_CVAL is a 64-bit write; the timer must be off while it lands. */
++	arch_timer_rtc_disarm(r);
++
++	if (!alrm->enabled) {
++		spin_unlock_irqrestore(&r->lock, flags);
++		return 0;
++	}
++
++	cnt = arch_timer_rtc_counter(r);
++	delta = target - r->offset - (s64)div_u64(cnt, r->rate);
++	if (delta < 1)
++		delta = 1;
++
++	r->alarm = target;
++	writeq_relaxed(cnt + (u64)delta * r->rate, r->base + CNTP_CVAL_LO);
++	/* ENABLE with IT_MASK clear: comparator armed, interrupt unmasked. */
++	writel_relaxed(ARCH_TIMER_CTRL_ENABLE, r->base + CNTP_CTL);
++	r->armed = true;
++
++	spin_unlock_irqrestore(&r->lock, flags);
++	return 0;
++}
++
++static int arch_timer_rtc_alarm_irq_enable(struct device *dev, unsigned int on)
++{
++	struct arch_timer *at = dev_get_drvdata(dev);
++	struct arch_timer_rtc *r = at->rtc;
++	unsigned long flags;
++	u32 ctl;
++
++	spin_lock_irqsave(&r->lock, flags);
++	if (on) {
++		ctl = readl_relaxed(r->base + CNTP_CTL);
++		writel_relaxed(ctl & ~ARCH_TIMER_CTRL_IT_MASK, r->base + CNTP_CTL);
++	} else {
++		arch_timer_rtc_disarm(r);
++	}
++	spin_unlock_irqrestore(&r->lock, flags);
++	return 0;
++}
++
++static const struct rtc_class_ops arch_timer_rtc_ops = {
++	.read_time		= arch_timer_rtc_read_time,
++	.set_time		= arch_timer_rtc_set_time,
++	.read_alarm		= arch_timer_rtc_read_alarm,
++	.set_alarm		= arch_timer_rtc_set_alarm,
++	.alarm_irq_enable	= arch_timer_rtc_alarm_irq_enable,
++};
++
++static irqreturn_t arch_timer_rtc_isr(int irq, void *dev_id)
++{
++	struct arch_timer_rtc *r = dev_id;
++	unsigned long flags;
++	u32 ctl;
++
++	spin_lock_irqsave(&r->lock, flags);
++	ctl = readl_relaxed(r->base + CNTP_CTL);
++	if (!(ctl & ARCH_TIMER_CTRL_IT_STAT)) {
++		spin_unlock_irqrestore(&r->lock, flags);
++		return IRQ_NONE;
++	}
++	arch_timer_rtc_disarm(r);
++	spin_unlock_irqrestore(&r->lock, flags);
++
++	rtc_update_irq(r->rtc, 1, RTC_AF | RTC_IRQF);
++	return IRQ_HANDLED;
++}
++
++/*
++ * Registration is deferred to late_initcall for one reason: this driver probes
++ * at ~0.30 s and rtc-pm8xxx at ~0.35 s, so registering from probe takes rtc0 and
++ * pushes the platform RTC to rtc1. CONFIG_RTC_HCTOSYS_DEVICE and
++ * RTC_SYSTOHC_DEVICE name "rtc0", so that would point boot-time clock reads and
++ * NTP writeback at this counter instead of the PMIC, leaving the PMIC's UEFI
++ * offset stale and bringing back the boot-at-epoch behaviour.
++ */
++static struct arch_timer *rtc_alarm_at;
++static struct platform_device *rtc_alarm_pdev;
++static int rtc_alarm_irq;
++
++static void arch_timer_mmio_rtc_note(struct platform_device *pdev,
++				     struct arch_timer_mem_frame *frame)
++{
++	struct arch_timer *at = platform_get_drvdata(pdev);
++
++	/*
++	 * Off unless asked for. Every arm,armv7-timer-mem platform reaches
++	 * here -- sc8280xp included -- and boards whose platform RTC has a
++	 * working alarm must not have a second one appear and be picked up by
++	 * alarmtimer instead.
++	 */
++	if (!rtc_alarm)
++		return;
++
++	/*
++	 * Only when the clockevent took the virtual timer. Otherwise the
++	 * physical one is in use and there is nothing spare in this frame.
++	 */
++	if (at->access != VIRT_ACCESS || frame->phys_irq <= 0)
++		return;
++
++	rtc_alarm_at   = at;
++	rtc_alarm_pdev = pdev;
++	rtc_alarm_irq  = frame->phys_irq;
++}
++
++static int __init arch_timer_mmio_rtc_init(void)
++{
++	struct platform_device *pdev = rtc_alarm_pdev;
++	struct arch_timer *at = rtc_alarm_at;
++	struct arch_timer_rtc *r;
++	int ret;
++
++	if (!at)
++		return 0;
++
++	r = devm_kzalloc(&pdev->dev, sizeof(*r), GFP_KERNEL);
++	if (!r)
++		return 0;
++
++	r->base = at->base;
++	r->rate = at->rate;
++	r->irq  = rtc_alarm_irq;
++	spin_lock_init(&r->lock);
++	at->rtc = r;
++
++	/* Leave the comparator off until something arms it. */
++	writel_relaxed(0, r->base + CNTP_CTL);
++
++	r->rtc = devm_rtc_allocate_device(&pdev->dev);
++	if (IS_ERR(r->rtc)) {
++		dev_warn(&pdev->dev, "no RTC alarm: allocate: %ld\n",
++			 PTR_ERR(r->rtc));
++		at->rtc = NULL;
++		return 0;
++	}
++
++	r->rtc->ops = &arch_timer_rtc_ops;
++	r->rtc->range_min = 0;
++	r->rtc->range_max = U32_MAX;
++
++	/*
++	 * Before registering, not after: rtc_does_wakealarm() gates the
++	 * wakealarm sysfs attribute on device_can_wakeup(parent), and
++	 * alarmtimer_rtc_add_device() -- which runs from the rtc class
++	 * interface during registration -- rejects the device outright unless
++	 * device_may_wakeup(parent) is already true.
++	 */
++	device_init_wakeup(&pdev->dev, true);
++
++	ret = devm_rtc_register_device(r->rtc);
++	if (ret) {
++		dev_warn(&pdev->dev, "no RTC alarm: register: %d\n", ret);
++		at->rtc = NULL;
++		return 0;
++	}
++
++	/*
++	 * Only now: the handler dereferences r->rtc, and a spurious level irq
++	 * before the device exists would take a NULL pointer.
++	 */
++	ret = devm_request_irq(&pdev->dev, r->irq, arch_timer_rtc_isr, 0,
++			       "arch_mem_timer_rtc", r);
++	if (ret) {
++		dev_warn(&pdev->dev, "no RTC alarm: irq %d: %d\n", r->irq, ret);
++		at->rtc = NULL;
++		return 0;
++	}
++
++	ret = dev_pm_set_wake_irq(&pdev->dev, r->irq);
++	if (ret)
++		dev_warn(&pdev->dev, "RTC alarm will not wake: %d\n", ret);
++
++	dev_info(&pdev->dev, "RTC alarm on the physical timer, irq %d\n",
++		 r->irq);
++	return 0;
++}
++late_initcall(arch_timer_mmio_rtc_init);
++
+ static int arch_timer_mmio_frame_register(struct platform_device *pdev,
+ 					  struct arch_timer_mem_frame *frame)
+ {
+@@ -320,6 +620,9 @@
+ 
+ 	/* Afer this point, we're not allowed to fail anymore */
+ 	arch_timer_mmio_setup(at, irq);
++
++	/* local: best-effort, never fails the probe; registers at late_initcall */
++	arch_timer_mmio_rtc_note(pdev, frame);
+ 	return 0;
+ }
+ 

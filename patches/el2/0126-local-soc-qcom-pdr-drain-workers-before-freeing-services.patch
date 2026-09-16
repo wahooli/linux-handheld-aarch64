@@ -1,0 +1,67 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] soc: qcom: pdr: disable workers before releasing service records
+
+pdr_handle_release() frees the service list before joining indack_work.
+That worker retains ind->pds while invoking the client and acknowledging
+the indication. Incoming QMI callbacks can also retain the pointer or queue
+more work until their handles are released.
+
+Disable and join all consumers while the records and QMI handles remain
+valid. Unlike cancellation, disabling rejects further queue attempts by
+racing QMI callbacks. Then release the QMI handles to join those producers,
+destroy the queues, and free pending indications and service records.
+
+This addresses a concrete teardown lifetime race reached during GLINK
+replacement. Its role in the intermittent EL2 reset is not yet confirmed.
+
+---
+--- a/drivers/soc/qcom/pdr_interface.c
++++ b/drivers/soc/qcom/pdr_interface.c
+@@ -711,26 +711,35 @@
+ void pdr_handle_release(struct pdr_handle *pdr)
+ {
+ 	struct pdr_service *pds, *tmp;
++	struct pdr_list_node *ind, *ind_tmp;
+ 
+ 	if (IS_ERR_OR_NULL(pdr))
+ 		return;
+ 
+-	mutex_lock(&pdr->list_lock);
++	/*
++	 * Stop consumers while their QMI handles and service records are live.
++	 * Disabling, rather than cancelling, also rejects work queued by QMI
++	 * callbacks racing with teardown.
++	 */
++	disable_work_sync(&pdr->locator_work);
++	disable_work_sync(&pdr->notifier_work);
++	disable_work_sync(&pdr->indack_work);
++
++	/* Join incoming callbacks before freeing the records they reference. */
++	qmi_handle_release(&pdr->locator_hdl);
++	qmi_handle_release(&pdr->notifier_hdl);
++
++	destroy_workqueue(pdr->notifier_wq);
++	destroy_workqueue(pdr->indack_wq);
++
++	list_for_each_entry_safe(ind, ind_tmp, &pdr->indack_list, node) {
++		list_del(&ind->node);
++		kfree(ind);
++	}
+ 	list_for_each_entry_safe(pds, tmp, &pdr->lookups, node) {
+ 		list_del(&pds->node);
+ 		kfree(pds);
+ 	}
+-	mutex_unlock(&pdr->list_lock);
+-
+-	cancel_work_sync(&pdr->locator_work);
+-	cancel_work_sync(&pdr->notifier_work);
+-	cancel_work_sync(&pdr->indack_work);
+-
+-	destroy_workqueue(pdr->notifier_wq);
+-	destroy_workqueue(pdr->indack_wq);
+-
+-	qmi_handle_release(&pdr->locator_hdl);
+-	qmi_handle_release(&pdr->notifier_hdl);
+ 
+ 	kfree(pdr);
+ }

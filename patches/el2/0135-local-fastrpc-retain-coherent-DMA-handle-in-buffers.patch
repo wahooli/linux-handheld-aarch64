@@ -1,0 +1,108 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] misc: fastrpc: retain the coherent DMA handle in buffers
+
+The channel remote_heap retains a buffer allocated by a file's user, but
+does not retain that user. On later channel removal fastrpc_buf_free()
+dereferences buf->fl->cctx to strip SID bits. Exported DMA buffers can
+likewise outlive the originating file, including subsequent mmap calls.
+
+Store the original dma_alloc_coherent handle in the buffer and use it
+for dma_free_coherent, dma_get_sgtable and dma_mmap_coherent. Keep the
+SID-encoded dma_addr used by DSP commands separate. Remove the now-
+unneeded raw user pointer.
+
+This closes a source-level lifetime hazard. It is not established that
+attempt 0x8f had a remote heap or that this explains its reset. It does
+not address all FastRPC channel/user teardown races.
+---
+--- a/drivers/misc/fastrpc.c
++++ b/drivers/misc/fastrpc.c
+@@ -190,11 +190,11 @@
+ };
+ 
+ struct fastrpc_buf {
+-	struct fastrpc_user *fl;
+ 	struct dma_buf *dmabuf;
+ 	struct device *dev;
+ 	void *virt;
+ 	dma_addr_t dma_addr;
++	dma_addr_t dma_handle; /* Original coherent allocation, without DSP SID. */
+ 	u64 size;
+ 	/* Lock for dma buf attachments */
+ 	struct mutex lock;
+@@ -423,12 +423,12 @@
+ static void fastrpc_buf_free(struct fastrpc_buf *buf)
+ {
+ 	dma_free_coherent(buf->dev, buf->size, buf->virt,
+-			  fastrpc_ipa_to_dma_addr(buf->fl->cctx, buf->dma_addr));
++			  buf->dma_handle);
+ 	kfree(buf);
+ }
+ 
+-static int __fastrpc_buf_alloc(struct fastrpc_user *fl, struct device *dev,
+-			     u64 size, struct fastrpc_buf **obuf)
++static int __fastrpc_buf_alloc(struct device *dev,
++			       u64 size, struct fastrpc_buf **obuf)
+ {
+ 	struct fastrpc_buf *buf;
+ 
+@@ -440,14 +440,13 @@
+ 	INIT_LIST_HEAD(&buf->node);
+ 	mutex_init(&buf->lock);
+ 
+-	buf->fl = fl;
+ 	buf->virt = NULL;
+ 	buf->dma_addr = 0;
+ 	buf->size = size;
+ 	buf->dev = dev;
+ 	buf->raddr = 0;
+ 
+-	buf->virt = dma_alloc_coherent(dev, buf->size, &buf->dma_addr,
++	buf->virt = dma_alloc_coherent(dev, buf->size, &buf->dma_handle,
+ 				       GFP_KERNEL);
+ 	if (!buf->virt) {
+ 		mutex_destroy(&buf->lock);
+@@ -455,6 +454,7 @@
+ 		return -ENOMEM;
+ 	}
+ 
++	buf->dma_addr = buf->dma_handle;
+ 	*obuf = buf;
+ 
+ 	return 0;
+@@ -466,7 +466,7 @@
+ 	int ret;
+ 	struct fastrpc_buf *buf;
+ 
+-	ret = __fastrpc_buf_alloc(fl, dev, size, obuf);
++	ret = __fastrpc_buf_alloc(dev, size, obuf);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -483,7 +483,7 @@
+ {
+ 	struct device *rdev = &fl->cctx->rpdev->dev;
+ 
+-	return  __fastrpc_buf_alloc(fl, rdev, size, obuf);
++	return  __fastrpc_buf_alloc(rdev, size, obuf);
+ }
+ 
+ static void fastrpc_channel_ctx_free(struct kref *ref)
+@@ -764,7 +764,7 @@
+ 		return -ENOMEM;
+ 
+ 	ret = dma_get_sgtable(buffer->dev, &a->sgt, buffer->virt,
+-			      fastrpc_ipa_to_dma_addr(buffer->fl->cctx, buffer->dma_addr),
++			      buffer->dma_handle,
+ 			      buffer->size);
+ 	if (ret < 0) {
+ 		dev_err(buffer->dev, "failed to get scatterlist from DMA API\n");
+@@ -814,7 +814,7 @@
+ 	dma_resv_assert_held(dmabuf->resv);
+ 
+ 	return dma_mmap_coherent(buf->dev, vma, buf->virt,
+-				 fastrpc_ipa_to_dma_addr(buf->fl->cctx, buf->dma_addr), size);
++				 buf->dma_handle, size);
+ }
+ 
+ static const struct dma_buf_ops fastrpc_dma_buf_ops = {

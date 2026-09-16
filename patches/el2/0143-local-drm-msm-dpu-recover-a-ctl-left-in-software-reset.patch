@@ -1,0 +1,99 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] drm/msm/dpu: recover a CTL left in software reset
+
+The blue screen on this machine is one line:
+
+  [dpu error]enc42 intf5 ctl 1 reset failure: -22
+  [dpu error]vblank timeout: 208c0
+  [dpu error]wait for commit done returned -110
+  [dpu error]enc42 frame done timeout
+
+then drm_fb_helper_damage_work spinning on drm_crtc_wait_one_vblank
+forever. dpu_hw_ctl_wait_reset_status() found CTL_SW_RESET bit 0 set,
+polled 2 ms, and gave up; dpu_encoder_helper_phys_cleanup() then ran and
+the pipeline never produced another vblank.
+
+It is not a hibernate bug. It reproduces on a plain cold boot, at the
+first kickoff after dpu_kms_hw_init with no earlier DPU error of any
+kind, and on the resume path it fires in the same place with the same
+ctl. Counted over six boots: two failing boots had it (one cold, one
+resumed), four clean boots had none.
+
+Two things can leave the bit set and only one is visible today. Either
+the ctl was handed over already in reset -- nothing in this driver has
+written CTL_SW_RESET at that point on a cold boot -- or a reset this
+driver issued never completed. Log the raw word at dpu_hw_ctl_init(),
+where the value can only have come from outside the driver, and stay
+silent when it is clear so a healthy boot says nothing.
+
+On the failure path print the raw block words before touching anything:
+all-ones across SW_RESET/TOP/FLUSH/START means the ctl is not clocked,
+which is a different defect from a genuinely latched reset and must not
+be read as one. Then write the bit's own idle value back and re-read. If
+it clears, say so and continue rather than tearing the pipeline down.
+
+Bit 0 is self-clearing and MDP drops it ~30 us after the ctl path
+finishes resetting, so 2 ms without it clearing means nothing is driving
+it to completion; writing 0 restores the resting state rather than
+imposing a new one. If the write does not take, the old -EINVAL and the
+existing cleanup are unchanged, so a wedged block behaves as before.
+
+Repair here is deliberately at the point of failure and no earlier: it
+has to be able to report whether clearing the bit is what brings the
+panel back. Hardware verification is required, and a boot that simply
+does not reproduce proves nothing -- four of six did not.
+
+---
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.c
+@@ -454,12 +454,30 @@
+ 		return 0;
+ 
+ 	pr_debug("hw ctl reset is set for ctl:%d\n", ctx->idx);
+-	if (dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US)) {
+-		pr_err("hw recovery is not complete for ctl:%d\n", ctx->idx);
+-		return -EINVAL;
++	if (!dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US))
++		return 0;
++
++	/*
++	 * Bit 0 is self-clearing and MDP drops it ~30us after it finishes
++	 * resetting the ctl path, so 2 ms without it clearing means nothing is
++	 * driving the reset to completion. Print the raw words before touching
++	 * anything: all-ones across the block means it is not clocked at all,
++	 * which is a different bug from a genuinely latched reset.
++	 */
++	pr_err("ctl%d stuck in sw reset: SW_RESET=%#010x TOP=%#010x FLUSH=%#010x START=%#010x\n",
++	       ctx->idx, DPU_REG_READ(c, CTL_SW_RESET), DPU_REG_READ(c, CTL_TOP),
++	       DPU_REG_READ(c, CTL_FLUSH), DPU_REG_READ(c, CTL_START));
++
++	/* Writing the idle value back is the bit's own resting state. */
++	DPU_REG_WRITE(c, CTL_SW_RESET, 0x0);
++	status = DPU_REG_READ(c, CTL_SW_RESET) & 0x01;
++	if (!status) {
++		pr_warn("ctl%d sw reset cleared by hand; continuing\n", ctx->idx);
++		return 0;
+ 	}
+ 
+-	return 0;
++	pr_err("hw recovery is not complete for ctl:%d\n", ctx->idx);
++	return -EINVAL;
+ }
+ 
+ static void dpu_hw_ctl_clear_all_blendstages(struct dpu_hw_ctl *ctx)
+@@ -869,5 +887,15 @@
+ 	c->mixer_count = mixer_count;
+ 	c->mixer_hw_caps = mixer;
+ 
++	/*
++	 * Silent on a healthy boot. A value here says the ctl came up already
++	 * in reset -- nothing in this driver has written it yet -- which tells
++	 * a stale handover apart from a reset Linux itself later fails to
++	 * complete. Both have been seen to end in "ctl N reset failure: -22".
++	 */
++	if (DPU_REG_READ(&c->hw, CTL_SW_RESET) & 0x01)
++		drm_info(dev, "ctl%d: CTL_SW_RESET=%#010x at init\n",
++			 c->idx, DPU_REG_READ(&c->hw, CTL_SW_RESET));
++
+ 	return c;
+ }

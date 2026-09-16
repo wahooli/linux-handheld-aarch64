@@ -1,0 +1,130 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] soc: qcom: apr: synchronize service and port removal with callbacks
+
+Receive dispatch drops svcs_lock after looking up a service, then invokes
+its callback through the unprotected pointer. Removing the IDR entry does
+not wait for such a receiver. A service or dynamic GPR port can therefore
+be freed while its callback still runs.
+
+Use a per-router SRCU domain around receive dispatch. After withdrawing a
+service or port from the IDR, wait for prior receivers before returning to
+devres cleanup or freeing the port. Leave services available throughout
+the driver's remove callback, since child teardown can require DSP replies.
+Use the same synchronization for explicit callback withdrawal instead of
+flushing unrelated queued RX work. Initialize and destroy SRCU with the
+router; SRCU is already provided by the RCU configuration.
+
+Callers freeing ports or withdrawing callbacks must be in sleepable context
+outside receive callbacks. The current graph-close and probe/remove call
+sites meet this requirement. This fixes pointer lifetime, not arbitrary
+client-side synchronization during remove; hardware validation is pending.
+
+---
+--- a/drivers/soc/qcom/apr.c
++++ b/drivers/soc/qcom/apr.c
+@@ -6,6 +6,7 @@
+ #include <linux/module.h>
+ #include <linux/device.h>
+ #include <linux/spinlock.h>
++#include <linux/srcu.h>
+ #include <linux/idr.h>
+ #include <linux/slab.h>
+ #include <linux/workqueue.h>
+@@ -28,6 +29,7 @@
+ 	struct rpmsg_endpoint *ch;
+ 	struct device *dev;
+ 	spinlock_t svcs_lock;
++	struct srcu_struct svcs_srcu;
+ 	spinlock_t rx_lock;
+ 	struct idr svcs_idr;
+ 	int dest_domain_id;
+@@ -83,6 +85,8 @@
+ 	idr_remove(&gpr->svcs_idr, port->id);
+ 	spin_unlock_irqrestore(&gpr->svcs_lock, flags);
+ 
++	/* A receiver may have looked up this port before its removal. */
++	synchronize_srcu(&gpr->svcs_srcu);
+ 	kfree(port);
+ }
+ EXPORT_SYMBOL_GPL(gpr_free_port);
+@@ -270,7 +274,7 @@
+  * packet. Such a service calls this itself, once the state the callback reads
+  * is initialised and before it sends its first command.
+  *
+- * Withdrawing (@callback NULL) drains the RX workqueue, so no callback is
++ * Withdrawing (@callback NULL) waits for active receivers, so no callback is
+  * still running when the caller's state goes away. Call from probe/remove
+  * only, never from the RX workqueue itself.
+  */
+@@ -281,7 +285,7 @@
+ 	/* Pair with the acquire in gpr_do_rx_callback(). */
+ 	smp_store_release(&gdev->svc.callback, callback);
+ 	if (!callback)
+-		flush_workqueue(gpr->rxwq);
++		synchronize_srcu(&gpr->svcs_srcu);
+ }
+ EXPORT_SYMBOL_GPL(gpr_set_service_callback);
+ 
+@@ -345,9 +349,12 @@
+ 	struct packet_router *apr = container_of(work, struct packet_router, rx_work);
+ 	struct apr_rx_buf *abuf, *b;
+ 	unsigned long flags;
++	int idx;
+ 
+ 	if (!list_empty(&apr->rx_list)) {
+ 		list_for_each_entry_safe(abuf, b, &apr->rx_list, node) {
++			/* Protect service pointers through the callback invocation. */
++			idx = srcu_read_lock(&apr->svcs_srcu);
+ 			switch (apr->type) {
+ 			case PR_TYPE_APR:
+ 				apr_do_rx_callback(apr, abuf);
+@@ -358,6 +365,7 @@
+ 			default:
+ 				break;
+ 			}
++			srcu_read_unlock(&apr->svcs_srcu, idx);
+ 			spin_lock_irqsave(&apr->rx_lock, flags);
+ 			list_del(&abuf->node);
+ 			spin_unlock_irqrestore(&apr->rx_lock, flags);
+@@ -418,6 +426,8 @@
+ 	spin_lock(&apr->svcs_lock);
+ 	idr_remove(&apr->svcs_idr, adev->svc.id);
+ 	spin_unlock(&apr->svcs_lock);
++	/* Keep teardown replies working until remove has finished. */
++	synchronize_srcu(&apr->svcs_srcu);
+ }
+ 
+ static int apr_uevent(const struct device *dev, struct kobj_uevent_env *env)
+@@ -650,10 +660,14 @@
+ 	dev_set_drvdata(dev, apr);
+ 	apr->ch = rpdev->ept;
+ 	apr->dev = dev;
++	ret = init_srcu_struct(&apr->svcs_srcu);
++	if (ret)
++		return ret;
+ 	apr->rxwq = create_singlethread_workqueue("qcom_apr_rx");
+ 	if (!apr->rxwq) {
+ 		dev_err(apr->dev, "Failed to start Rx WQ\n");
+-		return -ENOMEM;
++		ret = -ENOMEM;
++		goto cleanup_srcu;
+ 	}
+ 	INIT_WORK(&apr->rx_work, apr_rxwq);
+ 
+@@ -681,6 +695,8 @@
+ 	pdr_handle_release(apr->pdr);
+ destroy_wq:
+ 	destroy_workqueue(apr->rxwq);
++cleanup_srcu:
++	cleanup_srcu_struct(&apr->svcs_srcu);
+ 	return ret;
+ }
+ 
+@@ -691,6 +707,7 @@
+ 	pdr_handle_release(apr->pdr);
+ 	device_for_each_child(&rpdev->dev, NULL, apr_remove_device);
+ 	destroy_workqueue(apr->rxwq);
++	cleanup_srcu_struct(&apr->svcs_srcu);
+ }
+ 
+ /*

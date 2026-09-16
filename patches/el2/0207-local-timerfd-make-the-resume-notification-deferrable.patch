@@ -1,0 +1,85 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: timerfd: make the resume notification deferrable
+
+Supersedes 0205, which did not work. See below.
+
+tick_unfreeze() calls timekeeping_resume() every time the s2idle freeze depth
+drops from num_online_cpus(), i.e. on every s2idle entry -- not just on a real
+resume. timekeeping_resume() calls timerfd_resume(), which was a bare
+schedule_work(). That wakes a kworker; a runnable kworker makes the next
+enter_s2idle() return immediately; that unfreezes again and re-queues the work.
+Self-sustaining at ~9800 cycles/s on x1e80100, measured by ftrace over the
+machine_suspend window, with timerfd_resume_work the only work function running
+and tick_freeze/tick_unfreeze landing in the same microsecond.
+
+Why 0205 (gating on inject_sleeptime) failed: on arm64 the current clocksource
+is arch_sys_counter, which carries CLOCK_SOURCE_SUSPEND_NONSTOP, so
+clocksource_stop_suspend_timing() returns the real elapsed time across the
+freeze -- ~100 us, but nonzero. inject_sleeptime is therefore true on every
+cycle and the guard never fires. Confirmed on the running kernel: the wakeup
+stacks still contain timerfd_resume, which is only reachable through that
+branch.
+
+Two other guards are also wrong, recorded so they are not retried:
+
+  - Gating on the mono->real offset changing. It genuinely changes every cycle:
+    __timekeeping_inject_sleeptime() calls tk_set_wall_to_mono(), moving
+    offs_real by the injected delta.
+  - Skipping timerfd_resume() on the s2idle path outright. A long s2idle is a
+    real suspend from userspace's point of view, and timerfds registered with
+    TFD_TIMER_CANCEL_ON_SET (systemd keeps one to detect clock changes, so
+    cancel_list is not empty in practice) must still learn that time jumped.
+
+The property actually wanted is not "do not notify" but "notify without waking
+an idle CPU", which is exactly what a deferrable timer provides: per
+include/linux/timer.h, TIMER_DEFERRABLE "will not cause a CPU to come out of
+idle just to service it; instead, the timer will be serviced when the CPU
+eventually wakes up with a subsequent non-deferrable timer."
+
+The delay must be nonzero -- queue_delayed_work_on() short-circuits delay == 0
+into __queue_work(), reintroducing the wakeup.
+
+Local patch: derived from this tree, mainline not checked for an existing fix.
+Nothing in the mechanism is X1E-specific.
+
+Not-signed-off-by: local build
+---
+ fs/timerfd.c | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+--- a/fs/timerfd.c
++++ b/fs/timerfd.c
+@@ -122,15 +122,31 @@
+ 	timerfd_clock_was_set();
+ }
+ 
+-static DECLARE_WORK(timerfd_work, timerfd_resume_work);
++static DECLARE_DEFERRABLE_WORK(timerfd_work, timerfd_resume_work);
+ 
+ /*
+  * Invoked from timekeeping_resume(). Defer the actual update to work so
+  * timerfd_clock_was_set() runs in task context.
++ *
++ * The work is deferrable, and never queued with delay 0, because
++ * tick_unfreeze() reaches timekeeping_resume() on *every* s2idle entry, not
++ * just on a real resume. An immediate schedule_work() there wakes a kworker;
++ * a runnable kworker makes the next enter_s2idle() return at once; that
++ * unfreezes again and re-queues the work. The loop sustains itself and the
++ * system never reaches system sleep.
++ *
++ * A deferrable timer never brings a CPU out of idle -- the notification is
++ * delivered on the next wakeup that was going to happen anyway. That is soon
++ * enough for a best-effort clock-was-set hint which is already deferred to a
++ * workqueue, and it keeps the notification for a genuinely long s2idle, which
++ * simply skipping the call on this path would lose.
++ *
++ * The delay must be nonzero: queue_delayed_work_on() short-circuits delay == 0
++ * into __queue_work(), which is precisely the wakeup being avoided.
+  */
+ void timerfd_resume(void)
+ {
+-	schedule_work(&timerfd_work);
++	schedule_delayed_work(&timerfd_work, 1);
+ }
+ 
+ static void __timerfd_remove_cancel(struct timerfd_ctx *ctx)
