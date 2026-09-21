@@ -47,9 +47,11 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  drivers/gpu/drm/msm/adreno/a6xx_gmu.c | 13 ++++++++++++-
  1 file changed, 12 insertions(+), 1 deletion(-)
 
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index c8bc477ab..e0281c67c 100644
 --- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
 +++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
-@@ -657,7 +657,18 @@
+@@ -657,7 +657,18 @@ static void a6xx_rpmh_stop(struct a6xx_gmu *gmu)
  
  	gmu_write(gmu, REG_A6XX_GMU_RSCC_CONTROL_REQ, 0);
  

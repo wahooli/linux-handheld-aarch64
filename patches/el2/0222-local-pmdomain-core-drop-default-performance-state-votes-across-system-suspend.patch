@@ -1,0 +1,121 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: pmdomain: core: drop default performance-state votes across system suspend
+
+genpd applies a device's "required-opps" as its default performance state at
+attach time. That vote is dropped by genpd_runtime_suspend() and restored by
+genpd_runtime_resume(), but genpd_finish_suspend() does not touch it, so a
+device that is never runtime-suspended keeps voting its full operating corner
+on the parent rail for the whole of a system suspend.
+
+On the Lenovo Yoga Slim 7x (X1E-80-100) that is five devices: the three dwc3
+controllers and both PCIe root complexes, each carrying
+required-opps = <&rpmhpd_opp_nom>, all with runtime_status=active for the life
+of the boot. Tracing rpmh:rpmh_send_msg across an s2idle shows the consequence
+directly: cx.lvl is written exactly once at boot, to index 5 (vlvl 256,
+NOMINAL), and never again -- not in the suspend path, not in the sleep set. The
+CX rail sits at NOMINAL through every suspend while the devices that asked for
+it have their rails and clocks off. pcie-qcom drops its OPP in suspend_noirq on
+the operating-points-v2 path; the required-opps path gets nothing.
+
+Drop the vote in the noirq suspend phase, where runtime PM would have dropped
+it, and restore it in the noirq resume phase before the domain is powered
+back on -- the same ordering as genpd_runtime_resume(). rpmhpd floors an
+enabled domain at its enable corner, so on this machine CX goes from 256 to
+16 (RETENTION) while its child GDSCs still hold it on.
+
+Off by default. pmdomain.drop_pstate_on_suspend=1 on the kernel command line
+enables it for a boot; /sys/module/pmdomain/parameters/drop_pstate_on_suspend
+and /sys/kernel/debug/pm_genpd/drop_pstate_on_suspend switch it at runtime,
+effective from the next suspend, so one build gives both A/B arms. The module
+parameter carries an explicit "pmdomain." prefix because the file's
+KBUILD_MODNAME is "core".
+
+--- a/include/linux/pm_domain.h
++++ b/include/linux/pm_domain.h
+@@ -292,6 +292,7 @@
+ 	unsigned int performance_state;
+ 	unsigned int default_pstate;
+ 	unsigned int rpm_pstate;
++	unsigned int sys_pstate;
+ 	unsigned int opp_token;
+ 	bool hw_mode;
+ 	bool rpm_always_on;
+--- a/drivers/pmdomain/core.c
++++ b/drivers/pmdomain/core.c
+@@ -23,6 +23,7 @@
+ #include <linux/export.h>
+ #include <linux/cpu.h>
+ #include <linux/debugfs.h>
++#include <linux/moduleparam.h>
+ 
+ /* Provides a unique ID for each genpd device */
+ static DEFINE_IDA(genpd_ida);
+@@ -276,6 +277,25 @@
+ 	smp_mb__after_atomic();
+ }
+ 
++/*
++ * A device's default performance state (its "required-opps") is dropped when it
++ * runtime-suspends and restored when it runtime-resumes, but nothing touches it
++ * across system suspend. A device that is never runtime-suspended therefore
++ * keeps voting its full operating corner on the parent rail through the whole
++ * suspend. Drop those votes in the noirq suspend phase, mirroring the runtime PM
++ * behaviour, and restore them on resume. Off unless pmdomain.drop_pstate_on_suspend=1
++ * is on the command line; /sys/module/pmdomain/parameters/ and
++ * /sys/kernel/debug/pm_genpd/drop_pstate_on_suspend switch it at runtime, from
++ * the next suspend on. The prefix override keeps it off KBUILD_MODNAME "core".
++ */
++static bool genpd_drop_pstate_on_suspend;
++
++#undef MODULE_PARAM_PREFIX
++#define MODULE_PARAM_PREFIX "pmdomain."
++module_param_named(drop_pstate_on_suspend, genpd_drop_pstate_on_suspend, bool, 0644);
++MODULE_PARM_DESC(drop_pstate_on_suspend,
++		 "Drop default performance-state votes across system suspend (default 0)");
++
+ #ifdef CONFIG_DEBUG_FS
+ static struct dentry *genpd_debugfs_dir;
+ 
+@@ -1542,6 +1562,7 @@
+ 				int (*suspend_noirq)(struct device *dev),
+ 				int (*resume_noirq)(struct device *dev))
+ {
++	struct generic_pm_domain_data *gpd_data = dev_gpd_data(dev);
+ 	struct generic_pm_domain *genpd;
+ 	int ret = 0;
+ 
+@@ -1567,6 +1588,8 @@
+ 	}
+ 
+ 	genpd_lock(genpd);
++	if (genpd_drop_pstate_on_suspend)
++		gpd_data->sys_pstate = genpd_drop_performance_state(dev);
+ 	genpd->suspended_count++;
+ 	genpd_sync_power_off(genpd, true, 0);
+ 	genpd_unlock(genpd);
+@@ -1600,6 +1623,7 @@
+ static int genpd_finish_resume(struct device *dev,
+ 			       int (*resume_noirq)(struct device *dev))
+ {
++	struct generic_pm_domain_data *gpd_data = dev_gpd_data(dev);
+ 	struct generic_pm_domain *genpd;
+ 	int ret;
+ 
+@@ -1614,6 +1638,8 @@
+ 		return resume_noirq(dev);
+ 
+ 	genpd_lock(genpd);
++	genpd_restore_performance_state(dev, gpd_data->sys_pstate);
++	gpd_data->sys_pstate = 0;
+ 	genpd_sync_power_on(genpd, true, 0);
+ 	genpd->suspended_count--;
+ 	genpd_unlock(genpd);
+@@ -4144,6 +4170,8 @@
+ 
+ 	debugfs_create_file("pm_genpd_summary", S_IRUGO, genpd_debugfs_dir,
+ 			    NULL, &summary_fops);
++	debugfs_create_bool("drop_pstate_on_suspend", 0644, genpd_debugfs_dir,
++			    &genpd_drop_pstate_on_suspend);
+ 
+ 	list_for_each_entry(genpd, &gpd_list, gpd_list_node)
+ 		genpd_debug_add(genpd);

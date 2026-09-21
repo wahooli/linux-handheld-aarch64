@@ -1,8 +1,8 @@
 From 6b2d94f7a0c85e13d47fa26b9c0e83517d2af4b9 Mon Sep 17 00:00:00 2001
 From: Waltteri Hooli <wahooli@localhost>
 Date: Tue, 9 Sep 2026 17:30:00 +0300
-Subject: [PATCH 57/57] local: PCI: dwc/qcom: force the RC teardown at hibernate
- freeze (default off)
+Subject: [PATCH 57/57] local: PCI: dwc/qcom: force the RC teardown across system
+ sleep
 
 Fix candidate, not instrumentation. Default off; opt in on the kernel command
 line for one run.
@@ -57,34 +57,39 @@ restore walked pcie4's whole subtree and beyond before stopping elsewhere.
 This is that idea alone, defaulting off.
 
 Expected reading if it works: the device crumb stops naming 1c08000.pci.
----
- drivers/pci/controller/dwc/pcie-designware.h | 1 +
- drivers/pci/controller/dwc/pcie-designware-host.c | 9 ++++++++-
- drivers/pci/controller/dwc/pcie-qcom.c | 46 ++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 55 insertions(+), 1 deletions(-)
 
---- a/drivers/pci/controller/dwc/pcie-designware.h
-+++ b/drivers/pci/controller/dwc/pcie-designware.h
-@@ -468,12 +468,13 @@
- 	struct pci_eq_presets	presets;
- 	struct pci_config_window *cfg;
- 	bool			ecam_enabled;
- 	bool			native_ecam;
- 	bool                    skip_l23_ready;
- 	bool			skip_pwrctrl_off;
-+	bool			hib_force_teardown;
- };
- 
- struct dw_pcie_ep_ops {
- 	void	(*pre_init)(struct dw_pcie_ep *ep);
- 	void	(*init)(struct dw_pcie_ep *ep);
- 	int	(*raise_irq)(struct dw_pcie_ep *ep, u8 func_no,
+Folded in from the former 0225 ("PCI: qcom: tear the RC down for
+suspend-to-idle"), 2026-09-21 -- the same teardown, for the other sleep state.
+
+Both root complexes on the Lenovo Yoga Slim 7x (X1E-80-100) stay fully up
+through every s2idle: the suspend_noirq callbacks take under a millisecond, no
+link comes up again on resume, and the sleep set shows their GDSCs, PHY clkrefs
+and XO aux clocks holding CX and XO for the whole suspend. dw_pcie_suspend_noirq()
+only tears the RC down when pci_host_common_d3cold_possible() agrees, and on
+this machine it does not: both endpoints reach D3hot, but both root ports stay
+in D0 and are skipped by the PCI core, even though pcie-qcom already sets
+broken_l1ss_resume so nvme takes its shutdown path and ath12k powers its
+firmware down in suspend_late.
+
+Add s2idle_force_teardown, the suspend-to-idle counterpart of
+hib_force_teardown above: the RC is torn down at suspend_noirq regardless of
+the walk, and dw_pcie_resume_noirq() re-initialises it before any endpoint
+resumes, exactly as every hibernate freeze/thaw already does on this machine.
+
+Measured, same boot, 15 min each, single variable: 1086 mW with the RCs kept up,
+593 mW with them down. Default on, unlike the hibernate knob. The parameter
+stays writable so the A/B can be repeated without a rebuild.
+---
+ .../pci/controller/dwc/pcie-designware-host.c    |  9 ++-
+ drivers/pci/controller/dwc/pcie-designware.h     |  1 +
+ drivers/pci/controller/dwc/pcie-qcom.c           | 71 ++++++++++++++++++++
+ 3 files changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/pci/controller/dwc/pcie-designware-host.c b/drivers/pci/controller/dwc/pcie-designware-host.c
+index 06722259d..f803850af 100644
 --- a/drivers/pci/controller/dwc/pcie-designware-host.c
 +++ b/drivers/pci/controller/dwc/pcie-designware-host.c
-@@ -1243,13 +1243,20 @@
- 	int ret = 0;
- 	u32 val;
- 
+@@ -1229,7 +1229,14 @@ int dw_pcie_suspend_noirq(struct dw_pcie *pci)
  	if (!dw_pcie_link_up(pci))
  		goto stop_link;
  
@@ -100,15 +105,65 @@ Expected reading if it works: the device crumb stops naming 1c08000.pci.
  		return 0;
  
  	if (pci->pp.ops->pme_turn_off) {
- 		pci->pp.ops->pme_turn_off(&pci->pp);
- 	} else {
- 		ret = dw_pcie_pme_turn_off(pci);
+diff --git a/drivers/pci/controller/dwc/pcie-designware.h b/drivers/pci/controller/dwc/pcie-designware.h
+index 1d2139474..7cb2a7f31 100644
+--- a/drivers/pci/controller/dwc/pcie-designware.h
++++ b/drivers/pci/controller/dwc/pcie-designware.h
+@@ -471,6 +471,7 @@ struct dw_pcie_rp {
+ 	bool			native_ecam;
+ 	bool                    skip_l23_ready;
+ 	bool			skip_pwrctrl_off;
++	bool			hib_force_teardown;
+ };
+ 
+ struct dw_pcie_ep_ops {
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c b/drivers/pci/controller/dwc/pcie-qcom.c
+index d62cf302d..ed1fd45c8 100644
 --- a/drivers/pci/controller/dwc/pcie-qcom.c
 +++ b/drivers/pci/controller/dwc/pcie-qcom.c
-@@ -2336,14 +2336,60 @@
- DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x0106, qcom_fixup_class);
- DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x0107, qcom_fixup_class);
- DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x0302, qcom_fixup_class);
+@@ -2193,16 +2193,41 @@ static int qcom_pcie_probe(struct platform_device *pdev)
+ 	return ret;
+ }
+ 
++/*
++ * s2idle_force_teardown: tear the RC down for suspend-to-idle as well, the way
++ * hib_force_teardown does for the hibernate freeze. Every endpoint here is
++ * already told to expect context loss (broken_l1ss_resume), nvme takes its
++ * shutdown path and ath12k powers its firmware down, yet the D3cold walk keeps
++ * refusing -- the root ports themselves stay in D0 -- and both RCs stay up with
++ * their GDSCs, PHYs and XO aux clocks on for the whole suspend, the last thing
++ * holding CX and XO. Measured on the Yoga Slim 7x: 1086 mW -> 593 mW in s2idle
++ * with the RCs down, same boot, single variable. Default on; runtime
++ * switchable:
++ *
++ *	echo 0 > /sys/module/pcie_qcom/parameters/s2idle_force_teardown
++ */
++static bool s2idle_force_teardown = true;
++module_param(s2idle_force_teardown, bool, 0644);
++MODULE_PARM_DESC(s2idle_force_teardown,
++		 "s2idle: tear the RC down at suspend even when the D3cold walk refuses (default 1)");
++
+ static int qcom_pcie_suspend_noirq(struct device *dev)
+ {
+ 	struct qcom_pcie *pcie;
++	bool force;
+ 	int ret = 0;
+ 
+ 	pcie = dev_get_drvdata(dev);
+ 	if (!pcie)
+ 		return 0;
+ 
++	force = s2idle_force_teardown &&
++		pm_suspend_target_state == PM_SUSPEND_TO_IDLE;
++	if (force)
++		pcie->pci->pp.hib_force_teardown = true;
+ 	ret = dw_pcie_suspend_noirq(pcie->pci);
++	if (force)
++		pcie->pci->pp.hib_force_teardown = false;
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2361,8 +2386,54 @@ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x0302, qcom_fixup_class);
  DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x1000, qcom_fixup_class);
  DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x1001, qcom_fixup_class);
  
@@ -163,6 +218,3 @@ Expected reading if it works: the device crumb stops naming 1c08000.pci.
  };
  
  static struct platform_driver qcom_pcie_driver = {
- 	.probe = qcom_pcie_probe,
- 	.driver = {
- 		.name = "qcom-pcie",

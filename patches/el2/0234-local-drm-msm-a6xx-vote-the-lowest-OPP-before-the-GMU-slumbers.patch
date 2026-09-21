@@ -1,0 +1,92 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: drm/msm/a6xx: vote the lowest OPP before the GMU slumbers
+
+With GMU bandwidth voting (info->bcms; x1e80100's X1-85 included) the GPU's GX
+corner and DDR bandwidth are voted by the GMU firmware from the GX_BW_PERF_VOTE
+it was last given, straight to RPMh, invisible to the Linux interconnect
+framework. Measured -- the GMU vote has no readback -- that vote survives
+slumber: the prepare-slumber HFI carries bw=0/freq=0 under a TODO and lowers
+nothing, and the dev_pm_opp_set_opp(dev, NULL) in a6xx_gmu_stop() drops only
+the interconnect vote, which this path does not use. So the DCVS level the GPU
+is at when the GMU goes down is what RPMh aggregates for as long as it stays
+down.
+
+The devfreq idle clamp (msm_devfreq_idle_work() voting the lowest OPP before
+the 66 ms autosuspend fires) would hide this, but a6xx_gpu_init() enables
+gpu_clamp_to_idle only on a618 and 7c3 "where this is known not to cause power
+supply issues". On every other GMU part each runtime suspend slumbers from the
+working level -- on a live desktop that is 687 MHz several times a second -- and
+system suspend does the same, from whatever level the compositor had.
+
+On the Lenovo Yoga Slim 7x (X1E-78-100, X1-85) s2idle never reaches the RPMh
+sleep set, so the standing ACTIVE votes set the DDR frequency for the whole
+suspend (same shape as 0231 for icc-bwmon). The GPU's was the largest, and it
+was in the "idle" floor too, because the last runtime suspend before the lid
+closed had left the working-level vote behind:
+
+  idle desktop at lid close                 -> s2idle  590 mW   before
+  browser video playing at lid close        ->        1324 mW   (lab, 15 min)
+  same, real use, 4 h 54 min                ->        1972 mW   (9.7 of 57 Wh)
+  video still playing on another workspace  ->        1406 mW
+  idle desktop at lid close, this patch     ->         152 mW   (15 min, 11 % charge)
+
+Vote the lowest OPP through the GMU in a6xx_gmu_shutdown(), after the GMU is
+confirmed idle and before the bus halt and the slumber request. This is the
+clamp, applied at the one point every slumber passes through, without changing
+the frequency the GPU runs at while awake. The hung path still goes to
+force_off untouched, and a6xx_gmu_set_freq() is a no-op when the GMU already
+sits at the floor. A dev_dbg records the level it came from; it fires on most
+runtime suspends of a live desktop, so it is dynamic-debug only:
+
+  echo 'file a6xx_gmu.c +p' > /sys/kernel/debug/dynamic_debug/control
+  slumber from 687 MHz: voting 300 MHz first
+
+Resume is unaffected: a6xx_gmu_set_initial_freq() brings the GPU up at the
+level recorded here and devfreq re-evaluates from the GMU's own frequency
+(a6xx_gmu_get_freq) on its next sample.
+---
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -1203,6 +1203,33 @@
+ 	dev_pm_opp_put(gpu_opp);
+ }
+ 
++/*
++ * The GMU keeps its last GX_BW_PERF_VOTE across slumber: prepare-slumber carries
++ * no fallback level, and the dev_pm_opp_set_opp(NULL) in a6xx_gmu_stop() only
++ * drops the Linux interconnect vote, which GMU bandwidth voting does not use. So
++ * the DDR bandwidth the GPU was at when it went down stays voted at RPMh until
++ * the GMU comes back -- through every runtime suspend, since the devfreq idle
++ * clamp is only enabled on a618/7c3, and through system suspend. Slumber from
++ * the floor instead. On x1e80100 this is ~440 mW of s2idle.
++ */
++static void a6xx_gmu_set_lowest_freq(struct msm_gpu *gpu, struct a6xx_gmu *gmu)
++{
++	struct dev_pm_opp *gpu_opp;
++	unsigned long freq = 0;
++
++	gpu_opp = dev_pm_opp_find_freq_ceil(&gpu->pdev->dev, &freq);
++	if (IS_ERR(gpu_opp))
++		return;
++
++	/* Fires on most runtime suspends of a live desktop; dynamic debug only. */
++	if (freq != gmu->freq)
++		dev_dbg(gmu->dev, "slumber from %lu MHz: voting %lu MHz first\n",
++			gmu->freq / 1000000, freq / 1000000);
++
++	a6xx_gmu_set_freq(gpu, gpu_opp, false);
++	dev_pm_opp_put(gpu_opp);
++}
++
+ static void a6xx_gmu_set_initial_bw(struct msm_gpu *gpu, struct a6xx_gmu *gmu)
+ {
+ 	struct dev_pm_opp *gpu_opp;
+@@ -1510,6 +1537,8 @@
+ 	if (ret)
+ 		goto force_off;
+ 
++	a6xx_gmu_set_lowest_freq(&adreno_gpu->base, gmu);
++
+ 	adreno_gpu->funcs->bus_halt(adreno_gpu, a6xx_gpu->hung);
+ 
+ 	/* tell the GMU we want to slumber */

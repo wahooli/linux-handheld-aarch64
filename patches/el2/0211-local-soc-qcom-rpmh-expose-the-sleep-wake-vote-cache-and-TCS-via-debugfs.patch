@@ -1,0 +1,201 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: soc: qcom: rpmh: expose the sleep/wake vote cache and
+ TCS via debugfs
+
+DIAGNOSTIC. Adds no behaviour, only two read-only files per RSC.
+
+On x1e80100, s2idle costs ~717 mW more after a hibernate cycle than before it on
+the same boot, and **every counter we have says the two suspends are identical**:
+cpu0 s2idle entries 154 vs 154, genpd system-domain entries 17 vs 16, all three
+cpufreq policies at 2188800, aosd/cxsd/ddr zero in both, ADSP sleeping slightly
+*more* after. A full device-state diff (runtime_status for 1041 devices, clocks,
+regulators, PCI power states, modules) came back byte-identical. The residue is
+in state Linux does not model. See docs.local/S2IDLE-DRAIN.md.
+
+The RPMh sleep/wake vote cache is the largest such blind spot, and it is exactly
+the state that decides whether the rails may collapse: rpmh_flush() programs
+ctrlr->cache into the SLEEP and WAKE TCSes, and a wrong vote there holds a rail
+up for the entire suspend while showing nothing in sysfs. aosd/cxsd/ddr have
+never gone nonzero on this machine in any run, which is consistent with a vote
+nobody can currently see.
+
+drivers/soc/qcom/rpmh-rsc.c has no debugfs at all, so there was no way to look.
+
+  /sys/kernel/debug/rpmh/<rsc>/cache   addr, sleep_val, wake_val, dirty flag
+  /sys/kernel/debug/rpmh/<rsc>/tcs     the SLEEP/WAKE TCS registers themselves
+
+Two files rather than one because they answer different questions: `cache` is
+what Linux intends, `tcs` is what the hardware was actually given. A mismatch
+means the flush did not happen or did not take, which is a different bug from a
+wrong vote.
+
+struct cache_req moves from rpmh.c to rpmh-internal.h so the RSC can walk the
+list; no other change to rpmh.c. The cache walk holds cache_lock. The TCS read
+deliberately does not take drv->lock -- it is a diagnostic, a torn read is
+acceptable, and those registers are written only by rpmh_flush().
+
+Intended use: diff the files across a hibernate.
+
+  # debugfs is 0700 root: the glob must be expanded by root, so `sudo sh -c`
+  # rather than `sudo cat .../*/...` (the shell expands that one too early).
+  sudo sh -c 'cat /sys/kernel/debug/rpmh/*/cache' > /tmp/cache.good
+  systemctl hibernate   # resume
+  sudo sh -c 'cat /sys/kernel/debug/rpmh/*/cache' > /tmp/cache.bad
+  diff -u /tmp/cache.good /tmp/cache.bad
+
+diff --git a/drivers/soc/qcom/rpmh-internal.h b/drivers/soc/qcom/rpmh-internal.h
+index e3cf1beff..d1b235052 100644
+--- a/drivers/soc/qcom/rpmh-internal.h
++++ b/drivers/soc/qcom/rpmh-internal.h
+@@ -77,6 +77,23 @@ struct rpmh_request {
+  * @dirty: was the cache updated since flush
+  * @batch_cache: Cache sleep and wake requests sent as batch
+  */
++/**
++ * struct cache_req: the request object for the cached sleep/wake votes
++ *
++ * @addr: the address of the resource
++ * @sleep_val: the sleep vote
++ * @wake_val: the wake vote
++ * @list: linked list obj
++ *
++ * Moved here from rpmh.c so rpmh-rsc.c can expose it read-only via debugfs.
++ */
++struct cache_req {
++	u32 addr;
++	u32 sleep_val;
++	u32 wake_val;
++	struct list_head list;
++};
++
+ struct rpmh_ctrlr {
+ 	struct list_head cache;
+ 	spinlock_t cache_lock;
+diff --git a/drivers/soc/qcom/rpmh-rsc.c b/drivers/soc/qcom/rpmh-rsc.c
+index 66928ca40..6f68e0ef3 100644
+--- a/drivers/soc/qcom/rpmh-rsc.c
++++ b/drivers/soc/qcom/rpmh-rsc.c
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/atomic.h>
+ #include <linux/cpu_pm.h>
++#include <linux/debugfs.h>
+ #include <linux/delay.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
+@@ -1041,6 +1042,88 @@ static int rpmh_probe_tcs_config(struct platform_device *pdev, struct rsc_drv *d
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_DEBUG_FS
++static struct dentry *rpmh_rsc_debugfs_root;
++
++/*
++ * The sleep/wake vote cache: what the AP asks RPMh to hold while it is asleep.
++ * rpmh_flush() programs exactly this into the SLEEP and WAKE TCSes, so a vote
++ * that is wrong here keeps a rail up for the whole suspend, and nothing in
++ * sysfs shows it. Diff this across a hibernate to catch a vote that did not
++ * survive: on x1e80100 s2idle costs ~717 mW more after a hibernate cycle with
++ * every other counter identical. See docs.local/S2IDLE-DRAIN.md.
++ */
++static int rpmh_cache_show(struct seq_file *s, void *unused)
++{
++	struct rsc_drv *drv = s->private;
++	struct rpmh_ctrlr *ctrlr = &drv->client;
++	struct cache_req *p;
++	unsigned long flags;
++
++	spin_lock_irqsave(&ctrlr->cache_lock, flags);
++	seq_printf(s, "dirty: %d\n", ctrlr->dirty);
++	seq_puts(s, "addr        sleep_val    wake_val\n");
++	list_for_each_entry(p, &ctrlr->cache, list)
++		seq_printf(s, "%#010x  %#010x   %#010x\n",
++			   p->addr, p->sleep_val, p->wake_val);
++	spin_unlock_irqrestore(&ctrlr->cache_lock, flags);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(rpmh_cache);
++
++/*
++ * The SLEEP and WAKE TCS registers themselves -- the hardware side of the cache
++ * above. Written only by rpmh_flush(), so a mismatch between the two means the
++ * flush did not happen or did not take. Read without the drv lock: this is a
++ * diagnostic, a torn read is acceptable, and taking the lock here would nest
++ * under seq_file's.
++ */
++static int rpmh_tcs_show(struct seq_file *s, void *unused)
++{
++	struct rsc_drv *drv = s->private;
++	const char *name[] = { "SLEEP", "WAKE" };
++	int type[] = { SLEEP_TCS, WAKE_TCS };
++	int i, j, k;
++
++	for (i = 0; i < ARRAY_SIZE(type); i++) {
++		struct tcs_group *tcs = &drv->tcs[type[i]];
++
++		seq_printf(s, "%s: num_tcs=%d ncpt=%d offset=%d\n",
++			   name[i], tcs->num_tcs, tcs->ncpt, tcs->offset);
++		for (j = 0; j < tcs->num_tcs; j++) {
++			int id = tcs->offset + j;
++
++			seq_printf(s, "  tcs%-2d enable=%#010x\n", id,
++				   read_tcs_reg(drv, drv->regs[RSC_DRV_CMD_ENABLE], id));
++			for (k = 0; k < tcs->ncpt; k++)
++				seq_printf(s, "    cmd%-2d msgid=%#010x addr=%#010x data=%#010x\n",
++					   k,
++					   read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_MSGID], id, k),
++					   read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_ADDR], id, k),
++					   read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_DATA], id, k));
++		}
++	}
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(rpmh_tcs);
++
++static void rpmh_rsc_debugfs_add(struct rsc_drv *drv)
++{
++	struct dentry *d;
++
++	if (!rpmh_rsc_debugfs_root)
++		rpmh_rsc_debugfs_root = debugfs_create_dir("rpmh", NULL);
++
++	d = debugfs_create_dir(drv->name, rpmh_rsc_debugfs_root);
++	debugfs_create_file("cache", 0444, d, drv, &rpmh_cache_fops);
++	debugfs_create_file("tcs", 0444, d, drv, &rpmh_tcs_fops);
++}
++#else
++static void rpmh_rsc_debugfs_add(struct rsc_drv *drv) { }
++#endif
++
+ static int rpmh_rsc_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *dn = pdev->dev.of_node;
+@@ -1143,6 +1226,8 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
+ 	dev_set_drvdata(&pdev->dev, drv);
+ 	drv->dev = &pdev->dev;
+ 
++	rpmh_rsc_debugfs_add(drv);
++
+ 	return devm_of_platform_populate(&pdev->dev);
+ }
+ 
+diff --git a/drivers/soc/qcom/rpmh.c b/drivers/soc/qcom/rpmh.c
+index ca37da3dc..ee60ab2b6 100644
+--- a/drivers/soc/qcom/rpmh.c
++++ b/drivers/soc/qcom/rpmh.c
+@@ -48,13 +48,6 @@
+  * @wake_val: the wake vote
+  * @list: linked list obj
+  */
+-struct cache_req {
+-	u32 addr;
+-	u32 sleep_val;
+-	u32 wake_val;
+-	struct list_head list;
+-};
+-
+ /**
+  * struct batch_cache_req - An entry in our batch catch
+  *

@@ -60,55 +60,12 @@ Also drops the SET_SYSTEM_SLEEP_PM_OPS() macro in favour of the six fields it
 expands to, since it assigns .restore as well.
 
 ---
---- a/drivers/media/platform/qcom/iris/iris_firmware.c
-+++ b/drivers/media/platform/qcom/iris/iris_firmware.c
-@@ -166,6 +166,32 @@
- 	return ret;
- }
- 
-+/*
-+ * Drop the firmware mapping without going near the video block.
-+ *
-+ * iris_fw_unload() is the normal counterpart to iris_fw_load(), but it starts
-+ * by resetting the XTSS through core->reg_base, and there is one caller that
-+ * must not: after a hibernation image is restored the block is already powered
-+ * down by the .freeze that preceded the snapshot, so that write would land on
-+ * an unpowered register. The IOMMU side still has to be undone -- the mapping
-+ * itself lives in normal memory and comes back with the image, so a later
-+ * iris_fw_load() would find IRIS_FW_START_ADDR already mapped.
-+ */
-+void iris_fw_unmap(struct iris_core *core)
-+{
-+	size_t unmapped;
-+
-+	if (!core->fw.mapped_mem_size)
-+		return;
-+
-+	unmapped = iommu_unmap(core->fw.iommu_domain, IRIS_FW_START_ADDR,
-+			       core->fw.mapped_mem_size);
-+	if (unmapped != core->fw.mapped_mem_size)
-+		dev_err(core->dev, "failed to unmap firmware in IOMMU\n");
-+
-+	core->fw.mapped_mem_size = 0;
-+}
-+
- int iris_fw_unload(struct iris_core *core)
- {
- 	int ret;
---- a/drivers/media/platform/qcom/iris/iris_firmware.h
-+++ b/drivers/media/platform/qcom/iris/iris_firmware.h
-@@ -10,6 +10,7 @@
- 
- int iris_fw_load(struct iris_core *core);
- int iris_fw_unload(struct iris_core *core);
-+void iris_fw_unmap(struct iris_core *core);
- int iris_set_hw_state(struct iris_core *core, bool resume);
- 
- int iris_fw_init(struct iris_core *core);
+diff --git a/drivers/media/platform/qcom/iris/iris_core.c b/drivers/media/platform/qcom/iris/iris_core.c
+index 8c335dbfc..1033bdae9 100644
 --- a/drivers/media/platform/qcom/iris/iris_core.c
 +++ b/drivers/media/platform/qcom/iris/iris_core.c
-@@ -26,6 +26,43 @@
- 	pm_runtime_put_sync(core->dev);
+@@ -32,6 +32,43 @@ void iris_core_deinit(struct iris_core *core)
+ 		pm_runtime_put_sync(core->dev);
  }
  
 +/*
@@ -151,18 +108,71 @@ expands to, since it assigns .restore as well.
  static int iris_wait_for_system_response(struct iris_core *core)
  {
  	int ret;
+diff --git a/drivers/media/platform/qcom/iris/iris_core.h b/drivers/media/platform/qcom/iris/iris_core.h
+index b878da43f..0d4f26543 100644
 --- a/drivers/media/platform/qcom/iris/iris_core.h
 +++ b/drivers/media/platform/qcom/iris/iris_core.h
-@@ -133,5 +133,6 @@
+@@ -133,5 +133,6 @@ struct iris_core {
  
  int iris_core_init(struct iris_core *core);
  void iris_core_deinit(struct iris_core *core);
 +void iris_core_reset_after_restore(struct iris_core *core);
  
  #endif
+diff --git a/drivers/media/platform/qcom/iris/iris_firmware.c b/drivers/media/platform/qcom/iris/iris_firmware.c
+index 08cdbda1a..69533231b 100644
+--- a/drivers/media/platform/qcom/iris/iris_firmware.c
++++ b/drivers/media/platform/qcom/iris/iris_firmware.c
+@@ -166,6 +166,32 @@ int iris_fw_load(struct iris_core *core)
+ 	return ret;
+ }
+ 
++/*
++ * Drop the firmware mapping without going near the video block.
++ *
++ * iris_fw_unload() is the normal counterpart to iris_fw_load(), but it starts
++ * by resetting the XTSS through core->reg_base, and there is one caller that
++ * must not: after a hibernation image is restored the block is already powered
++ * down by the .freeze that preceded the snapshot, so that write would land on
++ * an unpowered register. The IOMMU side still has to be undone -- the mapping
++ * itself lives in normal memory and comes back with the image, so a later
++ * iris_fw_load() would find IRIS_FW_START_ADDR already mapped.
++ */
++void iris_fw_unmap(struct iris_core *core)
++{
++	size_t unmapped;
++
++	if (!core->fw.mapped_mem_size)
++		return;
++
++	unmapped = iommu_unmap(core->fw.iommu_domain, IRIS_FW_START_ADDR,
++			       core->fw.mapped_mem_size);
++	if (unmapped != core->fw.mapped_mem_size)
++		dev_err(core->dev, "failed to unmap firmware in IOMMU\n");
++
++	core->fw.mapped_mem_size = 0;
++}
++
+ int iris_fw_unload(struct iris_core *core)
+ {
+ 	int ret;
+diff --git a/drivers/media/platform/qcom/iris/iris_firmware.h b/drivers/media/platform/qcom/iris/iris_firmware.h
+index 1a077a587..5fb486325 100644
+--- a/drivers/media/platform/qcom/iris/iris_firmware.h
++++ b/drivers/media/platform/qcom/iris/iris_firmware.h
+@@ -10,6 +10,7 @@ struct iris_core;
+ 
+ int iris_fw_load(struct iris_core *core);
+ int iris_fw_unload(struct iris_core *core);
++void iris_fw_unmap(struct iris_core *core);
+ int iris_set_hw_state(struct iris_core *core, bool resume);
+ 
+ int iris_fw_init(struct iris_core *core);
+diff --git a/drivers/media/platform/qcom/iris/iris_probe.c b/drivers/media/platform/qcom/iris/iris_probe.c
+index 38556d2dd..11de7114d 100644
 --- a/drivers/media/platform/qcom/iris/iris_probe.c
 +++ b/drivers/media/platform/qcom/iris/iris_probe.c
-@@ -360,9 +360,30 @@
+@@ -360,9 +360,30 @@ static int __maybe_unused iris_pm_resume(struct device *dev)
  	return ret;
  }
  

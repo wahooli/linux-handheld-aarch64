@@ -1,0 +1,70 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: clk: qcom: tcsrcc-x1e80100: hand syscon our clockless regmap
+
+The TCSR node is a clock provider and a syscon at once. pcie6a_phy's
+qcom,4ln-config-sel = <&tcsr 0x1a000 0> makes phy-qcom-qmp-pcie look it up with
+syscon_regmap_lookup_by_phandle_args(), and of_syscon_register() then does what
+it does for any syscon: of_clk_get(np, 0) and regmap_mmio_attach_clk(), which is
+a clk_prepare() held for as long as the regmap exists. The node's first clock is
+RPMH_CXO_CLK -- the parent of the tcsr_*_clkref_en gates, not a bus clock -- and
+clk-rpmh casts its vote on prepare. So the APSS asks AOP to keep the crystal on
+in the active, wake and sleep sets alike, and XO shutdown, i.e. AOSS deep sleep,
+can never happen.
+
+Seen on the Lenovo Yoga Slim 7x (X1E-80-100): with every other XO consumer
+traced off inside an s2idle, bi_tcxo reads enable 8 / prepare 9 awake, the odd
+handle is "clock-controller@1fc0000, no connection id" (an of_clk_get() on the
+tcsr node), bi_tcxo is disabled but never unprepared in the suspend path, and
+xo.lvl is never written. Dropping the scm node's qcom,dload-mode removed one
+creator of that syscon; this PHY lookup is the other.
+
+of_syscon_register_regmap() exists for exactly this: a driver that owns the block
+registers its regmap so later syscon lookups share it instead of creating a new
+one. This driver already maps the TCSR without a clock, and the PHYs are
+consumers of its clocks, so fw_devlink guarantees it probes before them.
+Register the regmap before the clocks. -EOPNOTSUPP (no MFD_SYSCON) is silent;
+anything else, -EEXIST above all, is worth a warning because it means a clocked
+syscon already exists and the XO is pinned again.
+
+--- a/drivers/clk/qcom/tcsrcc-x1e80100.c
++++ b/drivers/clk/qcom/tcsrcc-x1e80100.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/clk-provider.h>
++#include <linux/mfd/syscon.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+@@ -261,7 +262,30 @@
+ 
+ static int tcsr_cc_x1e80100_probe(struct platform_device *pdev)
+ {
+-	return qcom_cc_probe(pdev, &tcsr_cc_x1e80100_desc);
++	struct regmap *regmap;
++	int ret;
++
++	regmap = qcom_cc_map(pdev, &tcsr_cc_x1e80100_desc);
++	if (IS_ERR(regmap))
++		return PTR_ERR(regmap);
++
++	/*
++	 * The node is also a syscon (pcie6a_phy's qcom,4ln-config-sel points
++	 * at it). Left to itself, of_syscon_register() takes the node's first
++	 * clock -- RPMH_CXO_CLK, the parent of the clkref gates, not a bus
++	 * clock -- and clk_prepare()s it for the life of the regmap. clk-rpmh
++	 * votes on prepare, so the APSS then demands the XO on in every RPMh
++	 * set, including sleep, and AOSS deep sleep is impossible. Hand syscon
++	 * this regmap instead; the TCSR needs no clock to be accessed. The
++	 * PHYs consume our clocks, so fw_devlink probes us first.
++	 */
++	ret = of_syscon_register_regmap(pdev->dev.of_node, regmap);
++	if (ret && ret != -EOPNOTSUPP)
++		dev_warn(&pdev->dev,
++			 "syscon regmap not registered (%d): a clocked syscon may pin the XO\n",
++			 ret);
++
++	return qcom_cc_really_probe(&pdev->dev, &tcsr_cc_x1e80100_desc, regmap);
+ }
+ 
+ static struct platform_driver tcsr_cc_x1e80100_driver = {

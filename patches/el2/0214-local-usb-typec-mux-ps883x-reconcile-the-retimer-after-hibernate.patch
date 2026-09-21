@@ -1,0 +1,153 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] usb: typec: mux: ps883x: reconcile the retimer after a hibernation restore
+
+One of the three PS8830 retimers comes back powered and fully configured after
+a cross-boot resume, and stays that way until reboot:
+
+    $ sudo cat /sys/kernel/debug/regmap/3-0008/registers
+    00: 21      CONN_STATUS_0: CONNECTION_PRESENT | USB_3_1_CONNECTED
+    01: 85      CONN_STATUS_1: DP_CONNECTED | DP_PIN_ASSIGNMENT_C_D | DP_HPD_LEVEL
+    02: 00
+
+A USB 3.1 SuperSpeed path and a four-lane DisplayPort path with HPD asserted,
+into a port with nothing plugged into it, on battery. The other two read back
+as not responding, which is correct. Persistent: byte-identical five minutes
+later, and it does not self-heal.
+
+The driver has no dev_pm_ops at all, and tracks its entire power state in
+retimer->in_reset. That bool comes back out of the image saying the chip is
+held in reset with its rails down; the pads that back it do not come back at
+all. On this board every control line of that one retimer is a PMIC GPIO --
+
+    reset-gpios  = <&pm8550_gpios 10>        (ps8830 node)
+    vdd/vddar/vddat enable = <&pmc8380_5_gpios 8>
+    vddio enable = <&pm8550ve_9_gpios 8>
+    vdd33/vdd33-cap enable = <&pm8550_gpios 11>
+
+-- while all six lines of the other two are TLMM. pinctrl-msm replays its pad
+state across a restore; nothing replays pinctrl-spmi-gpio. So exactly the
+retimer whose pads are not replayed is the one that comes back live, which is
+what picks this out from an ordinary regulator-refcount bug.
+
+Nothing ever corrects it. ps883x_retimer_probe() is what normally drives these
+pads into agreement with in_reset -- it ends in an unconditional ps883x_reset()
+-- and probe() does not run on a restore. A cold boot is clean for exactly that
+reason.
+
+Add a .restore that drives the rails and the reset line once through the
+framework, so the pads match what the driver already believes. It goes through
+regulator_enable() rather than writing the enable GPIOs directly because that is
+what keeps the use counts balanced: they are already zero at this point, so a
+bare ps883x_disable_vregs() would underflow them.
+
+Only .restore, deliberately: .thaw runs on the hibernating kernel with the
+hardware untouched, where this reconciliation is not merely unnecessary but
+describes a power cycle that did not happen. Aliasing the two is how several
+restore callbacks in this tree corrupt live state under /sys/power/pm_test.
+
+Only the in_reset case is handled. A retimer that was configured when the image
+was taken comes back equally wrong in the other direction, but replaying that
+needs the last cfg values cached and cannot be tested here without a dock; the
+next Type-C notification reconfigures it.
+
+While here, fix an unrelated unbalanced disable on the unbind path.
+ps883x_retimer_remove() calls ps883x_disable_vregs() unconditionally, so
+unbinding a retimer that is in reset -- the resting state probe() leaves behind
+-- underflows all six regulators:
+
+    unbalanced disables for VREG_RTMR0_1P8
+     ps883x_retimer_remove+0x54/0xb0 [ps883x]
+    ... x6
+
+ps883x_reset() already does exactly what those two statements do, and is a no-op
+when the retimer is already in reset.
+
+Measured on a Lenovo Yoga Slim 7x (X1E-80-100), awake idle with the panel off,
+one hibernate cycle into the boot: 2400 mW before, 1640 mW after driving the
+pads back by hand with an unbind/bind. Clean-boot baseline on the same machine
+is 1140-1240 mW.
+
+--- a/drivers/usb/typec/mux/ps883x.c
++++ b/drivers/usb/typec/mux/ps883x.c
+@@ -12,6 +12,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/pm.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/usb/pd.h>
+@@ -501,16 +502,62 @@
+ 	typec_retimer_unregister(retimer->retimer);
+ 	typec_switch_unregister(retimer->sw);
+ 
+-	gpiod_set_value(retimer->reset_gpio, 1);
++	ps883x_reset(retimer);
+ 
+ 	clk_disable_unprepare(retimer->xo_clk);
+ 
+-	ps883x_disable_vregs(retimer);
+-
+ 	typec_mux_put(retimer->typec_mux);
+ 	typec_switch_put(retimer->typec_switch);
+ }
+ 
++/*
++ * A hibernation image carries retimer->in_reset, but the pads that back it do
++ * not survive the power cycle. On the Yoga Slim 7x every control line of one of
++ * the three retimers -- reset and all three regulator enables -- is a PMIC GPIO,
++ * and nothing replays pinctrl-spmi-gpio state across a restore. That chip comes
++ * back powered and still carrying its previous configuration while the driver
++ * believes it is held in reset, and nothing corrects it: probe() is what
++ * normally drives these pads to the state in_reset describes, and probe() does
++ * not run on a restore.
++ *
++ * Observed: CONN_STATUS_0 = 0x21, CONN_STATUS_1 = 0x85 -- USB 3.1 plus four-lane
++ * DP with HPD asserted, into a port with nothing in it, for the rest of the boot.
++ *
++ * Drive the rails and the reset line once through the framework so the pads
++ * match what the driver believes. Going through regulator_enable() rather than
++ * writing the enable GPIOs directly is what keeps the use counts balanced: they
++ * are already zero here, so a bare ps883x_disable_vregs() would underflow.
++ *
++ * Only the in_reset case is handled. A retimer that was *configured* when the
++ * image was taken comes back equally wrong in the other direction, but replaying
++ * that needs the last cfg values cached and cannot be tested without a dock; the
++ * next Type-C notification reconfigures it.
++ */
++static int ps883x_retimer_restore(struct device *dev)
++{
++	struct ps883x_retimer *retimer = dev_get_drvdata(dev);
++	int ret;
++
++	guard(mutex)(&retimer->lock);
++
++	if (!retimer->in_reset)
++		return 0;
++
++	ret = ps883x_enable_vregs(retimer);
++	if (ret)
++		return ret;
++
++	/* ps883x_reset() is a no-op while in_reset, and the pads are the point */
++	retimer->in_reset = false;
++	ps883x_reset(retimer);
++
++	return 0;
++}
++
++static const struct dev_pm_ops ps883x_retimer_pm_ops = {
++	.restore = pm_sleep_ptr(ps883x_retimer_restore),
++};
++
+ static const struct of_device_id ps883x_retimer_of_table[] = {
+ 	{ .compatible = "parade,ps8830" },
+ 	{ }
+@@ -521,6 +568,7 @@
+ 	.driver = {
+ 		.name = "ps883x_retimer",
+ 		.of_match_table = ps883x_retimer_of_table,
++		.pm = pm_ptr(&ps883x_retimer_pm_ops),
+ 	},
+ 	.probe		= ps883x_retimer_probe,
+ 	.remove		= ps883x_retimer_remove,

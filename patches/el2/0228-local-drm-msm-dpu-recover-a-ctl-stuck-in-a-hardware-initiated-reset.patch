@@ -1,0 +1,118 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: drm/msm/dpu: recover a ctl stuck in a hardware-initiated reset
+
+The cold-boot blue screen is CTL_0 sitting in CTL_SW_RESET while the INTF_5
+timing engine runs. Three saved snapshots (2026-09-18 x2, 2026-09-19) agree:
+SW_RESET=1 within one frame of the engine starting, FLUSH still holding the
+DMA0|LM_0|LM_1|CTL bits, FRAME_COUNT advancing, and the panel painting
+INTF_UNDERFLOW_COLOR (0xff, blue) because the ctl path delivers nothing.
+
+The driver did not start that reset. 0212 instruments the only writer of the
+bit and stayed silent through three stuck kickoffs on 2026-09-19, and on a cold
+boot no reset_control() caller is reachable before the first enable anyway. So
+this is the "hw initiated ctl reset" the kickoff check was written for, and it
+never completes. The ctl's other words are identical to a healthy capture
+(dpu-diff 2026-09-19), so nothing there says what it waits on.
+
+Until the trigger is known, recover instead of failing every frame forever:
+
+  1. re-issue the software reset under the running engine;
+  2. stop the timing engine, wait for INTF_STATUS to drop, reset again,
+     restart the engine.
+
+Each step logs its outcome, so a cold-boot loop says which one clears it, or
+that neither does -- which points the next experiment at CTL_SW_RESET_OVERRIDE
+(0x060, downstream's hard reset; 0 in every capture). A software reset keeps
+the ctl's programming (upstream's own disable path clears INTF_ACTIVE by hand
+after one), so nothing is re-applied.
+
+Upstream's failure branch (snapshot, drop the vsync irq) is kept for the case
+where both steps fail. Expected on a healthy boot: nothing. Supersedes the
+repair half of 0143, whose write of 0 never cleared the bit.
+
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+@@ -14,6 +14,7 @@
+ 
+ #include <drm/display/drm_dsc_helper.h>
+ #include <drm/drm_managed.h>
++#include <linux/delay.h>
+ 
+ #define DPU_DEBUG_VIDENC(e, fmt, ...) DPU_DEBUG("enc%d intf%d " fmt, \
+ 		(e) && (e)->parent ? \
+@@ -549,6 +550,66 @@
+ 	return 0;
+ }
+ 
++/*
++ * The ctl is sitting in a software reset the hardware started on its own and
++ * never finished: the driver never wrote the bit (0143/0212), it is set within
++ * one frame of the timing engine starting, and the engine keeps counting frames
++ * while the panel shows INTF_UNDERFLOW_COLOR. Nothing in the ctl's registers
++ * says what it waits for, so escalate and log which step clears it. A software
++ * reset preserves the ctl's programming (the disable path clears INTF_ACTIVE by
++ * hand after one), so nothing is re-applied afterwards.
++ */
++static int dpu_encoder_phys_vid_recover_ctl(struct dpu_encoder_phys *phys_enc)
++{
++	struct dpu_hw_ctl *ctl = phys_enc->hw_ctl;
++	struct dpu_hw_intf *intf = phys_enc->hw_intf;
++	struct dpu_hw_intf_status status = { 0 };
++	unsigned long lock_flags;
++	int rc, i;
++
++	if (!ctl->ops.reset)
++		return -EINVAL;
++
++	/* 1: re-issue the reset under the running timing engine. */
++	rc = ctl->ops.reset(ctl);
++	if (!rc) {
++		DPU_ERROR_VIDENC(phys_enc,
++				 "ctl %d: stuck reset cleared by re-issuing it\n",
++				 ctl->idx);
++		return 0;
++	}
++
++	if (!intf || !intf->ops.enable_timing || !intf->ops.get_status)
++		return rc;
++
++	/*
++	 * 2: stop the engine, let the frame in flight drain (one frame is
++	 * 17 ms at 60 Hz), reset again, restart the engine.
++	 */
++	spin_lock_irqsave(phys_enc->enc_spinlock, lock_flags);
++	intf->ops.enable_timing(intf, 0);
++	spin_unlock_irqrestore(phys_enc->enc_spinlock, lock_flags);
++
++	for (i = 0; i < 40; i++) {
++		intf->ops.get_status(intf, &status);
++		if (!status.is_en)
++			break;
++		usleep_range(1000, 1500);
++	}
++
++	rc = ctl->ops.reset(ctl);
++
++	spin_lock_irqsave(phys_enc->enc_spinlock, lock_flags);
++	intf->ops.enable_timing(intf, 1);
++	spin_unlock_irqrestore(phys_enc->enc_spinlock, lock_flags);
++
++	DPU_ERROR_VIDENC(phys_enc,
++			 "ctl %d: stuck reset %s with the timing engine stopped (engine %s after %d ms)\n",
++			 ctl->idx, rc ? "STILL stuck" : "cleared",
++			 status.is_en ? "still running" : "stopped", i);
++	return rc;
++}
++
+ static void dpu_encoder_phys_vid_prepare_for_kickoff(
+ 		struct dpu_encoder_phys *phys_enc)
+ {
+@@ -567,6 +628,8 @@
+ 	 * frame, need to check and wait for hw initiated ctl reset completion
+ 	 */
+ 	rc = ctl->ops.wait_reset_status(ctl);
++	if (rc)
++		rc = dpu_encoder_phys_vid_recover_ctl(phys_enc);
+ 	if (rc) {
+ 		DPU_ERROR_VIDENC(phys_enc, "ctl %d reset failure: %d\n",
+ 				ctl->idx, rc);

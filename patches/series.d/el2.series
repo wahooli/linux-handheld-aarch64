@@ -1,6 +1,6 @@
 # el2 -- Lenovo Yoga Slim 7x (X1E80100) booting at EL2, for KVM.
 #
-# Committed in patches/el2/, not fetched: 0003-0029 are Stephan Gerhold's
+# Committed in patches/el2/, not fetched: 0003-0028 are Stephan Gerhold's
 # wip/qcom-laptops-6.17-el2 series, whose codelinaro branch is dead (mirror:
 # github.com/jglathe/linux_ms_dev_kit), and 0002, 0031, 0032 and the 'local:'
 # patches were written locally. There is no manifest upstream to take.
@@ -33,7 +33,8 @@
 # Keep armed: disarming it drops apss to zero. docs.local/S2IDLE-DRAIN.md
 0027-arm64-dts-qcom-hamoa-add-system-power-domain-SS3-sta.patch
 0028-platform-arm64-add-Yoga-Slim-7x-IT8987-EC-driver-DT-.patch
-0029-drm-msm-a6xx-Fix-stale-rpmh-votes-after-suspend.patch
+# 0029 (a6xx: fix stale rpmh votes after suspend) is in the 7.2.6 base;
+# dropped 2026-09-21.
 0030-local-remoteproc-qcom_q6v5_pas-Disable-recovery-for-.patch
 
 # HDR10 output on the eDP panel. Touches only drm/msm/dp, which nothing else in
@@ -68,13 +69,8 @@
 # dark, and the ADSP glink edge is stale, so battery, thermal, audio and UCSI
 # behind it all time out.
 
-# Upstream in v7.3-rc1, absent from the 7.2 base: resume_target_kernel() masks
-# only IRQs, so a Debug/SError/FIQ taken during the restore copy -- when no
-# exception vectors are mapped -- is fatal and silent. At EL1 the firmware
-# hypervisor absorbs SError/FIQ routing; bare-metal EL2 takes them directly.
-# 0038 is the same series' error-path companion.
-0037-arm64-hibernate-mask-DAIF-before-restoring-hibernate.patch
-0038-arm64-hibernate-Restore-DAIF-state-on-error.patch
+# 0037/0038 (arm64: hibernate: mask DAIF across the restore copy, and restore
+# it on error) are in the 7.2.6 base; dropped 2026-09-21.
 
 # Post-restore, the SMMUv3 hardware and the restored kernel disagree about the
 # command-queue indices ("CMDQ error ... Illegal command" storms), the queue
@@ -102,7 +98,10 @@
 # register write in that re-init is lethal; the inherited state is. Tear the
 # RC down at freeze regardless, so restore re-inits cold hardware, which is
 # the state test_resume proves works.
-0057-local-PCI-dwc-qcom-force-RC-teardown-at-hibernate-freeze.patch
+# Since 2026-09-21 also carries the former 0225: s2idle_force_teardown, the same
+# teardown at s2idle suspend_noirq, default ON (measured 1086 -> 593 mW); echo 0
+# > /sys/module/pcie_qcom/parameters/s2idle_force_teardown is the A/B arm.
+0057-local-PCI-dwc-qcom-force-the-RC-teardown-across-system-sleep.patch
 
 # Real protocol bug, not hibernate-specific. receive_version_ack() resends
 # VERSION whenever the acked feature mask differs from ours, so a remote that
@@ -122,13 +121,15 @@
 #         slept it. a6xx_rpmh_start() then polls for an ACK that cannot
 #         arrive: "Unable to power on the GPU RSC". Clear the bit on a cold
 #         boot, a decision derived from hardware (CX_MISC_TCM_RET_CNTL), not
-#         from the image.
+#         from the image. Since 2026-09-21 also carries the former 0093: the
+#         RSC sequencer is reset too, so reprogram it when STATUS0_DRV0 reads
+#         0 -- the full story sits with "THE GPU FIX" before 0094 below.
 #   0069  the arm-smmu (v2) driver behind the GPU aliases .restore onto
 #         .resume, which early-returns while the device is runtime-suspended.
 #         "Runtime-suspended" describes the image, not the silicon: the reset
 #         is skipped, the hardware never learns the restored stream mappings
 #         and the GMU cannot fetch its firmware.
-0068-local-drm-msm-a6xx-clear-stale-pdc-sleep-on-cold-boot.patch
+0068-local-drm-msm-a6xx-restore-the-RSC-after-a-cross-boot-resume.patch
 0069-local-iommu-arm-smmu-reprogram-on-hibernate-restore.patch
 
 
@@ -233,6 +234,9 @@
 # ~10 s later (servreg_monitor.c:537) taking CDSP with it, both recover, and
 # the sound card does not come back. Disable with
 # qcom_q6v5_pas.hibernate_restart=0.
+# Carries the former 0095 since 2026-09-21: on the way back it takes the lite
+# PAS IDs from the match data (the image holds zeroes) and asks the boot DSP to
+# stop over SMP2P before the SCM shutdown, which hung the resume when skipped.
 0082-local-remoteproc-qcom_q6v5_pas-restart-the-DSP-across-hibernation.patch
 
 # 0082 ALONE IS NOT ENOUGH -- tested 2026-09-11, it fails with -110. The freeze
@@ -377,7 +381,8 @@
 # than any flag -- every flag here comes back from the image and matches by
 # construction, which is what hid 0090, 0086 and 0068 -- and reprograms. Needed
 # caching the devm PDC mappings so rpmh_init can be re-run without leaking.
-0093-local-drm-msm-a6xx-reprogram-the-RSC-sequencer-after-hibernate.patch
+# (0093 folded into 0068 on 2026-09-21; the code lives there now, the record
+# stays here in sequence.)
 #
 # VERIFIED ON HARDWARE 2026-09-12. The reprogram fires and works:
 #   53.921256  RSC sequencer unprogrammed (STATUS0_DRV0=0) -- reprogramming
@@ -418,7 +423,6 @@
 # violation will soon follow"). Same defect class as 0090/0086/0093/0068/0069:
 # one-shot software state that survives the image and matches by construction.
 0094-local-drm-msm-a6xx-reload-the-zap-shader-after-hibernate.patch
-0095-local-remoteproc-qcom_q6v5_pas-use-boot-lite-IDs-after-hibernate.patch
 0096-local-ASoC-qcom-q6apm-enable-responses-before-child-probes.patch
 
 # Not a hibernate bug, despite being found here: a plain "echo stop > .../
@@ -567,13 +571,8 @@
 # Two more the SSR loop surfaced once 0116-0118 stopped hiding the rest of the
 # cycle. Neither is new, both are upstream and both predate this stack; they
 # only became visible because the restart path now runs to completion.
-#
-# 0119: ucsi_debugfs_register() is called from ucsi_register() but released
-# only from ucsi_destroy(), which pairs up for an interface registered once.
-# ucsi_glink registers and unregisters on every PDR down/up, so the second
-# registration hits "debugfs: 'pmic_glink.ucsi.0' already exists in 'ucsi'" and
-# overwrites ucsi->debugfs, leaking the old struct and its dentries each time.
-0119-local-usb-typec-ucsi-drop-debugfs-on-unregister-not-only-on-destroy.patch
+# 0119 (ucsi: release debugfs on unregister, not only on destroy) is fixed the
+# same way in the 7.2.6 base; dropped 2026-09-21.
 
 # 0120: "Driver needs fixing: Unsorted reg_defaults". Both macro drivers build
 # their table at probe by memcpy'ing a codec-version table onto the base one,
@@ -911,3 +910,147 @@
 # OFF by default -- needs arm_arch_timer_mmio.rtc_alarm=1 on the cmdline.
 # sc8280xp has the same timer node, so it must not self-enable.
 0209-local-clocksource-arm_arch_timer_mmio-RTC-alarm-on-the-physical-timer.patch
+
+# Local, MITIGATION not a fix. The s2idle domain state is accepted but returns in
+# <1 us, so the idle loop re-enters ~7000/s and each pass re-votes the whole
+# domain hierarchy through RPMh at 92-140 uJ. Measured: s2idle power is linear in
+# that rate, ~700-800 mW + ~0.1 mW per transition/s. Backs the domain vote off
+# once the state stops sticking; runtime idle untouched. Runtime-switchable via
+# /sys/module/cpuidle_psci/parameters/s2idle_domain_backoff, so one build gives
+# both A/B arms. docs.local/S2IDLE-DRAIN.md
+0210-local-cpuidle-psci-back-off-the-s2idle-domain-vote-when-it-never-sticks.patch
+
+# Local, DIAGNOSTIC only. rpmh-rsc has no debugfs at all; these expose the
+# sleep/wake vote cache and the SLEEP/WAKE TCS registers. `cache` is what Linux
+# intends, `tcs` is what the hardware got -- a mismatch across a hibernate is the
+# +717 mW residue. docs.local/S2IDLE-DRAIN.md
+0211-local-soc-qcom-rpmh-expose-the-sleep-wake-vote-cache-and-TCS-via-debugfs.patch
+
+
+
+# Local, DIAGNOSTIC only. 0143 reports CTL_SW_RESET set at kickoff; on hardware
+# the bit is set earlier, by a reset phys_cleanup() issues and discards the
+# return of. Logs the failing reset where it happens, plus the INTF timing-engine
+# state: timing_en=0 on every failure means the disable path's ordering is the
+# bug, timing_en=1 means the ctl itself wedges. docs.local/DISPLAY-HANDOVER.md
+0212-local-drm-msm-dpu-name-the-ctl-reset-that-actually-fails.patch
+
+# Local. One of the three PS8830 retimers comes back from a hibernate restore
+# powered and still configured -- USB3.1 + 4-lane DP with HPD asserted into an
+# empty port -- because every one of its control lines is a PMIC GPIO and
+# nothing replays pinctrl-spmi-gpio state, while the driver has no dev_pm_ops
+# and believes in_reset from the image. Worth ~760 mW awake idle by unbind/bind
+# measurement. Also fixes an unbalanced regulator disable on unbind.
+# docs.local/S2IDLE-DRAIN.md
+0214-local-usb-typec-mux-ps883x-reconcile-the-retimer-after-hibernate.patch
+
+# SHELVED 2026-09-18: built and measured, zero effect. 0218 targets exactly the
+# apss mechanism (CPU PM domains initialised powered-off under OSI, so the parent
+# can power off), and apss_cnt was 9 and 4 before vs 1 after on the same script
+# and duration, aosd 0 throughout, s2idle 1173->1173 and 1288->1287 mW. Not
+# harmful -- just unmerged upstream carrying rebase cost for nothing. In
+# docs.local/shelved-patches/. Re-test if they land upstream and the base moves.
+# docs.local/S2IDLE-DRAIN.md
+
+# Upstream, Saim Shujah, Reviewed-by Dmitry Baryshkov, Cc stable.
+# dpu_hw_ctl_clear_pending_flush() zeroes every cached child mask except
+# pending_periph_flush_mask, so stale INTF bits can be written to
+# CTL_PERIPH_FLUSH alongside the current state. Verified missing in this tree:
+# seven masks cleared, the peripheral one not. Fixes 64f7b81f0358.
+#
+# NOT expected to fix the blue screen -- that is a stuck CTL_SW_RESET, a
+# different register and a different failure. Carried because it is a real
+# one-line defect in the display path being debugged, so it stops being a
+# confounder. docs.local/DISPLAY-HANDOVER.md
+0220-drm-msm-dpu-clear-pending-peripheral-flush-state.patch
+
+# Local, DIAGNOSTIC. The only question left on the s2idle floor. Suspending
+# costs MORE than idling with the panel off (1173-1288 mW vs 1040), and the
+# difference is CPU sleep residency: apss is 84.7% asleep at runtime idle and
+# 0.19% suspended. PSCI returns in under a microsecond without sleeping, and
+# 0210 proved it is not the composite domain state -- the bare CPU-level call
+# does it too, while the same call works fine at runtime idle. PSCI returns
+# instantly when an interrupt is pending at the GIC, and suspend_device_irqs()
+# masks lines without deasserting them, so a level-triggered line that stays
+# asserted is pending forever and invisible to /proc/interrupts. This reads the
+# GIC directly. Dumps off with s2idle_gic_dumps=0 at runtime.
+# docs.local/S2IDLE-DRAIN.md
+# 0221 SHELVED 2026-09-19 to docs.local/shelved-patches/: it answered its
+# question (every pending SPI is masked; no GIC line keeps PSCI from sleeping)
+# and the real holders turned out to be the APSS's own RPMh votes, see below.
+# Pure diagnostic, no power effect; re-arm only if a pending-IRQ theory returns.
+# --- s2idle floor: the APSS's own sleep set holds DDR, CX and XO up (2026-09-19) ---
+# Tracing rpmh:rpmh_send_msg across an s2idle showed what Linux itself votes while
+# the SoC is meant to be asleep: qce's probe-time 393 MB/s DDR/LLCC request, CX at
+# NOMINAL from genpd default performance states that nothing drops at system
+# suspend, and XO held by the retimers' RF clocks and the PCIe root complexes.
+# docs.local/S2IDLE-DRAIN.md "THE APSS SLEEP SET, DECODED".
+# 0222: generic. Drop a device's default performance-state vote in the noirq
+# suspend phase (runtime PM already does this on runtime suspend) and restore it
+# on resume. CX 256 -> 16 during s2idle. OFF by default since 2026-09-21; cmdline
+# pmdomain.drop_pstate_on_suspend=1 enables, runtime toggle at
+# /sys/module/pmdomain/parameters/drop_pstate_on_suspend (and the old debugfs
+# file), effective from the next suspend.
+0222-local-pmdomain-core-drop-default-performance-state-votes-across-system-suspend.patch
+# 0223: qce keeps its bandwidth vote and clocks through suspend; drop them.
+0223-local-crypto-qce-release-bandwidth-and-clocks-across-system-suspend.patch
+# 0224: ps883x never stops its XO reference clock while the retimer is in reset.
+0224-local-usb-typec-mux-ps883x-gate-the-reference-clock-with-the-reset-line.patch
+# 0225 (s2idle RC teardown) folded into 0057 on 2026-09-21.
+# 0226: the scm node's qcom,dload-mode makes syscon clk_prepare() RPMH_CXO_CLK
+# forever (clk-rpmh votes on prepare), so the APSS demands the XO on in its sleep
+# set and AOSS deep sleep can never happen. Download mode is off by default.
+0226-local-arm64-dts-qcom-hamoa-drop-the-TCSR-download-mode-cookie-so-the-XO-can-be-released.patch
+# 0227: the PCIe PHY's qcom,4ln-config-sel looks the TCSR up as a syscon, which
+# clk_prepare()s RPMH_CXO_CLK forever -- the second creator of the XO hold 0226
+# removed. tcsrcc registers its own clockless regmap with syscon instead.
+0227-local-clk-qcom-tcsrcc-x1e80100-hand-syscon-our-clockless-regmap.patch
+# 0228: the cold-boot blue screen is CTL_0 in a HARDWARE-initiated sw reset that
+# never completes, under a running INTF_5 timing engine (three saved snapshots
+# + a healthy dpu-diff, 2026-09-19; 0212 stayed silent, so the driver never
+# wrote the bit). Recovers at the kickoff check: re-issue the reset, then stop
+# the timing engine / reset / restart. Each step logs; a cold-boot loop says
+# which one works. Supersedes 0143's write-0 repair. docs.local/DISPLAY-HANDOVER.md
+# RAN 2026-09-19 18:34, cold boot: BOTH steps fail, x4. INTF_STATUS drops in 5-11 ms
+# and the reset still never completes, so it is not waiting on the INTF. Kept as
+# the detector (its lines are the verdict); next is live SSH work during a blue
+# screen, ~/scripts/bluescreen-live.sh, not another blind rebuild.
+0228-local-drm-msm-dpu-recover-a-ctl-stuck-in-a-hardware-initiated-reset.patch
+# 0229: after a hibernate the image kernel inherits the restore kernel's GIC/PDC
+# enables (nine dwc3 wake lines armed, tsens critical lines off). Re-sync both to
+# the irqdescs at syscore resume. docs.local/S2IDLE-DRAIN.md 'nine USB wake lines'.
+0229-local-irqchip-gic-v3-qcom-pdc-re-sync-interrupt-enables-after-a-hibernation-restore.patch
+# 0230: the restore kernel leaves its RPMh ACTIVE votes behind (icc INT_MAX on
+# every BCM, rpmhpd clamped to the top corner, until a sync_state it never
+# reaches); the image kernel re-sends only what its own consumers move. Re-send
+# all four clients' votes at .restore. docs.local/S2IDLE-DRAIN.md "THE RESTORE
+# KERNEL'S VOTES". CONFIRMED: clean and post-hibernate s2idle both 590 mW.
+0230-local-qcom-rpmh-clients-re-send-every-ACTIVE-vote-after-a-hibernation-restore.patch
+# 0231: icc-bwmon has no PM ops, so the DDR bandwidth OPP it last voted from its
+# IRQ stays applied through a system sleep. s2idle here never reaches the RPMh
+# sleep set, so that stale ACTIVE vote sets DDR freq for the whole suspend:
+# suspend after a workload and DDR is pinned high (up to +540 mW) until resume.
+# Release the vote at suspend, re-arm the monitor at resume.
+# docs.local/S2IDLE-DRAIN.md "THE WORKLOAD RESIDUE IS BWMON".
+0231-local-soc-qcom-icc-bwmon-release-the-DDR-bandwidth-vote-across-system-sleep.patch
+
+# 0232: ath12k selects MEDIUM priority for its initial scan but never copies
+# that value into the zeroed WMI command, so firmware gets VERY_LOW instead.
+# Restore the assignment; log initial command submission for the hardware A/B.
+# Confirmed working on hardware (2026-09-21). docs.local/WIFI-RECONNECT.md
+0232-local-wifi-ath12k-send-the-selected-scan-priority-to-firmware.patch
+
+# 0233: measured remaining delay is one 8.98 s scan of 101 channels, including
+# all 60 6 GHz channels despite userspace requesting colocated-AP filtering.
+# Enable cfg80211 split scanning on WCN7850; defer initial 11d until its 6 GHz
+# part. Band-restricted legacy-only scans leave that initial 11d pending.
+# Confirmed working on hardware (2026-09-21). docs.local/WIFI-RECONNECT.md
+0233-local-wifi-ath12k-split-6-GHz-discovery-scans-on-WCN7850.patch
+
+# 0234: the GMU keeps its last GX/DDR-bandwidth vote across slumber, and the
+# devfreq idle clamp that would lower it first is a618/7c3-only upstream, so on
+# X1-85 EVERY slumber (runtime and system) left the working-level DDR vote at
+# RPMh. Vote the lowest OPP in a6xx_gmu_shutdown() before the slumber request.
+# MEASURED 2026-09-20: idle s2idle 590 -> 152 mW (one 15 min run). dev_dbg only.
+# docs.local/S2IDLE-DRAIN.md "0234 MEASURED".
+0234-local-drm-msm-a6xx-vote-the-lowest-OPP-before-the-GMU-slumbers.patch

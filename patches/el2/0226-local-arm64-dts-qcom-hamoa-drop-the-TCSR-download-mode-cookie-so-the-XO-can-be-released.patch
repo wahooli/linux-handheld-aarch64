@@ -1,0 +1,36 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: arm64: dts: qcom: hamoa: drop the TCSR download-mode cookie so the XO can be released
+
+The scm node's qcom,dload-mode = <&tcsr 0x19000> makes qcom_scm look the TCSR
+up as a syscon. of_syscon_register() takes the node's first clock -- for the
+TCSR that is RPMH_CXO_CLK, the XO reference the clkref gates are parented to --
+and regmap_mmio_attach_clk() holds a clk_prepare() on it for the life of the
+regmap. clk-rpmh casts its vote on prepare, not enable, and for the non-AO
+bi_tcxo that vote goes into the active, wake and sleep sets alike. The APSS
+therefore tells AOP that the crystal must stay on while it sleeps, forever, and
+AOSS deep sleep (XO shutdown) is off the table before anything else is looked at.
+
+Measured on the Lenovo Yoga Slim 7x (X1E-80-100) with every other XO consumer
+traced across an s2idle: bi_tcxo awake reads enable 8, prepare 9, and its named
+handles are the two attach-only remoteprocs (never prepared), the USB combo PHY
+(released in suspend) and "clock-controller@1fc0000, no connection id" -- the
+syscon's of_clk_get(np, 0). Inside the suspend every child of bi_tcxo was
+unprepared and bi_tcxo itself was disabled, but never unprepared, and xo.lvl
+was never written.
+
+The cookie exists to request a crash dump in download mode. download_mode
+defaults to off, in which case qcom_scm_set_download_mode() does nothing
+without an address, and nothing else on this machine references the TCSR as a
+syscon. Drop it. The clkref gates keep their parent through the clock
+provider's own regmap, which attaches no clock.
+
+--- a/arch/arm64/boot/dts/qcom/hamoa.dtsi
++++ b/arch/arm64/boot/dts/qcom/hamoa.dtsi
+@@ -330,7 +330,6 @@
+ 			compatible = "qcom,scm-x1e80100", "qcom,scm";
+ 			interconnects = <&aggre2_noc MASTER_CRYPTO QCOM_ICC_TAG_ALWAYS
+ 					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
+-			qcom,dload-mode = <&tcsr 0x19000>;
+ 		};
+ 
+ 		scmi {

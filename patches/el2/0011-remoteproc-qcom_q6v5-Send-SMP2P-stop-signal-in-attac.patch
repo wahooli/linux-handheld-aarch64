@@ -15,22 +15,35 @@ RPROC_DETACHED. It does not make sense to call the function while in
 RPROC_OFFLINE state.
 
 Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
+[wahooli: rebased onto cachyos-7.2.6-1, where upstream skips the stop
+ whenever a watchdog/fatal IRQ has already cleared q6v5->running, so
+ that logical crashes still get one. Keep that, and skip only when the
+ IRQ fired AND the state is RPROC_CRASHED: a detached remote (and the
+ hibernate restart, which stops an OFFLINE one) never set running and
+ must still send the stop.]
 ---
- drivers/remoteproc/qcom_q6v5.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
+ drivers/remoteproc/qcom_q6v5.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/remoteproc/qcom_q6v5.c b/drivers/remoteproc/qcom_q6v5.c
-index 94c75d9cc..ed1b578a8 100644
+index 3c173a4fc..7cdadc950 100644
 --- a/drivers/remoteproc/qcom_q6v5.c
 +++ b/drivers/remoteproc/qcom_q6v5.c
-@@ -231,8 +231,8 @@ int qcom_q6v5_request_stop(struct qcom_q6v5 *q6v5, struct qcom_sysmon *sysmon)
+@@ -232,8 +232,15 @@ int qcom_q6v5_request_stop(struct qcom_q6v5 *q6v5, struct qcom_sysmon *sysmon)
  
  	q6v5->running = false;
  
--	/* Don't perform SMP2P dance if remote isn't running */
--	if (q6v5->rproc->state != RPROC_RUNNING || qcom_sysmon_shutdown_acked(sysmon))
-+	/* Don't perform SMP2P dance if remote crashed or already stopped */
-+	if (q6v5->rproc->state == RPROC_CRASHED || qcom_sysmon_shutdown_acked(sysmon))
+-	/* A watchdog/fatal IRQ clears running; logical crashes still need a stop. */
+-	if (!was_running || qcom_sysmon_shutdown_acked(sysmon))
++	/*
++	 * Don't perform SMP2P dance if the remote crashed (a watchdog/fatal IRQ
++	 * clears running; logical crashes still need a stop) or already
++	 * stopped. Skip only on the IRQ path: a detached remote, or one we
++	 * stopped and left offline, never set running yet still wants the
++	 * stop signal.
++	 */
++	if ((!was_running && q6v5->rproc->state == RPROC_CRASHED) ||
++	    qcom_sysmon_shutdown_acked(sysmon))
  		return 0;
  
  	qcom_smem_state_update_bits(q6v5->state,

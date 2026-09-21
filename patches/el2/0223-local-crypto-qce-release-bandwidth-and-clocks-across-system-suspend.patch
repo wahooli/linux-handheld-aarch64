@@ -1,0 +1,98 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: crypto: qce: release bandwidth and clocks across system suspend
+
+qce casts a 393600 kBps interconnect vote on its memory path at probe and never
+touches it again, and its three clocks stay enabled for the life of the driver.
+The vote lands in the interconnect SLEEP bucket like any untagged request, so it
+is programmed into the RPMh sleep set and stays in force while the APSS sleeps.
+
+Decoding the sleep set as programmed inside an s2idle on the Lenovo Yoga Slim 7x
+(X1E-80-100): after every other memory consumer had released its bandwidth, the
+DDR (MC0) and LLCC (SH0) BCMs still carried avg 386 / peak 393 MB/s, and SN0 and
+SN3 carried 393 MB/s -- all of it this constant, from a module with no users
+(every algorithm at refcnt 1). Unloading qcrypto took the DDR sleep vote to the
+PCIe ports' deliberate 1 kBps and nothing else.
+
+Nothing can be queued to the engine while userspace is frozen. Drop the
+bandwidth vote and the clocks in suspend and take them back in resume.
+
+--- a/drivers/crypto/qce/core.c
++++ b/drivers/crypto/qce/core.c
+@@ -11,6 +11,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
++#include <linux/pm.h>
+ #include <linux/types.h>
+ #include <crypto/algapi.h>
+ #include <crypto/internal/hash.h>
+@@ -247,6 +248,61 @@
+ 	return devm_qce_register_algs(qce);
+ }
+ 
++/*
++ * The bandwidth vote cast at probe stays in the interconnect sleep bucket and
++ * the clocks stay enabled, so an idle crypto engine keeps DDR, LLCC and the
++ * NoCs busy for the whole of system suspend. Nothing is queued to it while
++ * userspace is frozen; drop everything and take it back on resume.
++ */
++static int qce_suspend(struct device *dev)
++{
++	struct qce_device *qce = dev_get_drvdata(dev);
++	int ret;
++
++	ret = icc_set_bw(qce->mem_path, 0, 0);
++	if (ret)
++		return ret;
++
++	clk_disable_unprepare(qce->bus);
++	clk_disable_unprepare(qce->iface);
++	clk_disable_unprepare(qce->core);
++
++	return 0;
++}
++
++static int qce_resume(struct device *dev)
++{
++	struct qce_device *qce = dev_get_drvdata(dev);
++	int ret;
++
++	ret = clk_prepare_enable(qce->core);
++	if (ret)
++		return ret;
++	ret = clk_prepare_enable(qce->iface);
++	if (ret)
++		goto err_core;
++	ret = clk_prepare_enable(qce->bus);
++	if (ret)
++		goto err_iface;
++
++	ret = icc_set_bw(qce->mem_path, QCE_DEFAULT_MEM_BANDWIDTH,
++			 QCE_DEFAULT_MEM_BANDWIDTH);
++	if (ret)
++		goto err_bus;
++
++	return 0;
++
++err_bus:
++	clk_disable_unprepare(qce->bus);
++err_iface:
++	clk_disable_unprepare(qce->iface);
++err_core:
++	clk_disable_unprepare(qce->core);
++	return ret;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(qce_pm_ops, qce_suspend, qce_resume);
++
+ static const struct of_device_id qce_crypto_of_match[] = {
+ 	{ .compatible = "qcom,crypto-v5.1", },
+ 	{ .compatible = "qcom,crypto-v5.4", },
+@@ -260,6 +316,7 @@
+ 	.driver = {
+ 		.name = KBUILD_MODNAME,
+ 		.of_match_table = qce_crypto_of_match,
++		.pm = pm_sleep_ptr(&qce_pm_ops),
+ 	},
+ };
+ module_platform_driver(qce_crypto_driver);

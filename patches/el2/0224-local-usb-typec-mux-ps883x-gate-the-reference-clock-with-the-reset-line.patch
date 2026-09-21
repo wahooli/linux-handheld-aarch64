@@ -1,0 +1,84 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: usb: typec: mux: ps883x: gate the reference clock with the reset line
+
+The driver enables the retimer's XO reference clock in probe and only disables
+it in remove. ps883x_reset(), which is the resting state -- probe ends in it,
+and every unplug returns to it -- asserts reset and drops all six rails but
+leaves the clock running. On the Lenovo Yoga Slim 7x (X1E-80-100) the three
+retimers sit on RPMH_RF_CLK3/4/5, so three XO buffer outputs from the PMIC
+stay enabled for chips that are held in reset with nothing plugged in, and the
+rpmh vote cache shows rfclka3/4/5 enabled in both the sleep and wake sets.
+AOSS deep sleep is XO shutdown; a live buffer forbids it. Unbinding the three
+retimers took all three votes to zero.
+
+Stop the clock in ps883x_reset(), after the reset line is asserted and before
+the rails go, and start it in ps883x_configure() when the retimer is brought
+out of reset, after the rails and before the reset line is released. probe
+already enables it once before its first ps883x_reset(), so the count stays
+balanced; the two error paths after that reset no longer touch the clock or
+the rails, which reset has already turned off. remove and the hibernate
+.restore path lose their explicit clock calls for the same reason.
+
+--- a/drivers/usb/typec/mux/ps883x.c
++++ b/drivers/usb/typec/mux/ps883x.c
+@@ -140,6 +140,7 @@
+ 		return;
+ 
+ 	gpiod_set_value(retimer->reset_gpio, 1);
++	clk_disable_unprepare(retimer->xo_clk);
+ 	ps883x_disable_vregs(retimer);
+ 	retimer->in_reset = true;
+ }
+@@ -159,6 +160,13 @@
+ 		if (ret)
+ 			return ret;
+ 
++		ret = clk_prepare_enable(retimer->xo_clk);
++		if (ret) {
++			dev_err(dev, "failed to enable XO: %d\n", ret);
++			ps883x_disable_vregs(retimer);
++			return ret;
++		}
++
+ 		gpiod_set_value(retimer->reset_gpio, 0);
+ 
+ 		/* firmware initialization delay */
+@@ -463,7 +471,7 @@
+ 	if (IS_ERR(retimer->sw)) {
+ 		ret = PTR_ERR(retimer->sw);
+ 		dev_err(dev, "failed to register typec switch: %d\n", ret);
+-		goto err_clk_disable;
++		goto err_mux_put;
+ 	}
+ 
+ 	rtmr_desc.drvdata = retimer;
+@@ -482,6 +490,7 @@
+ 
+ err_switch_unregister:
+ 	typec_switch_unregister(retimer->sw);
++	goto err_mux_put;
+ err_clk_disable:
+ 	clk_disable_unprepare(retimer->xo_clk);
+ err_vregs_disable:
+@@ -504,8 +513,6 @@
+ 
+ 	ps883x_reset(retimer);
+ 
+-	clk_disable_unprepare(retimer->xo_clk);
+-
+ 	typec_mux_put(retimer->typec_mux);
+ 	typec_switch_put(retimer->typec_switch);
+ }
+@@ -547,6 +554,12 @@
+ 	if (ret)
+ 		return ret;
+ 
++	ret = clk_prepare_enable(retimer->xo_clk);
++	if (ret) {
++		ps883x_disable_vregs(retimer);
++		return ret;
++	}
++
+ 	/* ps883x_reset() is a no-op while in_reset, and the pads are the point */
+ 	retimer->in_reset = false;
+ 	ps883x_reset(retimer);

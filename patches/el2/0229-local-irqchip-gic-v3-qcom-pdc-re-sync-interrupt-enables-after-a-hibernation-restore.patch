@@ -1,0 +1,195 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: irqchip: gic-v3, qcom-pdc: re-sync interrupt enables after a hibernation restore
+
+Two kernels program the interrupt controllers across a hibernation: the one
+that loads the image, and the one inside it. Nothing reconciles them. The GICv3
+driver has no restore hook for the distributor, qcom-pdc has no PM at all, and
+resume_device_irqs() only re-enables the lines it suspended itself. So the image
+kernel wakes up with whatever SPI and PDC enables the restore kernel left, and
+keeps them for the life of the boot.
+
+Measured on a Lenovo Yoga Slim 7x (X1E-80-100), same boot, one hibernate between
+two /dev/mem dumps of GICD_ISENABLER and the PDC enable bank:
+
+  - after the restore, INTID 523 527 529 554 564 565 567 568 -- PDC pins 11 15
+    17 47 57 58 60 61, the dm_hs_phy/dp_hs_phy/ss_phy wake lines of all three
+    dwc3 controllers -- are enabled at the GIC and set in the PDC bank, with
+    nothing plugged in and this kernel believing them disabled. The restore
+    kernel's dwc3 armed them at quiesce: its wakeup capability defaults on and
+    it has no udev to turn it off. The HS PHY lines assert when the PHYs power
+    down at every s2idle, so the APSS gets pulled out of collapse by a wake
+    nobody handles: 4 APSS collapses per 2 min against 33-40 on a clean boot,
+    and roughly 550 mW on top of a 590 mW suspend.
+  - in the other direction the tsens critical lines and four geni i2c lines are
+    enabled on a clean boot and disabled after the restore -- lines the restore
+    kernel never enabled and this kernel never re-wrote. Thermal trip
+    interrupts are dead until reboot.
+
+Walk both controllers at syscore resume and make the hardware match the
+irqdescs: a GIC SPI is enabled iff a mapped irq exists that is neither disabled
+nor masked; a PDC pin is enabled iff its mapped irq is not disabled, which is
+what qcom_pdc_gic_enable()/disable() maintain. Lines with no mapping at all are
+what gic_dist_init() would have left disabled on a clean boot, so they are
+disabled here too. syscore_resume() runs on the restore path and after the
+image snapshot, and not at all for suspend-to-idle, so on this machine the cost
+is one walk per hibernate; where the state already matches nothing is written.
+
+--- a/drivers/irqchip/irq-gic-v3.c
++++ b/drivers/irqchip/irq-gic-v3.c
+@@ -9,6 +9,7 @@
+ #include <linux/acpi.h>
+ #include <linux/cpu.h>
+ #include <linux/cpu_pm.h>
++#include <linux/syscore_ops.h>
+ #include <linux/delay.h>
+ #include <linux/interrupt.h>
+ #include <linux/irqdomain.h>
+@@ -1503,6 +1504,53 @@
+ 	cpu_pm_register_notifier(&gic_cpu_pm_notifier_block);
+ }
+ 
++/*
++ * A hibernation restore hands this kernel a distributor programmed by the kernel
++ * that loaded the image. Nothing reconciles the two: resume_device_irqs() only
++ * re-enables the lines it suspended, so an SPI the restore kernel enabled and
++ * this kernel believes disabled stays enabled for the life of the boot -- and a
++ * line this kernel believes enabled that the restore kernel never touched stays
++ * off. Seen on x1e80100: the restore kernel's dwc3 armed all nine USB PHY wake
++ * lines at quiesce (its wakeup default is on, and it has no udev to turn it
++ * off), the image kernel never knew, and every suspend was cut short by wakes
++ * nobody handled; in the other direction the tsens critical lines came back
++ * disabled. Walk the SPIs at syscore resume and make the hardware match the
++ * irqdescs. Cheap, idempotent, and on a suspend-to-idle machine this path runs
++ * only for the restore.
++ */
++static void gic_syscore_resume(void *data)
++{
++	void __iomem *base = gic_data.dist_base;
++	unsigned int i, on = 0, off = 0;
++
++	for (i = 32; i < GIC_LINE_NR; i++) {
++		unsigned int virq = irq_find_mapping(gic_data.domain, i);
++		struct irq_data *d = virq ? irq_get_irq_data(virq) : NULL;
++		bool want = d && !irqd_irq_disabled(d) && !irqd_irq_masked(d);
++		bool have = readl_relaxed(base + GICD_ISENABLER + (i / 32) * 4) & BIT(i % 32);
++
++		if (want == have)
++			continue;
++		writel_relaxed(BIT(i % 32), base + (want ? GICD_ISENABLER : GICD_ICENABLER) + (i / 32) * 4);
++		if (want)
++			on++;
++		else
++			off++;
++	}
++	if (on || off) {
++		gic_dist_wait_for_rwp();
++		pr_info("GICv3: re-synced SPI enables after resume: %u turned on, %u turned off\n", on, off);
++	}
++}
++
++static const struct syscore_ops gic_syscore_ops = {
++	.resume = gic_syscore_resume,
++};
++
++static struct syscore gic_syscore = {
++	.ops = &gic_syscore_ops,
++};
++
+ #else
+ static inline void gic_cpu_pm_init(void) { }
+ #endif /* CONFIG_CPU_PM */
+@@ -2053,6 +2101,7 @@
+ 	gic_enable_nmi_support();
+ 	gic_smp_init();
+ 	gic_cpu_pm_init();
++	register_syscore(&gic_syscore);
+ 
+ 	if (gic_dist_supports_lpis()) {
+ 		its_init(handle, &gic_data.rdists, gic_data.domain, dist_prio_irq);
+--- a/drivers/irqchip/qcom-pdc.c
++++ b/drivers/irqchip/qcom-pdc.c
+@@ -18,6 +18,7 @@
+ #include <linux/of_irq.h>
+ #include <linux/soc/qcom/irq.h>
+ #include <linux/spinlock.h>
++#include <linux/syscore_ops.h>
+ #include <linux/slab.h>
+ #include <linux/types.h>
+ 
+@@ -61,6 +62,7 @@
+ static struct pdc_pin_region *pdc_region;
+ static int pdc_region_cnt;
+ static unsigned int pdc_version;
++static struct irq_domain *pdc_wake_domain;
+ static bool pdc_x1e_quirk;
+ 
+ static void pdc_base_reg_write(void __iomem *base, int reg, u32 i, u32 val)
+@@ -139,6 +141,59 @@
+ 		pdc_enable_intr_cfg(pin_out, on);
+ }
+ 
++static bool __pdc_intr_enabled(int pin_out)
++{
++	if (pdc_version < PDC_VERSION_3_2)
++		return pdc_reg_read(IRQ_ENABLE_BANK, FIELD_GET(IRQ_ENABLE_BANK_INDEX_MASK, pin_out)) &
++		       BIT(FIELD_GET(IRQ_ENABLE_BANK_BIT_MASK, pin_out));
++	return pdc_reg_read(IRQ_i_CFG, pin_out) & BIT(IRQ_i_CFG_IRQ_ENABLE);
++}
++
++/*
++ * The PDC enable bit follows irq_enable()/irq_disable(). After a hibernation
++ * restore it holds whatever the kernel that loaded the image left -- on
++ * x1e80100 that kernel's dwc3 armed all nine USB PHY wake pins at quiesce and
++ * this kernel, believing them disabled, never cleared them, so they woke the
++ * APSS out of every s2idle collapse. Re-sync every pin to this kernel's irqdesc
++ * state at syscore resume. See gic_syscore_resume() for the GIC half.
++ */
++static void pdc_syscore_resume(void *data)
++{
++	unsigned long flags;
++	unsigned int fixed = 0;
++	int i;
++	u32 pin;
++
++	if (!pdc_wake_domain)
++		return;
++
++	raw_spin_lock_irqsave(&pdc_lock, flags);
++	for (i = 0; i < pdc_region_cnt; i++) {
++		for (pin = pdc_region[i].pin_base;
++		     pin < pdc_region[i].pin_base + pdc_region[i].cnt; pin++) {
++			unsigned int virq = irq_find_mapping(pdc_wake_domain, pin);
++			struct irq_data *d = virq ? irq_get_irq_data(virq) : NULL;
++			bool want = d && !irqd_irq_disabled(d);
++
++			if (__pdc_intr_enabled(pin) == want)
++				continue;
++			__pdc_enable_intr(pin, want);
++			fixed++;
++		}
++	}
++	raw_spin_unlock_irqrestore(&pdc_lock, flags);
++	if (fixed)
++		pr_info("qcom-pdc: re-synced %u pin enable(s) after resume\n", fixed);
++}
++
++static const struct syscore_ops pdc_syscore_ops = {
++	.resume = pdc_syscore_resume,
++};
++
++static struct syscore pdc_syscore = {
++	.ops = &pdc_syscore_ops,
++};
++
+ static void pdc_enable_intr(struct irq_data *d, bool on)
+ {
+ 	unsigned long flags;
+@@ -435,6 +490,8 @@
+ 	}
+ 
+ 	irq_domain_update_bus_token(pdc_domain, DOMAIN_BUS_WAKEUP);
++	pdc_wake_domain = pdc_domain;
++	register_syscore(&pdc_syscore);
+ 
+ 	return 0;
+ 

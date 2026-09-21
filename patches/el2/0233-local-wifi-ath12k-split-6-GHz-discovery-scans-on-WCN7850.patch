@@ -1,0 +1,75 @@
+Subject: [PATCH] local: wifi: ath12k: split 6 GHz discovery scans on WCN7850
+
+A trace on the Yoga Slim 7x with scan-priority fix 0232 shows a successful
+hardware scan taking 8.976505 seconds after s2idle. Userspace requests
+NL80211_SCAN_FLAG_COLOCATED_6GHZ, but the scan covers 101 channels:
+13 in 2.4 GHz, 28 in 5 GHz and 60 in 6 GHz. There is no post-scan
+userspace delay or retry accounting for the latency.
+
+Enable cfg80211's split 6 GHz scan handling for single-radio, tri-band
+WCN7850. With the colocated-AP flag, cfg80211 scans legacy bands first and
+then selects 6 GHz preferred scanning channels plus channels reported in
+reduced neighbor reports. Requests without that flag retain the full
+requested channel coverage. Do not shorten dwell or change country rules.
+
+Follow Qualcomm's ChromiumOS ath11k split-scan sequencing: defer initial
+11d discovery until the 6 GHz part is submitted. Otherwise firmware can
+run country discovery between the two host scan parts. Keeping 11d in
+PREPARING also lets 0232 send MEDIUM priority for both parts. Preserve the
+existing 11d start on an unsuccessful host-scan submission.
+
+Like that implementation, a successful legacy-only scan on a split-scan
+wiphy leaves initial 11d discovery pending until a later 6 GHz scan. This
+must be considered when testing band-restricted discovery. The measured
+NetworkManager reconnect path requests all three bands.
+
+Log the channel count of each submitted part for the next hardware test.
+The measured 60-channel 6 GHz list has 15 PSC channels; eliminating 45
+70-ms dwells could save about 3.15 seconds before RNR additions and scan
+scheduling overhead. That is an estimate, not a tested WCN7850 result.
+
+Based on the split-scan design by Manikanta Pubbisetty for WCN6750:
+https://chromium.googlesource.com/chromiumos/third_party/kernel-rebase-patches/+/eb41b7da5ebc5eea36f59356919c78d1d80b19ec/4382f958e7c6f76ee4ac49480fde23bc7c6fa3b5bb190e615fc02f3e.patch
+---
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -5728,6 +5728,9 @@
+ 	}
+ 
+ 	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac scan started");
++	if (hw->wiphy->flags & WIPHY_FLAG_SPLIT_SCAN_6GHZ)
++		ath12k_info(ar->ab, "scan: split part 6ghz=%u channels=%u\n",
++			    req->scan_6ghz, n_channels);
+ 
+ 	/* Add a margin to account for event/command processing */
+ 	ieee80211_queue_delayed_work(ath12k_ar_to_hw(ar), &ar->scan.timeout,
+@@ -5740,9 +5743,14 @@
+ 		kfree(arg);
+ 	}
+ 
++	/* Keep country discovery from delaying the second half of a split scan.
++	 * Leave 11d PREPARING so both parts get the initial MEDIUM priority.
++	 */
+ 	if (ar->state_11d == ATH12K_11D_PREPARING &&
+ 	    ahvif->vdev_type == WMI_VDEV_TYPE_STA &&
+-	    ahvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE)
++	    ahvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE &&
++	    (ret || !(hw->wiphy->flags & WIPHY_FLAG_SPLIT_SCAN_6GHZ) ||
++	     req->scan_6ghz))
+ 		ath12k_mac_11d_scan_start(ar, arvif->vdev_id);
+ 
+ 	return ret;
+@@ -14862,8 +14870,11 @@
+ 	if (ah->num_radio == 1 &&
+ 	    wiphy->bands[NL80211_BAND_2GHZ] &&
+ 	    wiphy->bands[NL80211_BAND_5GHZ] &&
+-	    wiphy->bands[NL80211_BAND_6GHZ])
++	    wiphy->bands[NL80211_BAND_6GHZ]) {
+ 		ieee80211_hw_set(hw, SINGLE_SCAN_ON_ALL_BANDS);
++		if (ab->hw_rev == ATH12K_HW_WCN7850_HW20)
++			wiphy->flags |= WIPHY_FLAG_SPLIT_SCAN_6GHZ;
++	}
+ 
+ 	ieee80211_hw_set(hw, SIGNAL_DBM);
+ 	ieee80211_hw_set(hw, SUPPORTS_PS);

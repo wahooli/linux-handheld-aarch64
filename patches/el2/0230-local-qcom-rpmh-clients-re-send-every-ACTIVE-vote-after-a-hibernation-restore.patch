@@ -1,0 +1,353 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: qcom rpmh clients: re-send every ACTIVE vote after a hibernation restore
+
+Two kernels vote to RPMh across a hibernation: the one that loads the image and
+the one inside it. The loader is the same binary booted from the initcpio, and
+swsusp_arch_resume() obliterates it mid-flight with no .remove and no .suspend.
+Everything it voted stays in the RPMh ACTIVE set: RPMh keeps the last vote per
+resource and offers no readback, and the image kernel's four RPMh clients only
+send when their own bookkeeping changes.
+
+The loader's votes are not small. It never reaches sync_state -- the deferred
+probe timeout is 10 s and the resume write comes sooner -- so:
+
+  - interconnect: icc_node_add() votes INT_MAX on every node at probe and only
+    icc_sync_state() lowers it. Every BCM on every NoC is at its maximum.
+  - rpmhpd: rpmhpd_aggregate_corner() clamps to the highest corner until
+    rpmhpd_sync_state(). Every domain the loader enabled is at its top corner.
+  - clk-rpmh and rpmh-regulator: whatever the loader's consumers held.
+
+The image kernel re-sends a BCM only when a consumer on its path calls
+icc_set_bw(), a domain only when genpd toggles it or changes its perf state, a
+clock only when its aggregate changes, a regulator only when the core asks for
+a change. Anything static after the restore keeps the loader's vote for the
+life of the boot, and the AOP turns those votes into NoC clock rates and rail
+corners whether the APSS is awake or in s2idle.
+
+Measured on a Lenovo Yoga Slim 7x (X1E-80-100): a clean boot suspends at
+590 mW with an empty APSS sleep set. The same build after one hibernate
+suspends at 1131 mW with an identical sleep-set trace, identical clock
+hardware state, and the GIC/PDC leftovers already re-synced.
+
+Give each client a hibernation restore hook that re-sends everything from its
+own state: rpmhpd re-aggregates every domain at restore_noirq, before consumer
+domains power on; the icc providers re-commit every BCM; clk-rpmh forgets what
+it last sent and sends every clock; rpmh-regulator re-sends enable, voltage
+and mode for every regulator it has ever touched. Consumers that move later
+vote on top. .restore runs only on the hibernation restore path, never for
+s2idle. Only the x1e80100 NoC driver is wired to the shared icc pm ops here.
+---
+--- a/drivers/pmdomain/qcom/rpmhpd.c
++++ b/drivers/pmdomain/qcom/rpmhpd.c
+@@ -1216,12 +1216,55 @@
+ 	mutex_unlock(&rpmhpd_lock);
+ }
+ 
++/*
++ * A hibernation restore is programmed by two kernels: the one that loaded the
++ * image and this one. The loader never reached sync_state, so every domain it
++ * enabled sits at its highest corner in the RPMh ACTIVE set, RPMh has no
++ * readback, and this driver only sends when one of its own consumers moves.
++ * Re-send every domain from our own bookkeeping; consumers re-vote on top.
++ */
++static int rpmhpd_restore_noirq(struct device *dev)
++{
++	const struct rpmhpd_desc *desc = of_device_get_match_data(dev);
++	struct rpmhpd **rpmhpds = desc->rpmhpds;
++	unsigned int corner;
++	struct rpmhpd *pd;
++	unsigned int i;
++	int ret;
++
++	mutex_lock(&rpmhpd_lock);
++	for (i = 0; i < desc->num_pds; i++) {
++		pd = rpmhpds[i];
++		if (!pd)
++			continue;
++
++		if (pd->enabled)
++			corner = max(pd->corner, pd->enable_corner);
++		else
++			corner = 0;
++
++		/* The loader may have left it higher: wait for the ack. */
++		pd->active_corner = 0;
++		ret = rpmhpd_aggregate_corner(pd, corner);
++		if (ret)
++			dev_err(dev, "failed to restore %s (%d)\n", pd->res_name, ret);
++	}
++	mutex_unlock(&rpmhpd_lock);
++
++	return 0;
++}
++
++static const struct dev_pm_ops rpmhpd_pm_ops = {
++	.restore_noirq = rpmhpd_restore_noirq,
++};
++
+ static struct platform_driver rpmhpd_driver = {
+ 	.driver = {
+ 		.name = "qcom-rpmhpd",
+ 		.of_match_table = rpmhpd_match_table,
+ 		.suppress_bind_attrs = true,
+ 		.sync_state = rpmhpd_sync_state,
++		.pm = pm_sleep_ptr(&rpmhpd_pm_ops),
+ 	},
+ 	.probe = rpmhpd_probe,
+ };
+--- a/drivers/interconnect/qcom/icc-rpmh.h
++++ b/drivers/interconnect/qcom/icc-rpmh.h
+@@ -163,5 +163,6 @@
+ void qcom_icc_pre_aggregate(struct icc_node *node);
+ int qcom_icc_rpmh_probe(struct platform_device *pdev);
+ void qcom_icc_rpmh_remove(struct platform_device *pdev);
++extern const struct dev_pm_ops qcom_icc_rpmh_pm_ops;
+ 
+ #endif
+--- a/drivers/interconnect/qcom/icc-rpmh.c
++++ b/drivers/interconnect/qcom/icc-rpmh.c
+@@ -371,5 +371,29 @@
+ }
+ EXPORT_SYMBOL_GPL(qcom_icc_rpmh_remove);
+ 
++/*
++ * A hibernation restore is programmed by two kernels: the one that loaded the
++ * image and this one. The loader's icc_node_add() voted INT_MAX on every node,
++ * and only sync_state -- ten seconds into a boot the loader never finishes --
++ * would have lowered those votes. RPMh keeps the last ACTIVE vote per BCM and
++ * has no readback, and this kernel re-commits only the BCMs on paths its
++ * consumers touch. Re-commit every BCM of this provider from our aggregates.
++ */
++static int qcom_icc_rpmh_restore(struct device *dev)
++{
++	struct qcom_icc_provider *qp = dev_get_drvdata(dev);
++	size_t i;
++
++	for (i = 0; i < qp->num_bcms; i++)
++		qcom_icc_bcm_voter_add(qp->voter, qp->bcms[i]);
++
++	return qcom_icc_bcm_voter_commit(qp->voter);
++}
++
++const struct dev_pm_ops qcom_icc_rpmh_pm_ops = {
++	.restore = qcom_icc_rpmh_restore,
++};
++EXPORT_SYMBOL_GPL(qcom_icc_rpmh_pm_ops);
++
+ MODULE_DESCRIPTION("Qualcomm RPMh interconnect driver");
+ MODULE_LICENSE("GPL v2");
+--- a/drivers/interconnect/qcom/x1e80100.c
++++ b/drivers/interconnect/qcom/x1e80100.c
+@@ -1905,6 +1905,7 @@
+ 		.name = "qnoc-x1e80100",
+ 		.of_match_table = qnoc_of_match,
+ 		.sync_state = icc_sync_state,
++		.pm = pm_sleep_ptr(&qcom_icc_rpmh_pm_ops),
+ 	},
+ };
+ 
+--- a/drivers/clk/qcom/clk-rpmh.c
++++ b/drivers/clk/qcom/clk-rpmh.c
+@@ -249,13 +249,13 @@
+ 	.recalc_rate	= clk_rpmh_recalc_rate,
+ };
+ 
+-static int clk_rpmh_bcm_send_cmd(struct clk_rpmh *c, bool enable)
++/* Call with rpmh_clk_lock held. */
++static int __clk_rpmh_bcm_send_cmd(struct clk_rpmh *c, bool enable)
+ {
+ 	struct tcs_cmd cmd = { 0 };
+ 	u32 cmd_state;
+ 	int ret = 0;
+ 
+-	mutex_lock(&rpmh_clk_lock);
+ 	if (enable) {
+ 		cmd_state = 1;
+ 		if (c->aggr_state)
+@@ -284,6 +284,15 @@
+ 		}
+ 	}
+ 
++	return ret;
++}
++
++static int clk_rpmh_bcm_send_cmd(struct clk_rpmh *c, bool enable)
++{
++	int ret;
++
++	mutex_lock(&rpmh_clk_lock);
++	ret = __clk_rpmh_bcm_send_cmd(c, enable);
+ 	mutex_unlock(&rpmh_clk_lock);
+ 
+ 	return ret;
+@@ -1132,11 +1141,57 @@
+ };
+ MODULE_DEVICE_TABLE(of, clk_rpmh_match_table);
+ 
++/*
++ * A hibernation restore is programmed by two kernels: the one that loaded the
++ * image and this one. Whatever the loader's consumers left in the RPMh ACTIVE
++ * set stays there -- RPMh has no readback -- and this driver only sends when
++ * its own aggregate differs from what it last sent. Forget what we last sent
++ * and send every clock again from our own state.
++ */
++static int clk_rpmh_restore(struct device *dev)
++{
++	const struct clk_rpmh_desc *desc = of_device_get_match_data(dev);
++	struct clk_rpmh *c;
++	bool enable;
++	int i, ret;
++
++	mutex_lock(&rpmh_clk_lock);
++	for (i = 0; i < desc->num_clks; i++) {
++		if (!desc->clks[i])
++			continue;
++
++		c = to_clk_rpmh(desc->clks[i]);
++		if (c->peer) {
++			/* ARC/VRM: peers share one send, skip the one already done */
++			if (c->last_sent_aggr_state == ~c->aggr_state)
++				continue;
++			c->last_sent_aggr_state = ~c->aggr_state;
++			c->peer->last_sent_aggr_state = ~c->aggr_state;
++			ret = clk_rpmh_send_aggregate_command(c);
++		} else {
++			/* BCM: the last sent vote is our only record of enable */
++			enable = c->last_sent_aggr_state != 0;
++			c->last_sent_aggr_state = UINT_MAX;
++			ret = __clk_rpmh_bcm_send_cmd(c, enable);
++		}
++		if (ret)
++			dev_err(dev, "failed to restore %s (%d)\n", c->res_name, ret);
++	}
++	mutex_unlock(&rpmh_clk_lock);
++
++	return 0;
++}
++
++static const struct dev_pm_ops clk_rpmh_pm_ops = {
++	.restore = clk_rpmh_restore,
++};
++
+ static struct platform_driver clk_rpmh_driver = {
+ 	.probe		= clk_rpmh_probe,
+ 	.driver		= {
+ 		.name	= "clk-rpmh",
+ 		.of_match_table = clk_rpmh_match_table,
++		.pm	= pm_sleep_ptr(&clk_rpmh_pm_ops),
+ 	},
+ };
+ 
+--- a/drivers/regulator/qcom-rpmh-regulator.c
++++ b/drivers/regulator/qcom-rpmh-regulator.c
+@@ -155,6 +155,8 @@
+  */
+ struct rpmh_vreg {
+ 	struct device			*dev;
++	struct regulator_dev		*rdev;
++	struct list_head		list;
+ 	u32				addr;
+ 	struct regulator_desc		rdesc;
+ 	const struct rpmh_vreg_hw_data	*hw_data;
+@@ -531,6 +533,7 @@
+ 			node, ret);
+ 		return ret;
+ 	}
++	vreg->rdev = rdev;
+ 
+ 	dev_dbg(dev, "%pOFn regulator registered for RPMh resource %s @ 0x%05X\n",
+ 		node, rpmh_resource_name, vreg->addr);
+@@ -1816,6 +1819,7 @@
+ {
+ 	struct device *dev = &pdev->dev;
+ 	const struct rpmh_vreg_init_data *vreg_data;
++	struct list_head *vregs;
+ 	struct rpmh_vreg *vreg;
+ 	const char *pmic_id;
+ 	int ret;
+@@ -1830,6 +1834,12 @@
+ 		return ret;
+ 	}
+ 
++	vregs = devm_kzalloc(dev, sizeof(*vregs), GFP_KERNEL);
++	if (!vregs)
++		return -ENOMEM;
++	INIT_LIST_HEAD(vregs);
++	platform_set_drvdata(pdev, vregs);
++
+ 	for_each_available_child_of_node_scoped(dev->of_node, node) {
+ 		vreg = devm_kzalloc(dev, sizeof(*vreg), GFP_KERNEL);
+ 		if (!vreg)
+@@ -1839,11 +1849,64 @@
+ 						vreg_data);
+ 		if (ret < 0)
+ 			return ret;
++
++		list_add_tail(&vreg->list, vregs);
+ 	}
+ 
+ 	return 0;
+ }
+ 
++/*
++ * A hibernation restore is programmed by two kernels: the one that loaded the
++ * image and this one. The loader's consumers left their enable, voltage and
++ * mode votes in the RPMh ACTIVE set, RPMh has no readback, and this driver only
++ * sends when the regulator core asks for a change. Re-send what we know about
++ * every regulator, in the order the driver itself would have sent it.
++ */
++static int rpmh_regulator_restore(struct device *dev)
++{
++	struct list_head *vregs = dev_get_drvdata(dev);
++	struct rpmh_vreg *vreg;
++	int ret;
++
++	list_for_each_entry(vreg, vregs, list) {
++		/* regulator_lock() is core-private; this is what it takes. */
++		ww_mutex_lock(&vreg->rdev->mutex, NULL);
++
++		if (vreg->enabled != -EINVAL) {
++			if (vreg->voltage_selector != -ENOTRECOVERABLE) {
++				ret = _rpmh_regulator_vrm_set_voltage_sel(vreg->rdev,
++						vreg->voltage_selector, true);
++				if (ret)
++					dev_err(dev, "%s: failed to restore voltage (%d)\n",
++						vreg->rdesc.name, ret);
++			}
++
++			ret = rpmh_regulator_set_enable_state(vreg->rdev,
++							      vreg->enabled);
++			if (ret)
++				dev_err(dev, "%s: failed to restore enable (%d)\n",
++					vreg->rdesc.name, ret);
++		}
++
++		if (vreg->mode != REGULATOR_MODE_INVALID) {
++			ret = rpmh_regulator_vrm_set_mode_bypass(vreg, vreg->mode,
++								 vreg->bypassed);
++			if (ret)
++				dev_err(dev, "%s: failed to restore mode (%d)\n",
++					vreg->rdesc.name, ret);
++		}
++
++		ww_mutex_unlock(&vreg->rdev->mutex);
++	}
++
++	return 0;
++}
++
++static const struct dev_pm_ops rpmh_regulator_pm_ops = {
++	.restore = rpmh_regulator_restore,
++};
++
+ static const struct of_device_id __maybe_unused rpmh_regulator_match_table[] = {
+ 	{
+ 		.compatible = "qcom,pm8005-rpmh-regulators",
+@@ -2010,6 +2073,7 @@
+ 		.name = "qcom-rpmh-regulator",
+ 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+ 		.of_match_table	= of_match_ptr(rpmh_regulator_match_table),
++		.pm = pm_sleep_ptr(&rpmh_regulator_pm_ops),
+ 	},
+ 	.probe = rpmh_regulator_probe,
+ };

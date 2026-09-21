@@ -1,0 +1,108 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: drm/msm/dpu: name the ctl reset that actually fails
+
+DIAGNOSTIC. Adds no behaviour, only two error paths that were silent.
+
+0143 instruments the wrong end of this bug. It reports CTL_SW_RESET bit 0 still
+set at kickoff, and on hardware that report is accurate but misattributed: the
+bit is set *earlier*, by a reset this driver issued and nobody checked.
+
+dpu_hw_ctl_reset_control() is the only code that ever writes CTL_SW_RESET=1. It
+polls 2 ms and returns -EINVAL on timeout. Of its two callers, only
+dpu_encoder_helper_hw_reset() looks at the return; dpu_encoder_helper_phys_cleanup()
+discards it. So a reset that never completes leaves the bit set, prints nothing,
+and the next kickoff trips over it and blames a frame that had nothing to do
+with it. Every log we have starts at that second event.
+
+Evidence for the misattribution, from two failures on 2026-09-18:
+
+  cold boot   4.306 vblank timeout        <- pipeline already stalled
+              4.485 ctl1 stuck in sw reset
+  hib entry  30.228 freezing user space   <- display disabled here, silently
+             30.479 ctl1 stuck in sw reset
+             30.529 vblank timeout
+
+In both, the reset that set the bit is unlogged and off the front of the trace.
+0143 also proved the bit is not a stale handover -- its at-init check has never
+fired across every boot since it was added -- and that writing 0 back does not
+clear it, so this is a reset in progress that never finishes, not a latched bit.
+
+Two hunks:
+
+- dpu_hw_ctl_reset_control(): pr_err on the failing poll, with the register read
+  back. Silent on success, so a healthy boot stays quiet.
+
+- dpu_encoder_helper_phys_cleanup(): stop discarding the return, and read the
+  INTF timing-engine status when it fails. This is the discriminator.
+  dpu_encoder_phys_vid_disable() stops the timing engine and only then calls
+  cleanup, so the reset can be issued into a pipeline that has stopped clocking.
+  timing_en=0 on every failure means the ordering is the bug and the fix belongs
+  in the disable path; timing_en=1 means the ctl genuinely wedges under a running
+  engine and the fix belongs in the ctl. frame_count/line_count separate "engine
+  off" from "engine on but not advancing".
+
+Expected on a healthy boot: nothing. On a failing one, one new line before the
+first "stuck in sw reset", naming the caller and the engine state.
+
+Compile-checked against the 0143 tree, both objects, no warnings. Shelve once it
+has answered.
+
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.c
+@@ -437,8 +437,19 @@
+ 
+ 	pr_debug("issuing hw ctl reset for ctl:%d\n", ctx->idx);
+ 	DPU_REG_WRITE(c, CTL_SW_RESET, 0x1);
+-	if (dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US))
++	if (dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US)) {
++		/*
++		 * This is the only place that ever sets the bit, and the only
++		 * caller that checks the return is the hw_reset path. When the
++		 * poll fails here the bit stays set and the *next* kickoff is
++		 * what reports it, so the failure gets pinned on a frame that
++		 * had nothing to do with it. Name it where it happens.
++		 */
++		pr_err("ctl%d sw reset did not complete in %d us (SW_RESET=%#010x)\n",
++		       ctx->idx, DPU_REG_RESET_TIMEOUT_US,
++		       DPU_REG_READ(c, CTL_SW_RESET));
+ 		return -EINVAL;
++	}
+ 
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -2259,12 +2259,31 @@
+ {
+ 	struct dpu_hw_ctl *ctl = phys_enc->hw_ctl;
+ 	struct dpu_hw_intf_cfg intf_cfg = { 0 };
+-	int i;
++	struct dpu_hw_intf_status intf_status = { 0 };
++	int i, rc;
+ 	struct dpu_encoder_virt *dpu_enc;
+ 
+ 	dpu_enc = to_dpu_encoder_virt(phys_enc->parent);
+ 
+-	ctl->ops.reset(ctl);
++	/*
++	 * dpu_encoder_phys_vid_disable() stops the timing engine before it gets
++	 * here, so this reset can land on a pipeline that has already stopped
++	 * clocking. Upstream discards the return entirely. Record the engine
++	 * state alongside the failure: a reset that only ever fails with
++	 * timing_en=0 is a sequencing bug, not a wedged ctl.
++	 */
++	rc = ctl->ops.reset(ctl);
++	if (rc) {
++		if (phys_enc->hw_intf && phys_enc->hw_intf->ops.get_status)
++			phys_enc->hw_intf->ops.get_status(phys_enc->hw_intf,
++							  &intf_status);
++		DPU_ERROR_ENC(dpu_enc,
++			      "ctl %d reset failed at cleanup: intf%d timing_en=%u frame_count=%u line_count=%u\n",
++			      ctl->idx,
++			      phys_enc->hw_intf ? phys_enc->hw_intf->idx - INTF_0 : -1,
++			      intf_status.is_en, intf_status.frame_count,
++			      intf_status.line_count);
++	}
+ 
+ 	dpu_encoder_helper_reset_mixers(phys_enc);
+ 

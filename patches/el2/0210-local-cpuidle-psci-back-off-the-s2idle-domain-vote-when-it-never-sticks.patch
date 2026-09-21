@@ -1,0 +1,176 @@
+From: Waltteri Hooli <wahooli@localhost>
+Subject: [PATCH] local: cpuidle: psci: back off the s2idle domain vote when it
+ never sticks
+
+On x1e80100 the s2idle domain state is accepted by firmware and returns in under
+a microsecond. psci_cpu_suspend_enter() reports success, enter_s2idle_proper()
+discards the result, and the idle loop re-enters immediately -- ~7000 times a
+second on a clean boot, ~15000 after a hibernate. Nothing is waking the CPU; it
+never sleeps in the first place. See docs.local/S2IDLE-DRAIN.md.
+
+The PSCI call is not what costs. Every pass also runs dev_pm_genpd_suspend() and
+dev_pm_genpd_resume(), tearing the whole CPU/cluster/system domain hierarchy
+down and re-voting it through RPMh. Bracketing genpd's own idle_states counters
+across suspends measures power as linear in that rate:
+
+  s2idle power ~= 700-800 mW + ~0.1 mW per domain transition/s
+
+i.e. 92-140 uJ per pass, fitted independently from two pre/post-hibernate pairs.
+At 15000/s the hierarchy churn is most of the machine's sleep power: 1351 mW on
+a clean boot and 2069 mW after a hibernate, against a ~700 mW intercept.
+
+So stop paying for the hierarchy once the deep state is demonstrably not
+sticking. After PSCI_S2IDLE_FUTILE_LIMIT consecutive entries that return short
+of the state's own target residency, skip the genpd suspend/resume pair and make
+the bare CPU-level call instead. With genpd skipped nothing calls
+psci_set_domain_state(), so ds->state stays zero and states[idx] is used -- the
+CPU state alone, no domain vote, and no rejected-statistics accounting either.
+The full path is retried every PSCI_S2IDLE_RETRY_NS, so a platform where the
+state does stick is unaffected: there the first entry sleeps past its target,
+the counter resets, and the backoff never arms.
+
+This is a mitigation, not a fix. It caps the loss at the intercept; it does not
+explain why PSCI returns instantly, which is still open and worth considerably
+more -- aosd/cxsd/ddr have never once collapsed on this machine. Runtime idle is
+left completely alone: it works, and cpu-sleep-0 is worth ~4.8 W there.
+
+s2idle_domain_backoff is writable at runtime, so one build gives both arms of
+the A/B with no reboot:
+
+  echo 0 | sudo tee /sys/module/cpuidle_psci/parameters/s2idle_domain_backoff
+
+The effect needs no new plumbing to observe: the usage counts in
+/sys/kernel/debug/pm_genpd/power-domain-system/idle_states should fall from
+millions per suspend to a few hundred, and s2idle-power.sh already brackets them.
+
+--- a/drivers/cpuidle/cpuidle-psci.c	2026-09-16 19:35:23.579022754 +0300
++++ b/drivers/cpuidle/cpuidle-psci.c	2026-09-16 19:35:23.594059177 +0300
+@@ -20,6 +20,7 @@
+ #include <linux/psci.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
++#include <linux/sched/clock.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ #include <linux/syscore_ops.h>
+@@ -36,6 +37,12 @@
+ 	struct device *dev;
+ };
+ 
++/* Per-CPU s2idle backoff state; see __psci_enter_domain_idle_state(). */
++struct psci_s2idle_backoff {
++	u64		retry_at;
++	unsigned int	futile;
++};
++
+ struct psci_cpuidle_domain_state {
+ 	struct generic_pm_domain *pd;
+ 	unsigned int state_idx;
+@@ -45,6 +52,58 @@
+ static DEFINE_PER_CPU_READ_MOSTLY(struct psci_cpuidle_data, psci_cpuidle_data);
+ static DEFINE_PER_CPU(struct psci_cpuidle_domain_state, psci_domain_state);
+ static bool psci_cpuidle_use_syscore;
++static DEFINE_PER_CPU(struct psci_s2idle_backoff, psci_s2idle_backoff);
++
++/*
++ * How many consecutive futile entries before the domain vote is skipped, and
++ * how long to stay backed off before re-testing. 16 keeps a healthy platform
++ * from arming this by accident; the retry then costs 16 full passes per second,
++ * ~1.6 mW at the measured per-pass energy.
++ */
++#define PSCI_S2IDLE_FUTILE_LIMIT	16
++#define PSCI_S2IDLE_RETRY_NS		NSEC_PER_SEC
++
++static bool s2idle_domain_backoff = true;
++module_param(s2idle_domain_backoff, bool, 0644);
++MODULE_PARM_DESC(s2idle_domain_backoff,
++	 "Skip the genpd domain vote during s2idle once the domain idle state stops sticking (default: on)");
++
++static bool psci_s2idle_skip_domain(void)
++{
++	struct psci_s2idle_backoff *b = this_cpu_ptr(&psci_s2idle_backoff);
++
++	if (!s2idle_domain_backoff || b->futile < PSCI_S2IDLE_FUTILE_LIMIT)
++		return false;
++
++	/* Re-arm the full path periodically so recovery is noticed. */
++	if ((s64)(local_clock_noinstr() - b->retry_at) >= 0) {
++		b->futile = 0;
++		return false;
++	}
++
++	return true;
++}
++
++/*
++ * An entry returning short of the state's own target residency achieved
++ * nothing. target_residency_ns is the CPU state's (600 us on x1e80100) even when
++ * a deeper domain state was requested, which errs towards *not* arming the
++ * backoff -- futile entries here return in under a microsecond, three orders of
++ * magnitude clear of the threshold.
++ */
++static void psci_s2idle_account(u64 entered_ns, u64 target_ns)
++{
++	struct psci_s2idle_backoff *b = this_cpu_ptr(&psci_s2idle_backoff);
++
++	if (entered_ns >= target_ns) {
++		b->futile = 0;
++		return;
++	}
++
++	if (b->futile < PSCI_S2IDLE_FUTILE_LIMIT &&
++	    ++b->futile == PSCI_S2IDLE_FUTILE_LIMIT)
++		b->retry_at = local_clock_noinstr() + PSCI_S2IDLE_RETRY_NS;
++}
+ 
+ void psci_set_domain_state(struct generic_pm_domain *pd, unsigned int state_idx,
+ 			   u32 state)
+@@ -70,6 +129,8 @@
+ 	struct device *pd_dev = data->dev;
+ 	struct psci_cpuidle_domain_state *ds;
+ 	u32 state = states[idx];
++	bool skip_domain = s2idle && psci_s2idle_skip_domain();
++	u64 entered_at = 0;
+ 	int ret;
+ 
+ 	ret = cpu_pm_enter();
+@@ -77,23 +138,34 @@
+ 		return -1;
+ 
+ 	/* Do runtime PM to manage a hierarchical CPU toplogy. */
+-	if (s2idle)
+-		dev_pm_genpd_suspend(pd_dev);
+-	else
++	if (s2idle) {
++		if (!skip_domain)
++			dev_pm_genpd_suspend(pd_dev);
++	} else {
+ 		pm_runtime_put_sync_suspend(pd_dev);
++	}
+ 
+ 	ds = this_cpu_ptr(&psci_domain_state);
+ 	if (ds->state)
+ 		state = ds->state;
+ 
++	if (s2idle)
++		entered_at = local_clock_noinstr();
++
+ 	trace_psci_domain_idle_enter(dev->cpu, state, s2idle);
+ 	ret = psci_cpu_suspend_enter(state) ? -1 : idx;
+ 	trace_psci_domain_idle_exit(dev->cpu, state, s2idle);
+ 
+ 	if (s2idle)
+-		dev_pm_genpd_resume(pd_dev);
+-	else
++		psci_s2idle_account(local_clock_noinstr() - entered_at,
++				    drv->states[idx].target_residency_ns);
++
++	if (s2idle) {
++		if (!skip_domain)
++			dev_pm_genpd_resume(pd_dev);
++	} else {
+ 		pm_runtime_get_sync(pd_dev);
++	}
+ 
+ 	cpu_pm_exit();
+ 

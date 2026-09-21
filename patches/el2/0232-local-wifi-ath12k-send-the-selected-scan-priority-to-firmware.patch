@@ -1,0 +1,50 @@
+Subject: [PATCH] local: wifi: ath12k: send the selected scan priority to firmware
+
+ath12k_wmi_send_scan_start_cmd() selects MEDIUM priority while 11d scan
+offload is being prepared and LOW otherwise, but only updates the host
+argument. It never copies that value into the WMI command. The command
+buffer is zeroed, so firmware receives VERY_LOW for every normal scan.
+
+The 11d offload implementation raises the first host scan's priority to
+avoid preemption by the firmware's MEDIUM-priority country discovery.
+Restore the missing little-endian assignment so firmware receives the
+priority the driver selected.
+
+On the Yoga Slim 7x/WCN7850, the unpatched journal shows about 16.1 seconds
+between supplicant availability and connection activation on cold boot,
+two hibernate restores and two s2idle resumes. Country discovery completes
+about 7.2 seconds into that interval. Authentication and DHCP are quick.
+The missing assignment is a source-proven defect; whether it accounts for
+that delay still needs a patched hardware comparison.
+
+Log successful submission of the initial MEDIUM-priority scan so the test
+can identify the corrected path with CONFIG_ATH12K_DEBUG disabled. This
+marker proves command submission, not firmware scheduling or scan success.
+
+Link: https://lists.infradead.org/pipermail/ath12k/2025-March/006346.html
+---
+ drivers/net/wireless/ath/ath12k/wmi.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -2684,6 +2684,7 @@ int ath12k_wmi_send_scan_start_cmd(struct ath12k *ar,
+ 		arg->scan_priority = WMI_SCAN_PRIORITY_MEDIUM;
+ 	else
+ 		arg->scan_priority = WMI_SCAN_PRIORITY_LOW;
++	cmd->scan_priority = cpu_to_le32(arg->scan_priority);
+ 	cmd->notify_scan_events = cpu_to_le32(arg->notify_scan_events);
+ 
+ 	ath12k_wmi_copy_scan_event_cntrl_flags(cmd, arg);
+@@ -2800,6 +2801,10 @@ int ath12k_wmi_send_scan_start_cmd(struct ath12k *ar,
+ 		ath12k_warn(ar->ab, "failed to send WMI_START_SCAN_CMDID\n");
+ 		dev_kfree_skb(skb);
+ 	}
++	if (!ret && ar->state_11d == ATH12K_11D_PREPARING)
++		ath12k_info(ar->ab,
++			    "scan: initial scan priority %u submitted to firmware\n",
++			    arg->scan_priority);
+ 
+ 	return ret;
+ }
