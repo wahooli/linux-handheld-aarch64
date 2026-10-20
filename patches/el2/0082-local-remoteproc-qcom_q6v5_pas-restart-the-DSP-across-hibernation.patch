@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Date: Fri, 11 Sep 2026 10:30:00 +0300
 Subject: [PATCH 82/82] local: remoteproc: qcom_q6v5_pas: restart the DSP across
  hibernation
@@ -93,14 +93,14 @@ is the point of the whole notifier and must be reached in every case --
 aborting over a -EINVAL from an already-stopped PAS is what left the CDSP
 offline.
 ---
- drivers/remoteproc/qcom_q6v5_pas.c | 177 +++++++++++++++++++++++++++++++++
- 1 file changed, 177 insertions(+)
+ drivers/remoteproc/qcom_q6v5_pas.c | 178 +++++++++++++++++++++++++++++++++
+ 1 file changed, 178 insertions(+)
 
 diff --git a/drivers/remoteproc/qcom_q6v5_pas.c b/drivers/remoteproc/qcom_q6v5_pas.c
-index eabe58d8d..1e62ea9ee 100644
+index 2d0e5dbb8..cb621b429 100644
 --- a/drivers/remoteproc/qcom_q6v5_pas.c
 +++ b/drivers/remoteproc/qcom_q6v5_pas.c
-@@ -26,6 +26,7 @@
+@@ -28,6 +28,7 @@
  #include <linux/soc/qcom/mdt_loader.h>
  #include <linux/soc/qcom/smem.h>
  #include <linux/soc/qcom/smem_state.h>
@@ -108,17 +108,17 @@ index eabe58d8d..1e62ea9ee 100644
  
  #include "qcom_common.h"
  #include "qcom_pil_info.h"
-@@ -118,6 +119,9 @@ struct qcom_pas {
+@@ -123,6 +124,9 @@ struct qcom_pas {
  
- 	struct qcom_scm_pas_context *pas_ctx;
- 	struct qcom_scm_pas_context *dtb_pas_ctx;
+ 	struct qcom_pas_context *pas_ctx;
+ 	struct qcom_pas_context *dtb_pas_ctx;
 +
 +	struct notifier_block pm_notifier;
 +	bool hibernate_restart;
  };
  
  static void qcom_pas_segment_dump(struct rproc *rproc,
-@@ -771,6 +775,171 @@ static void qcom_pas_unassign_memory_region(struct qcom_pas *pas)
+@@ -800,6 +804,171 @@ static void qcom_pas_unassign_memory_region(struct qcom_pas *pas)
  	}
  }
  
@@ -145,7 +145,7 @@ index eabe58d8d..1e62ea9ee 100644
 + * channel state), and nothing can be renegotiated from this side: a fresh
 + * VERSION draws silence and a GLINK SSR do_cleanup is never answered. Stopping
 + * the remoteproc afterwards does not work either -- the SMP2P handshake comes
-+ * out of the image, so the remote never acks it, and qcom_scm_pas_shutdown()
++ * out of the image, so the remote never acks it, and qcom_pas_shutdown()
 + * then returns -EINVAL.
 + *
 + * So do it from the other end. rproc_shutdown() while the DSP is still healthy
@@ -244,7 +244,7 @@ index eabe58d8d..1e62ea9ee 100644
 +		/*
 +		 * Ask that DSP to stop before telling TrustZone to tear it
 +		 * down -- the cold-boot order, and qcom_pas_stop() does the
-+		 * same. It matters here because qcom_scm_pas_shutdown() is a
++		 * same. It matters here because qcom_pas_shutdown() is a
 +		 * synchronous SMC with no timeout of its own, and shutting
 +		 * down a PAS that is still running has hung the resume.
 +		 *
@@ -267,14 +267,14 @@ index eabe58d8d..1e62ea9ee 100644
 +		/*
 +		 * Errors are expected and never fatal: as at cold boot we do
 +		 * not know whether the lite or the full image is loaded, so
-+		 * one of the two shutdowns inside qcom_pas_shutdown() always
++		 * one of the two shutdowns of qcom_pas_shutdown_full_or_lite() always
 +		 * fails, and a DSP the bootloader did not start fails both.
 +		 * Do not skip rproc_boot() over them -- that is what left the
 +		 * CDSP offline.
 +		 */
-+		qcom_pas_shutdown(pas->pas_id, pas->lite_pas_id);
++		qcom_pas_shutdown_full_or_lite(pas->pas_id, pas->lite_pas_id);
 +		if (pas->dtb_pas_id)
-+			qcom_pas_shutdown(pas->dtb_pas_id, pas->lite_dtb_pas_id);
++			qcom_pas_shutdown_full_or_lite(pas->dtb_pas_id, pas->lite_dtb_pas_id);
 +
 +		ret = rproc_boot(rproc);
 +		if (ret)
@@ -290,7 +290,7 @@ index eabe58d8d..1e62ea9ee 100644
  static int qcom_pas_probe(struct platform_device *pdev)
  {
  	const struct qcom_pas_data *desc;
-@@ -936,8 +1105,15 @@ static int qcom_pas_probe(struct platform_device *pdev)
+@@ -952,12 +1121,19 @@ static int qcom_pas_probe(struct platform_device *pdev)
  	if (ret)
  		goto remove_ssr_sysmon;
  
@@ -299,6 +299,10 @@ index eabe58d8d..1e62ea9ee 100644
 +	if (ret)
 +		goto del_rproc;
 +
+ 	node = of_get_compatible_child(pdev->dev.of_node, "qcom,bam-dmux");
+ 	pas->bam_dmux = of_platform_device_create(node, NULL, &pdev->dev);
+ 	of_node_put(node);
+ 
  	return 0;
  
 +del_rproc:
@@ -306,13 +310,14 @@ index eabe58d8d..1e62ea9ee 100644
  remove_ssr_sysmon:
  	qcom_remove_ssr_subdev(rproc, &pas->ssr_subdev);
  	qcom_remove_sysmon_subdev(pas->sysmon);
-@@ -965,6 +1141,7 @@ static void qcom_pas_remove(struct platform_device *pdev)
+@@ -985,6 +1161,8 @@ static void qcom_pas_remove(struct platform_device *pdev)
  	if (!pas->rproc)
  		return;
  
 +	unregister_pm_notifier(&pas->pm_notifier);
- 	rproc_del(pas->rproc);
++
+ 	if (pas->bam_dmux)
+ 		of_platform_device_destroy(&pas->bam_dmux->dev, NULL);
  
- 	qcom_q6v5_deinit(&pas->q6v5);
 -- 
 2.51.0

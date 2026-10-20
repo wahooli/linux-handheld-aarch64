@@ -23,8 +23,7 @@ import sys
 
 import yaml
 
-# Built rather than written literally, so this file never contains the sequence
-# it looks for -- grepping the repo for the bug would otherwise match the linter.
+# Built, not literal, so this file never contains the sequence it searches for.
 OPEN = "$" + "{{"
 CLOSE = "}" + "}"
 EXPR = re.compile(re.escape(OPEN) + r".*?" + re.escape(CLOSE))
@@ -62,11 +61,7 @@ def main() -> int:
                 )
                 bad += 1
 
-        # 3. Every bash `run:` block parses as shell. A workflow is mostly shell
-        #    pasted into YAML, and YAML validity says nothing about it.
-        #
-        #    ${{ }} is substituted before the shell ever sees it, so replace it
-        #    with a bare token rather than letting it confuse bash.
+        # 3. Every bash run: block parses as shell; expressions are stubbed out first.
         try:
             doc = yaml.safe_load(open(path)) or {}
         except Exception:

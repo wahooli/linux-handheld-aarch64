@@ -1,0 +1,86 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] local: usb: typec: mux: ps883x: reset the retimer when the sink re-asserts HPD
+
+On the Yoga Slim 7x, with a Samsung C49G95T at 5120x1440@120 (HBR3 x4)
+behind a USB-C dock and a DP KVM, the link occasionally loses lock on all
+four lanes. About ten seconds later the PS8830's LTTPR caps fall back from
+HBR3 x4 (rev 2.0) to HBR2 x1 (rev 1.2). CONN_STATUS still reads 03/87/00,
+so the chip has not been reset, and the caps stay degraded until a replug.
+msm DP clamps the link to them: black before 0235/0236, a low mode after.
+
+Toggling HPD_LEVEL through a low period does not clear the fallback. A
+replug does, and the part of a replug that reaches the retimer is
+ps883x_reset() (rails and reset line) followed by a fresh configure.
+
+The sink answers the dead link by dropping HPD, which pmic_glink passes on
+as a DP event with DP_STATUS_HPD_STATE clear, and raises it again a second
+or two later. Treat that re-assertion like a replug: reset the retimer and
+let the configure below bring it back up with its caps restored, before
+pmic_glink notifies DRM of the new HPD state.
+
+Only a high -> low -> high sequence while the retimer is running counts,
+so the first HPD after plug-in and repeated IRQ_HPD events do not reset it.
+Skip it when the port also carries USB 3 (pin assignment D), which the
+reset would drop.
+
+--- a/drivers/usb/typec/mux/ps883x.c
++++ b/drivers/usb/typec/mux/ps883x.c
+@@ -63,6 +63,8 @@
+ 
+ 	enum typec_orientation orientation;
+ 	bool in_reset;
++	bool dp_hpd;		/* sink HPD level at the last DP event */
++	bool dp_hpd_dropped;	/* went low after having been high */
+ };
+ 
+ static int ps883x_enable_vregs(struct ps883x_retimer *retimer)
+@@ -198,6 +200,7 @@
+ 
+ static int ps883x_set(struct ps883x_retimer *retimer, struct typec_retimer_state *state)
+ {
++	const struct typec_displayport_data *dp_data = NULL;
+ 	struct typec_thunderbolt_data *tb_data;
+ 	const struct enter_usb_data *eudo_data;
+ 	int cfg0 = CONN_STATUS_0_CONNECTION_PRESENT;
+@@ -211,6 +214,7 @@
+ 	if (state->alt) {
+ 		switch (state->alt->svid) {
+ 		case USB_TYPEC_DP_SID:
++			dp_data = state->data;
+ 			cfg1 |= CONN_STATUS_1_DP_CONNECTED |
+ 				CONN_STATUS_1_DP_HPD_LEVEL;
+ 
+@@ -272,6 +276,33 @@
+ 		}
+ 	}
+ 
++	/*
++	 * After a link loss the LTTPR can fall back to HBR2 x1 caps (rev 1.2)
++	 * and keep them until the chip is reset; toggling HPD_LEVEL does not
++	 * clear it. The sink answers a dead link by dropping HPD, so treat its
++	 * return like a replug. Not with USB 3 on the port, which would drop too.
++	 */
++	if (dp_data) {
++		bool hpd = dp_data->status & DP_STATUS_HPD_STATE;
++
++		if (!hpd && retimer->dp_hpd)
++			retimer->dp_hpd_dropped = true;
++
++		if (hpd && retimer->dp_hpd_dropped && !retimer->in_reset &&
++		    !(cfg0 & CONN_STATUS_0_USB_3_1_CONNECTED)) {
++			dev_info(&retimer->client->dev,
++				 "sink re-asserted HPD, resetting the retimer\n");
++			ps883x_reset(retimer);
++		}
++
++		if (hpd)
++			retimer->dp_hpd_dropped = false;
++		retimer->dp_hpd = hpd;
++	} else {
++		retimer->dp_hpd = false;
++		retimer->dp_hpd_dropped = false;
++	}
++
+ 	return ps883x_configure(retimer, cfg0, cfg1, cfg2, reset);
+ }
+ 

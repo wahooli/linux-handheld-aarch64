@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] ASoC: codecs: lpass-{wsa,rx}-macro: sort the reg_defaults we assemble
 
 Three lines of regmap scolding on every probe of these codecs, so once per

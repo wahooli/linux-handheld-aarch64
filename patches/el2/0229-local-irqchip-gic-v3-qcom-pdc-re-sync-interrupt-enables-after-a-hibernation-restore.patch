@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] local: irqchip: gic-v3, qcom-pdc: re-sync interrupt enables after a hibernation restore
 
 Two kernels program the interrupt controllers across a hibernation: the one
@@ -34,6 +34,14 @@ disabled here too. syscore_resume() runs on the restore path and after the
 image snapshot, and not at all for suspend-to-idle, so on this machine the cost
 is one walk per hibernate; where the state already matches nothing is written.
 
+Rebased onto cachyos-7.3.0-2, which moved qcom-pdc's state into struct
+pdc_desc with per-version enable ops and added a secondary mode (x1e falls
+into it when the SCM pass-through write fails). The PDC walk now calls
+pdc->enable_intr(), which takes the lock itself, and for a secondary-mode
+GPIO pin also wants it unmasked and re-syncs the GPIO mask bit with it.
+
+diff --git a/drivers/irqchip/irq-gic-v3.c b/drivers/irqchip/irq-gic-v3.c
+index 6e1fa5b24..f10a21a47 100644
 --- a/drivers/irqchip/irq-gic-v3.c
 +++ b/drivers/irqchip/irq-gic-v3.c
 @@ -9,6 +9,7 @@
@@ -44,7 +52,7 @@ is one walk per hibernate; where the state already matches nothing is written.
  #include <linux/delay.h>
  #include <linux/interrupt.h>
  #include <linux/irqdomain.h>
-@@ -1503,6 +1504,53 @@
+@@ -1500,6 +1501,53 @@ static void gic_cpu_pm_init(void)
  	cpu_pm_register_notifier(&gic_cpu_pm_notifier_block);
  }
  
@@ -98,7 +106,7 @@ is one walk per hibernate; where the state already matches nothing is written.
  #else
  static inline void gic_cpu_pm_init(void) { }
  #endif /* CONFIG_CPU_PM */
-@@ -2053,6 +2101,7 @@
+@@ -2050,6 +2098,7 @@ static int __init gic_init_bases(phys_addr_t dist_phys_base,
  	gic_enable_nmi_support();
  	gic_smp_init();
  	gic_cpu_pm_init();
@@ -106,6 +114,8 @@ is one walk per hibernate; where the state already matches nothing is written.
  
  	if (gic_dist_supports_lpis()) {
  		its_init(handle, &gic_data.rdists, gic_data.domain, dist_prio_irq);
+diff --git a/drivers/irqchip/qcom-pdc.c b/drivers/irqchip/qcom-pdc.c
+index ce6d80c7f..c9d2e0cbb 100644
 --- a/drivers/irqchip/qcom-pdc.c
 +++ b/drivers/irqchip/qcom-pdc.c
 @@ -18,6 +18,7 @@
@@ -115,25 +125,27 @@ is one walk per hibernate; where the state already matches nothing is written.
 +#include <linux/syscore_ops.h>
  #include <linux/slab.h>
  #include <linux/types.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
+@@ -186,6 +187,7 @@ struct pdc_pin_region {
+ #define pin_to_hwirq(r, p)	((r)->parent_base + (p) - (r)->pin_base)
  
-@@ -61,6 +62,7 @@
- static struct pdc_pin_region *pdc_region;
- static int pdc_region_cnt;
- static unsigned int pdc_version;
+ static struct pdc_desc *pdc;
 +static struct irq_domain *pdc_wake_domain;
- static bool pdc_x1e_quirk;
  
  static void pdc_base_reg_write(void __iomem *base, int reg, u32 i, u32 val)
-@@ -139,6 +141,59 @@
- 		pdc_enable_intr_cfg(pin_out, on);
+ {
+@@ -284,6 +286,64 @@ static void pdc_enable_intr_cfg(int pin_out, bool on)
+ 	pdc_reg_write(pdc->regs->irq_cfg_reg, pin_out, enable);
  }
  
-+static bool __pdc_intr_enabled(int pin_out)
++static bool pdc_intr_enabled(int pin_out)
 +{
-+	if (pdc_version < PDC_VERSION_3_2)
-+		return pdc_reg_read(IRQ_ENABLE_BANK, FIELD_GET(IRQ_ENABLE_BANK_INDEX_MASK, pin_out)) &
-+		       BIT(FIELD_GET(IRQ_ENABLE_BANK_BIT_MASK, pin_out));
-+	return pdc_reg_read(IRQ_i_CFG, pin_out) & BIT(IRQ_i_CFG_IRQ_ENABLE);
++	if (pdc->version >= PDC_VERSION_3_2)
++		return pdc_reg_read(pdc->regs->irq_cfg_reg, pin_out) &
++		       BIT(pdc->cfg_fields->irq_enable);
++
++	return pdc_reg_read(pdc->regs->irq_en_reg, FIELD_GET(IRQ_ENABLE_BANK_INDEX_MASK, pin_out)) &
++	       BIT(FIELD_GET(IRQ_ENABLE_BANK_BIT_MASK, pin_out));
 +}
 +
 +/*
@@ -143,32 +155,35 @@ is one walk per hibernate; where the state already matches nothing is written.
 + * this kernel, believing them disabled, never cleared them, so they woke the
 + * APSS out of every s2idle collapse. Re-sync every pin to this kernel's irqdesc
 + * state at syscore resume. See gic_syscore_resume() for the GIC half.
++ *
++ * A secondary-mode GPIO pin also drops its enable (and GPIO mask) bit while
++ * masked, so for those the wanted state is enabled and unmasked.
 + */
 +static void pdc_syscore_resume(void *data)
 +{
-+	unsigned long flags;
 +	unsigned int fixed = 0;
-+	int i;
 +	u32 pin;
 +
 +	if (!pdc_wake_domain)
 +		return;
 +
-+	raw_spin_lock_irqsave(&pdc_lock, flags);
-+	for (i = 0; i < pdc_region_cnt; i++) {
-+		for (pin = pdc_region[i].pin_base;
-+		     pin < pdc_region[i].pin_base + pdc_region[i].cnt; pin++) {
++	for (int i = 0; i < pdc->region_cnt; i++) {
++		for (pin = pdc->region[i].pin_base;
++		     pin < pdc->region[i].pin_base + pdc->region[i].cnt; pin++) {
 +			unsigned int virq = irq_find_mapping(pdc_wake_domain, pin);
 +			struct irq_data *d = virq ? irq_get_irq_data(virq) : NULL;
-+			bool want = d && !irqd_irq_disabled(d);
++			bool secondary = pdc->mode == PDC_SECONDARY_MODE && pdc_pin_is_gpio(pin);
++			bool want = d && !irqd_irq_disabled(d) &&
++				    !(secondary && irqd_irq_masked(d));
 +
-+			if (__pdc_intr_enabled(pin) == want)
++			if (pdc_intr_enabled(pin) == want)
 +				continue;
-+			__pdc_enable_intr(pin, want);
++			pdc->enable_intr(pin, want);
++			if (secondary)
++				pdc->unmask_gpio(pin, want);
 +			fixed++;
 +		}
 +	}
-+	raw_spin_unlock_irqrestore(&pdc_lock, flags);
 +	if (fixed)
 +		pr_info("qcom-pdc: re-synced %u pin enable(s) after resume\n", fixed);
 +}
@@ -181,10 +196,10 @@ is one walk per hibernate; where the state already matches nothing is written.
 +	.ops = &pdc_syscore_ops,
 +};
 +
- static void pdc_enable_intr(struct irq_data *d, bool on)
+ static void qcom_pdc_gic_secondary_disable(struct irq_data *d)
  {
- 	unsigned long flags;
-@@ -435,6 +490,8 @@
+ 	pdc->enable_intr(d->hwirq, false);
+@@ -753,6 +813,8 @@ static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *pare
  	}
  
  	irq_domain_update_bus_token(pdc_domain, DOMAIN_BUS_WAKEUP);
@@ -192,4 +207,4 @@ is one walk per hibernate; where the state already matches nothing is written.
 +	register_syscore(&pdc_syscore);
  
  	return 0;
- 
+ }

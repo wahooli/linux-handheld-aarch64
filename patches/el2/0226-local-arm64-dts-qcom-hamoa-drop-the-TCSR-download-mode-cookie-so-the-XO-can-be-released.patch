@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] local: arm64: dts: qcom: hamoa: drop the TCSR download-mode cookie so the XO can be released
 
 The scm node's qcom,dload-mode = <&tcsr 0x19000> makes qcom_scm look the TCSR

@@ -1,3 +1,4 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] local: wifi: ath12k: send the selected scan priority to firmware
 
 ath12k_wmi_send_scan_start_cmd() selects MEDIUM priority while 11d scan

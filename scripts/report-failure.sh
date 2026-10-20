@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 #
-# Open (or comment on) the build-failure issue. Deduped by title so a repeated
-# failure adds a comment instead of a second issue.
-#
-# Needs GH_TOKEN. RUN_URL is optional and is just a link back to the logs.
+# Open, or comment on, the build-failure issue (deduped by title). Needs GH_TOKEN; RUN_URL optional.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,9 +10,7 @@ lp_load "${HERE}"
 
 command -v gh >/dev/null || { echo "!! gh not available" >&2; exit 0; }
 
-# Must survive version.env not existing -- a broken fetch is a likely reason to
-# be here. When it does exist, its resolved values are what the build used;
-# otherwise fall back to what the product conf asked for.
+# Must work without version.env: a broken fetch is a likely reason to be here.
 if [ -f version.env ]; then
     # shellcheck source=/dev/null
     source ./version.env
@@ -28,13 +23,10 @@ else
     resolved="requested; version.env was never written, so the failure is at or before fetch"
 fi
 
-# Precomputed rather than expanded in the unquoted heredoc below, where every
-# backtick would need escaping. A variable's expansion is not rescanned for
-# command substitution, so backticks are safe here.
+# Precomputed: backticks in the unquoted heredoc below would need escaping.
 if [ "${USE_OGC}" = yes ]; then ogc_cell="\`${OGC_REF}\`"; else ogc_cell="off for this product"; fi
 
-# The advice depends on whether this product has an upstream to wait for: with
-# USE_ARMADA=no every patch is committed here.
+# The advice depends on whether there is an upstream to wait for (armada) or only BORE.
 if [ "${USE_ARMADA}" = yes ]; then
     UPSTREAM_ADVICE="**If upstream patches stopped applying** this is a base bump the device stack has
 not caught up with. armada rebases its stack onto new mainline releases on its own

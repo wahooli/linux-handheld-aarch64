@@ -1,26 +1,8 @@
 #!/usr/bin/env bash
 #
-# Check the upstreams every product depends on for movement, and rewrite
-# sources.env if any moved.
-#
-# Prints a report and exits 0 either way; whether a build follows is the
-# workflow's decision, made from the lines appended to $GITHUB_OUTPUT.
-#
-# Only upstreams some product actually uses are polled -- bumping a ref no build
-# reads produces a commit, a dispatched build and an identical kernel:
-#
-#   CachyOS  highest stable cachyos-X.Y[.Z]-N release, by version not by date,
-#            so LTS and -rc tags are passed over
-#   OGC      highest mainline-stable vX.Y[.Z]-ogcN release, same reasoning
-#   ROCKNIX  latest release tag (monthly cadence)
-#   armada   newest commit touching kernel/ -- armada-packages publishes no tags
-#            at all, and watching the branch head would fire on every unrelated
-#            commit
-#
-# kernel.org is not polled: KERNELORG_REF is pinned by hand, because a product on
-# that base exists to be held still.
-#
-# Auth: GH_TOKEN if set, else anonymous (60 req/h, which is plenty).
+# Check the upstreams some product uses for movement and rewrite sources.env; exits 0 either way.
+# Whether a build follows is the workflow's call, from $GITHUB_OUTPUT. kernel.org is pinned by hand.
+# Auth: GH_TOKEN if set, else anonymous.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,23 +21,21 @@ gh_get() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# Which sources are in use, across every product
-# ---------------------------------------------------------------------------
-# Each conf is read in a subshell: they set the same variable names, so sourcing
-# two here would leave the last one's values standing.
-uses_cachyos=; uses_ogc=; uses_armada=; uses_rocknix=; product_list=()
+# --- sources in use ---
+# One subshell per conf: they set the same variable names.
+uses_cachyos=; uses_ogc=; uses_armada=; uses_rocknix=; product_list=(); cachy_scheds=()
 for _p in ${PRODUCTS}; do
     conf="products/${_p}.conf"
     [ -f "${conf}" ] || { echo "!! PRODUCTS names ${_p} but ${conf} is missing" >&2; exit 1; }
     product_list+=("${_p}")
     # shellcheck disable=SC1090
-    read -r ks ogc arm rock < <( . "${conf}" >/dev/null 2>&1
-                                 echo "${KERNEL_SOURCE:-} ${USE_OGC:-no} ${USE_ARMADA:-no} ${USE_ROCKNIX:-no}" )
+    read -r ks ogc arm rock sched < <( . "${conf}" >/dev/null 2>&1
+                                 echo "${KERNEL_SOURCE:-} ${USE_OGC:-no} ${USE_ARMADA:-no} ${USE_ROCKNIX:-no} ${CACHY_SCHED:--}" )
     [ "${ks}"   = cachyos ] && uses_cachyos=1
     [ "${ogc}"  = yes ]     && uses_ogc=1
     [ "${arm}"  = yes ]     && uses_armada=1
     [ "${rock}" = yes ]     && uses_rocknix=1
+    [ "${sched}" != - ]     && cachy_scheds+=("${sched}")
 done
 
 echo "==> polling for ${#product_list[@]} product(s): ${product_list[*]}"
@@ -63,19 +43,11 @@ echo "==> polling for ${#product_list[@]} product(s): ${product_list[*]}"
 changed=(); outputs=()
 new_cachyos="${CACHYOS_REF:-}"; new_ogc="${OGC_REF:-}"
 new_armada="${ARMADA_REF:-}";   new_rocknix="${ROCKNIX_REF:-}"
+new_cachy_patches="${CACHY_PATCHES_REF:-}"
 
-# ---------------------------------------------------------------------------
-# CachyOS
-# ---------------------------------------------------------------------------
-# Two traps, same as OGC:
-#
-#   LTS  LTS maintenance releases are tagged alongside mainline, so picking by
-#        publication date walks the base backwards
-#   rc   cachyos-7.3-rc1-2 is not flagged prerelease, so the API flag does not
-#        hold it back; the numeric-only pattern excludes it instead
-#
-# Ordered by [major, minor, patch, tagrel], so a new tag revision of the same
-# kernel counts as movement.
+# --- CachyOS ---
+# Highest by [major, minor, patch, tagrel], not date: LTS tags would walk the base back, and -rc
+# tags are not flagged prerelease, so the numeric-only pattern excludes them.
 if [ -n "${uses_cachyos}" ]; then
     cachy_json="$(gh_get "${API}/repos/CachyOS/linux/releases?per_page=100")"
     new_cachyos="$(jq -r '
@@ -95,8 +67,7 @@ if [ -n "${uses_cachyos}" ]; then
     [ "${newest_any}" != "${new_cachyos}" ] && \
         echo "    (CachyOS's newest release ${newest_any} is not mainline stable; taking ${new_cachyos})"
 
-    # The release must carry the two assets the build downloads: a tag whose
-    # upload is still in flight otherwise fails fifty minutes into a build.
+    # Refuse a tag whose assets are still uploading; the build would fail an hour in.
     if [ "${new_cachyos}" != "${CACHYOS_REF}" ]; then
         base_url="https://github.com/CachyOS/linux/releases/download/${new_cachyos}/${new_cachyos}.tar.gz"
         for u in "${base_url}" "${base_url}.asc"; do
@@ -107,13 +78,32 @@ if [ -n "${uses_cachyos}" ]; then
             }
         done
     fi
+
+    # The scheduler patch is ported per base, so its pin moves with the base. Refuse the bump
+    # until every selected patch exists for the new major, or the build fails at fetch.
+    if [ ${#cachy_scheds[@]} -gt 0 ] && [ "${new_cachyos}" != "${CACHYOS_REF}" ]; then
+        [[ "${new_cachyos}" =~ ^cachyos-([0-9]+\.[0-9]+) ]]
+        major="${BASH_REMATCH[1]}"
+        new_cachy_patches="$(gh_get "${API}/repos/CachyOS/kernel-patches/commits?path=${major}/sched&per_page=1" \
+            | jq -r '.[0].sha // empty')"
+        for s in "${cachy_scheds[@]}"; do
+            # Same file name fetch-patches.sh maps CACHY_SCHED to.
+            f="${major}/sched/0001-${s}-cachy.patch"
+            if [ -z "${new_cachy_patches}" ] || ! curl -fsIL --retry 2 -o /dev/null \
+                "https://raw.githubusercontent.com/CachyOS/kernel-patches/${new_cachy_patches}/${f}"; then
+                echo "!! ${new_cachyos}: CachyOS/kernel-patches has no ${f} yet" >&2
+                echo "!! refusing the bump; sources.env stays at ${CACHYOS_REF}" >&2
+                exit 1
+            fi
+        done
+    fi
     [ "${new_cachyos}" != "${CACHYOS_REF}" ] && changed+=("CachyOS ${CACHYOS_REF} -> ${new_cachyos}")
-    outputs+=("cachyos_ref=${new_cachyos}")
+    [ "${new_cachy_patches}" != "${CACHY_PATCHES_REF}" ] && \
+        changed+=("CachyOS patches ${CACHY_PATCHES_REF:0:12} -> ${new_cachy_patches:0:12}")
+    outputs+=("cachyos_ref=${new_cachyos}" "cachy_patches_ref=${new_cachy_patches}")
 fi
 
-# ---------------------------------------------------------------------------
-# OGC
-# ---------------------------------------------------------------------------
+# --- OGC ---
 if [ -n "${uses_ogc}" ]; then
     ogc_json="$(gh_get "${API}/repos/OpenGamingCollective/linux/releases?per_page=100")"
     new_ogc="$(jq -r '
@@ -134,8 +124,7 @@ if [ -n "${uses_ogc}" ]; then
     [ "${newest_ogc}" != "${new_ogc}" ] && \
         echo "    (OGC's newest release ${newest_ogc} is not mainline stable; taking ${new_ogc})"
 
-    # An OGC bump only implies a kernel.org tarball for a product that derives its
-    # base from the tag. On a cachyos product it supplies patches only.
+    # Only a product deriving its kernel.org base from the tag needs that tarball.
     if [ "${new_ogc}" != "${OGC_REF}" ] && [ -z "${KERNELORG_REF:-}" ] && [ -z "${BASE_VERSION:-}" ]; then
         if [[ "${new_ogc}" =~ ^v?(.+)-ogc[0-9]+$ ]]; then
             b="${BASH_REMATCH[1]}"; km="${b%%.*}"
@@ -151,9 +140,7 @@ if [ -n "${uses_ogc}" ]; then
     outputs+=("ogc_ref=${new_ogc}")
 fi
 
-# ---------------------------------------------------------------------------
-# ROCKNIX and armada
-# ---------------------------------------------------------------------------
+# --- ROCKNIX and armada ---
 if [ -n "${uses_rocknix}" ]; then
     new_rocknix="$(gh_get "${API}/repos/ROCKNIX/distribution/releases?per_page=10" \
         | jq -r '[.[] | select(.draft == false and .prerelease == false)] | .[0].tag_name // empty')"
@@ -170,9 +157,7 @@ if [ -n "${uses_armada}" ]; then
     outputs+=("armada_ref=${new_armada}")
 fi
 
-# ---------------------------------------------------------------------------
-# Report
-# ---------------------------------------------------------------------------
+# --- report ---
 row() {   # $1 label, $2 current, $3 new, $4 in-use flag
     if [ -z "${4}" ]; then
         printf '    %-9s %-26s %s\n' "${1}" "${2:-–}" "not used by any product"
@@ -183,6 +168,7 @@ row() {   # $1 label, $2 current, $3 new, $4 in-use flag
     fi
 }
 row CachyOS "${CACHYOS_REF:-}"      "${new_cachyos}"      "${uses_cachyos}"
+row sched   "${CACHY_PATCHES_REF:0:12}" "${new_cachy_patches:0:12}" "${cachy_scheds[*]}"
 row OGC     "${OGC_REF:-}"          "${new_ogc}"          "${uses_ogc}"
 row ROCKNIX "${ROCKNIX_REF:-}"      "${new_rocknix}"      "${uses_rocknix}"
 row armada  "${ARMADA_REF:0:12}"    "${new_armada:0:12}"  "${uses_armada}"
@@ -193,18 +179,19 @@ if [ ${#changed[@]} -eq 0 ]; then
     exit 0
 fi
 
-# sed rather than regenerating the file: the comments in sources.env document
-# what each ref means and have to survive an automated edit.
+# sed, not regenerate: the rest of sources.env must survive.
 [ -n "${uses_cachyos}" ] && sed -i "s|^CACHYOS_REF=.*|CACHYOS_REF=${new_cachyos}|" sources.env
+[ ${#cachy_scheds[@]} -gt 0 ] && \
+    sed -i "s|^CACHY_PATCHES_REF=.*|CACHY_PATCHES_REF=${new_cachy_patches}|" sources.env
 [ -n "${uses_ogc}" ]     && sed -i "s|^OGC_REF=.*|OGC_REF=${new_ogc}|"             sources.env
 [ -n "${uses_armada}" ]  && sed -i "s|^ARMADA_REF=.*|ARMADA_REF=${new_armada}|"    sources.env
 [ -n "${uses_rocknix}" ] && sed -i "s|^ROCKNIX_REF=.*|ROCKNIX_REF=${new_rocknix}|" sources.env
 
-# Prove the edits landed: a silently failed sed means the poller commits nothing
-# and reports success forever.
+# Prove the edits landed, or the poller would report success forever.
 # shellcheck source=/dev/null
 ( source ./sources.env
   [ -z "${uses_cachyos}" ] || [ "${CACHYOS_REF}" = "${new_cachyos}" ] || exit 1
+  [ ${#cachy_scheds[@]} -eq 0 ] || [ "${CACHY_PATCHES_REF}" = "${new_cachy_patches}" ] || exit 1
   [ -z "${uses_ogc}" ]     || [ "${OGC_REF}"     = "${new_ogc}" ]     || exit 1
   [ -z "${uses_armada}" ]  || [ "${ARMADA_REF}"  = "${new_armada}" ]  || exit 1
   [ -z "${uses_rocknix}" ] || [ "${ROCKNIX_REF}" = "${new_rocknix}" ] || exit 1 ) \

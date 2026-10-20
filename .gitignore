@@ -85,3 +85,5 @@ pkg/
 *~
 .idea/
 .vscode/
+
+__pycache__

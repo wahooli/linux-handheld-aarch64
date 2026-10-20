@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] soc: qcom: pdr: disable workers before releasing service records
 
 pdr_handle_release() frees the service list before joining indack_work.

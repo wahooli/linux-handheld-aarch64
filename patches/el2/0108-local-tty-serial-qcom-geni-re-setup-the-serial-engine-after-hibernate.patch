@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Date: Fri, 12 Sep 2026 19:20:00 +0300
 Subject: [PATCH 108/108] local: tty: serial: qcom-geni: re-setup the serial
  engine after a hibernate restore
@@ -66,14 +66,16 @@ without relying on a designated initializer overriding the macro's.
 
 Not board-specific: every qcom geni UART shares these pm ops.
 
-Signed-off-by: Waltteri Hooli <wahooli@localhost>
+Signed-off-by: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 ---
- drivers/tty/serial/qcom_geni_serial.c | 63 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ drivers/tty/serial/qcom_geni_serial.c | 63 ++++++++++++++++++++++++++++++-
  1 file changed, 62 insertions(+), 1 deletion(-)
 
+diff --git a/drivers/tty/serial/qcom_geni_serial.c b/drivers/tty/serial/qcom_geni_serial.c
+index a851b8f0e..b5256471d 100644
 --- a/drivers/tty/serial/qcom_geni_serial.c
 +++ b/drivers/tty/serial/qcom_geni_serial.c
-@@ -2002,6 +2002,58 @@
+@@ -2136,6 +2136,58 @@ static int qcom_geni_serial_resume(struct device *dev)
  	return ret;
  }
  
@@ -132,8 +134,8 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  #if IS_ENABLED(CONFIG_SERIAL_QCOM_GENI_CONSOLE)
  static const struct qcom_geni_device_data qcom_geni_console_data = {
  	.console = true,
-@@ -2044,10 +2096,19 @@
- 	.set_rate = geni_serial_set_level,
+@@ -2170,10 +2222,19 @@ static const struct qcom_geni_device_data sa8255p_qcom_geni_uart_data = {
+ 	.set_rate = geni_se_set_perf_level,
  };
  
 +/*
@@ -152,4 +154,4 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
 +	.restore = pm_sleep_ptr(qcom_geni_serial_restore),
  };
  
- static const struct of_device_id qcom_geni_serial_match_table[] = {
+ static void qcom_geni_serial_sys_shutdown(struct platform_device *pdev)

@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Date: Thu, 11 Sep 2026 23:30:00 +0300
 Subject: [PATCH 90/90] local: drm/msm/dp: reprogram the pixel clock RCG on
  hibernate restore
@@ -86,15 +86,16 @@ monitor showed all along. That is a SECOND, independent fault which was simply
 invisible on the eDP while nothing could be presented at all. mdss_mdp_clk_src
 is NOT the cause: its RCG reads CFG=00000105, src_div=5 on both boots.
 ---
- drivers/gpu/drm/msm/dp/dp_ctrl.c    | 66 ++++++++++++++++++++++++++
+ drivers/gpu/drm/msm/dp/dp_ctrl.c    | 64 +++++++++++++++++++++++++++++++++
  drivers/gpu/drm/msm/dp/dp_ctrl.h    |  1 +
- drivers/gpu/drm/msm/dp/dp_display.c | 25 +++++++++--
- 3 files changed, 90 insertions(+), 2 deletions(-)
+ drivers/gpu/drm/msm/dp/dp_display.c | 36 +++++++++++++++++--
+ 3 files changed, 99 insertions(+), 2 deletions(-)
 
-diff -ur a4/drivers/gpu/drm/msm/dp/dp_ctrl.c b4/drivers/gpu/drm/msm/dp/dp_ctrl.c
---- a/drivers/gpu/drm/msm/dp/dp_ctrl.c	2026-09-11 20:12:27.435914036 +0300
-+++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c	2026-09-11 20:12:27.457558875 +0300
-@@ -202,6 +202,70 @@
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 0d68a952d..6ac010df1 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -201,6 +201,70 @@ static int msm_dp_aux_link_configure(struct drm_dp_aux *aux,
  /*
   * NOTE: resetting DP controller will also clear any pending HPD related interrupts
   */
@@ -162,24 +163,26 @@ diff -ur a4/drivers/gpu/drm/msm/dp/dp_ctrl.c b4/drivers/gpu/drm/msm/dp/dp_ctrl.c
 +			 cached, parked);
 +}
 +
- void msm_dp_ctrl_reset(struct msm_dp_ctrl *msm_dp_ctrl)
+ void msm_dp_ctrl_reset(struct msm_dp_ctrl *msm_dp_ctrl,
+ 		       struct msm_dp_panel *panel)
  {
- 	struct msm_dp_ctrl_private *ctrl =
-diff -ur a4/drivers/gpu/drm/msm/dp/dp_ctrl.h b4/drivers/gpu/drm/msm/dp/dp_ctrl.h
---- a/drivers/gpu/drm/msm/dp/dp_ctrl.h	2026-09-11 20:12:27.439871010 +0300
-+++ b/drivers/gpu/drm/msm/dp/dp_ctrl.h	2026-09-11 20:12:27.457633094 +0300
-@@ -32,6 +32,7 @@
- 				    void __iomem *link_base);
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.h b/drivers/gpu/drm/msm/dp/dp_ctrl.h
+index 5902cf7e7..201ed540e 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.h
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.h
+@@ -39,6 +39,7 @@ struct msm_dp_ctrl *msm_dp_ctrl_get(struct device *dev,
  
- void msm_dp_ctrl_reset(struct msm_dp_ctrl *msm_dp_ctrl);
+ void msm_dp_ctrl_reset(struct msm_dp_ctrl *msm_dp_ctrl,
+ 		       struct msm_dp_panel *panel);
 +void msm_dp_ctrl_pixel_clk_invalidate(struct msm_dp_ctrl *msm_dp_ctrl);
  void msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl);
  void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl);
  void msm_dp_ctrl_irq_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl);
-diff -ur a4/drivers/gpu/drm/msm/dp/dp_display.c b4/drivers/gpu/drm/msm/dp/dp_display.c
---- a/drivers/gpu/drm/msm/dp/dp_display.c	2026-09-11 20:12:27.443573918 +0300
-+++ b/drivers/gpu/drm/msm/dp/dp_display.c	2026-09-11 20:12:27.457702731 +0300
-@@ -1244,10 +1244,42 @@
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index a23f2b7f4..90b7b8fc1 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -1310,10 +1310,42 @@ static int msm_dp_pm_runtime_resume(struct device *dev)
  	return 0;
  }
  

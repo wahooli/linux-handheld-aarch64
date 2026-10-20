@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] ASoC: codecs: lpass-macro: rebind fsgen consumers after a DSP restart
 
 Restarting the audio DSP now leaves the macro codecs bound and healthy, but

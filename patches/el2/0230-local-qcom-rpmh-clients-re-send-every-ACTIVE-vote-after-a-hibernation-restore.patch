@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] local: qcom rpmh clients: re-send every ACTIVE vote after a hibernation restore
 
 Two kernels vote to RPMh across a hibernation: the one that loads the image and
@@ -37,118 +37,11 @@ and mode for every regulator it has ever touched. Consumers that move later
 vote on top. .restore runs only on the hibernation restore path, never for
 s2idle. Only the x1e80100 NoC driver is wired to the shared icc pm ops here.
 ---
---- a/drivers/pmdomain/qcom/rpmhpd.c
-+++ b/drivers/pmdomain/qcom/rpmhpd.c
-@@ -1216,12 +1216,55 @@
- 	mutex_unlock(&rpmhpd_lock);
- }
- 
-+/*
-+ * A hibernation restore is programmed by two kernels: the one that loaded the
-+ * image and this one. The loader never reached sync_state, so every domain it
-+ * enabled sits at its highest corner in the RPMh ACTIVE set, RPMh has no
-+ * readback, and this driver only sends when one of its own consumers moves.
-+ * Re-send every domain from our own bookkeeping; consumers re-vote on top.
-+ */
-+static int rpmhpd_restore_noirq(struct device *dev)
-+{
-+	const struct rpmhpd_desc *desc = of_device_get_match_data(dev);
-+	struct rpmhpd **rpmhpds = desc->rpmhpds;
-+	unsigned int corner;
-+	struct rpmhpd *pd;
-+	unsigned int i;
-+	int ret;
-+
-+	mutex_lock(&rpmhpd_lock);
-+	for (i = 0; i < desc->num_pds; i++) {
-+		pd = rpmhpds[i];
-+		if (!pd)
-+			continue;
-+
-+		if (pd->enabled)
-+			corner = max(pd->corner, pd->enable_corner);
-+		else
-+			corner = 0;
-+
-+		/* The loader may have left it higher: wait for the ack. */
-+		pd->active_corner = 0;
-+		ret = rpmhpd_aggregate_corner(pd, corner);
-+		if (ret)
-+			dev_err(dev, "failed to restore %s (%d)\n", pd->res_name, ret);
-+	}
-+	mutex_unlock(&rpmhpd_lock);
-+
-+	return 0;
-+}
-+
-+static const struct dev_pm_ops rpmhpd_pm_ops = {
-+	.restore_noirq = rpmhpd_restore_noirq,
-+};
-+
- static struct platform_driver rpmhpd_driver = {
- 	.driver = {
- 		.name = "qcom-rpmhpd",
- 		.of_match_table = rpmhpd_match_table,
- 		.suppress_bind_attrs = true,
- 		.sync_state = rpmhpd_sync_state,
-+		.pm = pm_sleep_ptr(&rpmhpd_pm_ops),
- 	},
- 	.probe = rpmhpd_probe,
- };
---- a/drivers/interconnect/qcom/icc-rpmh.h
-+++ b/drivers/interconnect/qcom/icc-rpmh.h
-@@ -163,5 +163,6 @@
- void qcom_icc_pre_aggregate(struct icc_node *node);
- int qcom_icc_rpmh_probe(struct platform_device *pdev);
- void qcom_icc_rpmh_remove(struct platform_device *pdev);
-+extern const struct dev_pm_ops qcom_icc_rpmh_pm_ops;
- 
- #endif
---- a/drivers/interconnect/qcom/icc-rpmh.c
-+++ b/drivers/interconnect/qcom/icc-rpmh.c
-@@ -371,5 +371,29 @@
- }
- EXPORT_SYMBOL_GPL(qcom_icc_rpmh_remove);
- 
-+/*
-+ * A hibernation restore is programmed by two kernels: the one that loaded the
-+ * image and this one. The loader's icc_node_add() voted INT_MAX on every node,
-+ * and only sync_state -- ten seconds into a boot the loader never finishes --
-+ * would have lowered those votes. RPMh keeps the last ACTIVE vote per BCM and
-+ * has no readback, and this kernel re-commits only the BCMs on paths its
-+ * consumers touch. Re-commit every BCM of this provider from our aggregates.
-+ */
-+static int qcom_icc_rpmh_restore(struct device *dev)
-+{
-+	struct qcom_icc_provider *qp = dev_get_drvdata(dev);
-+	size_t i;
-+
-+	for (i = 0; i < qp->num_bcms; i++)
-+		qcom_icc_bcm_voter_add(qp->voter, qp->bcms[i]);
-+
-+	return qcom_icc_bcm_voter_commit(qp->voter);
-+}
-+
-+const struct dev_pm_ops qcom_icc_rpmh_pm_ops = {
-+	.restore = qcom_icc_rpmh_restore,
-+};
-+EXPORT_SYMBOL_GPL(qcom_icc_rpmh_pm_ops);
-+
- MODULE_DESCRIPTION("Qualcomm RPMh interconnect driver");
- MODULE_LICENSE("GPL v2");
---- a/drivers/interconnect/qcom/x1e80100.c
-+++ b/drivers/interconnect/qcom/x1e80100.c
-@@ -1905,6 +1905,7 @@
- 		.name = "qnoc-x1e80100",
- 		.of_match_table = qnoc_of_match,
- 		.sync_state = icc_sync_state,
-+		.pm = pm_sleep_ptr(&qcom_icc_rpmh_pm_ops),
- 	},
- };
- 
+diff --git a/drivers/clk/qcom/clk-rpmh.c b/drivers/clk/qcom/clk-rpmh.c
+index a224a94ae..558a99fd5 100644
 --- a/drivers/clk/qcom/clk-rpmh.c
 +++ b/drivers/clk/qcom/clk-rpmh.c
-@@ -249,13 +249,13 @@
+@@ -249,13 +249,13 @@ static const struct clk_ops clk_rpmh_ops = {
  	.recalc_rate	= clk_rpmh_recalc_rate,
  };
  
@@ -164,7 +57,7 @@ s2idle. Only the x1e80100 NoC driver is wired to the shared icc pm ops here.
  	if (enable) {
  		cmd_state = 1;
  		if (c->aggr_state)
-@@ -284,6 +284,15 @@
+@@ -284,6 +284,15 @@ static int clk_rpmh_bcm_send_cmd(struct clk_rpmh *c, bool enable)
  		}
  	}
  
@@ -180,7 +73,7 @@ s2idle. Only the x1e80100 NoC driver is wired to the shared icc pm ops here.
  	mutex_unlock(&rpmh_clk_lock);
  
  	return ret;
-@@ -1132,11 +1141,57 @@
+@@ -1126,11 +1135,57 @@ static const struct of_device_id clk_rpmh_match_table[] = {
  };
  MODULE_DEVICE_TABLE(of, clk_rpmh_match_table);
  
@@ -238,9 +131,128 @@ s2idle. Only the x1e80100 NoC driver is wired to the shared icc pm ops here.
  	},
  };
  
+diff --git a/drivers/interconnect/qcom/icc-rpmh.c b/drivers/interconnect/qcom/icc-rpmh.c
+index 3b445acef..3a88091d7 100644
+--- a/drivers/interconnect/qcom/icc-rpmh.c
++++ b/drivers/interconnect/qcom/icc-rpmh.c
+@@ -371,5 +371,29 @@ void qcom_icc_rpmh_remove(struct platform_device *pdev)
+ }
+ EXPORT_SYMBOL_GPL(qcom_icc_rpmh_remove);
+ 
++/*
++ * A hibernation restore is programmed by two kernels: the one that loaded the
++ * image and this one. The loader's icc_node_add() voted INT_MAX on every node,
++ * and only sync_state -- ten seconds into a boot the loader never finishes --
++ * would have lowered those votes. RPMh keeps the last ACTIVE vote per BCM and
++ * has no readback, and this kernel re-commits only the BCMs on paths its
++ * consumers touch. Re-commit every BCM of this provider from our aggregates.
++ */
++static int qcom_icc_rpmh_restore(struct device *dev)
++{
++	struct qcom_icc_provider *qp = dev_get_drvdata(dev);
++	size_t i;
++
++	for (i = 0; i < qp->num_bcms; i++)
++		qcom_icc_bcm_voter_add(qp->voter, qp->bcms[i]);
++
++	return qcom_icc_bcm_voter_commit(qp->voter);
++}
++
++const struct dev_pm_ops qcom_icc_rpmh_pm_ops = {
++	.restore = qcom_icc_rpmh_restore,
++};
++EXPORT_SYMBOL_GPL(qcom_icc_rpmh_pm_ops);
++
+ MODULE_DESCRIPTION("Qualcomm RPMh interconnect driver");
+ MODULE_LICENSE("GPL v2");
+diff --git a/drivers/interconnect/qcom/icc-rpmh.h b/drivers/interconnect/qcom/icc-rpmh.h
+index 09d879140..cc4c578b9 100644
+--- a/drivers/interconnect/qcom/icc-rpmh.h
++++ b/drivers/interconnect/qcom/icc-rpmh.h
+@@ -163,5 +163,6 @@ int qcom_icc_bcm_init(struct qcom_icc_bcm *bcm, struct device *dev);
+ void qcom_icc_pre_aggregate(struct icc_node *node);
+ int qcom_icc_rpmh_probe(struct platform_device *pdev);
+ void qcom_icc_rpmh_remove(struct platform_device *pdev);
++extern const struct dev_pm_ops qcom_icc_rpmh_pm_ops;
+ 
+ #endif
+diff --git a/drivers/interconnect/qcom/x1e80100.c b/drivers/interconnect/qcom/x1e80100.c
+index 2ba2823c7..f74c72ef0 100644
+--- a/drivers/interconnect/qcom/x1e80100.c
++++ b/drivers/interconnect/qcom/x1e80100.c
+@@ -1905,6 +1905,7 @@ static struct platform_driver qnoc_driver = {
+ 		.name = "qnoc-x1e80100",
+ 		.of_match_table = qnoc_of_match,
+ 		.sync_state = icc_sync_state,
++		.pm = pm_sleep_ptr(&qcom_icc_rpmh_pm_ops),
+ 	},
+ };
+ 
+diff --git a/drivers/pmdomain/qcom/rpmhpd.c b/drivers/pmdomain/qcom/rpmhpd.c
+index 907432759..43d2db6e5 100644
+--- a/drivers/pmdomain/qcom/rpmhpd.c
++++ b/drivers/pmdomain/qcom/rpmhpd.c
+@@ -1220,12 +1220,55 @@ static void rpmhpd_sync_state(struct device *dev)
+ 	mutex_unlock(&rpmhpd_lock);
+ }
+ 
++/*
++ * A hibernation restore is programmed by two kernels: the one that loaded the
++ * image and this one. The loader never reached sync_state, so every domain it
++ * enabled sits at its highest corner in the RPMh ACTIVE set, RPMh has no
++ * readback, and this driver only sends when one of its own consumers moves.
++ * Re-send every domain from our own bookkeeping; consumers re-vote on top.
++ */
++static int rpmhpd_restore_noirq(struct device *dev)
++{
++	const struct rpmhpd_desc *desc = of_device_get_match_data(dev);
++	struct rpmhpd **rpmhpds = desc->rpmhpds;
++	unsigned int corner;
++	struct rpmhpd *pd;
++	unsigned int i;
++	int ret;
++
++	mutex_lock(&rpmhpd_lock);
++	for (i = 0; i < desc->num_pds; i++) {
++		pd = rpmhpds[i];
++		if (!pd)
++			continue;
++
++		if (pd->enabled)
++			corner = max(pd->corner, pd->enable_corner);
++		else
++			corner = 0;
++
++		/* The loader may have left it higher: wait for the ack. */
++		pd->active_corner = 0;
++		ret = rpmhpd_aggregate_corner(pd, corner);
++		if (ret)
++			dev_err(dev, "failed to restore %s (%d)\n", pd->res_name, ret);
++	}
++	mutex_unlock(&rpmhpd_lock);
++
++	return 0;
++}
++
++static const struct dev_pm_ops rpmhpd_pm_ops = {
++	.restore_noirq = rpmhpd_restore_noirq,
++};
++
+ static struct platform_driver rpmhpd_driver = {
+ 	.driver = {
+ 		.name = "qcom-rpmhpd",
+ 		.of_match_table = rpmhpd_match_table,
+ 		.suppress_bind_attrs = true,
+ 		.sync_state = rpmhpd_sync_state,
++		.pm = pm_sleep_ptr(&rpmhpd_pm_ops),
+ 	},
+ 	.probe = rpmhpd_probe,
+ };
+diff --git a/drivers/regulator/qcom-rpmh-regulator.c b/drivers/regulator/qcom-rpmh-regulator.c
+index 25c14de3c..b07aa8694 100644
 --- a/drivers/regulator/qcom-rpmh-regulator.c
 +++ b/drivers/regulator/qcom-rpmh-regulator.c
-@@ -155,6 +155,8 @@
+@@ -163,6 +163,8 @@ struct rpmh_vreg_hw_data {
   */
  struct rpmh_vreg {
  	struct device			*dev;
@@ -249,7 +261,7 @@ s2idle. Only the x1e80100 NoC driver is wired to the shared icc pm ops here.
  	u32				addr;
  	struct regulator_desc		rdesc;
  	const struct rpmh_vreg_hw_data	*hw_data;
-@@ -531,6 +533,7 @@
+@@ -580,6 +582,7 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg, struct device *dev,
  			node, ret);
  		return ret;
  	}
@@ -257,7 +269,7 @@ s2idle. Only the x1e80100 NoC driver is wired to the shared icc pm ops here.
  
  	dev_dbg(dev, "%pOFn regulator registered for RPMh resource %s @ 0x%05X\n",
  		node, rpmh_resource_name, vreg->addr);
-@@ -1816,6 +1819,7 @@
+@@ -1934,6 +1937,7 @@ static int rpmh_regulator_probe(struct platform_device *pdev)
  {
  	struct device *dev = &pdev->dev;
  	const struct rpmh_vreg_init_data *vreg_data;
@@ -265,7 +277,7 @@ s2idle. Only the x1e80100 NoC driver is wired to the shared icc pm ops here.
  	struct rpmh_vreg *vreg;
  	const char *pmic_id;
  	int ret;
-@@ -1830,6 +1834,12 @@
+@@ -1948,6 +1952,12 @@ static int rpmh_regulator_probe(struct platform_device *pdev)
  		return ret;
  	}
  
@@ -278,17 +290,16 @@ s2idle. Only the x1e80100 NoC driver is wired to the shared icc pm ops here.
  	for_each_available_child_of_node_scoped(dev->of_node, node) {
  		vreg = devm_kzalloc(dev, sizeof(*vreg), GFP_KERNEL);
  		if (!vreg)
-@@ -1839,11 +1849,64 @@
- 						vreg_data);
- 		if (ret < 0)
- 			return ret;
-+
+@@ -1963,11 +1973,63 @@ static int rpmh_regulator_probe(struct platform_device *pdev)
+ 			dev_err(dev, "failed to read initial mode for %s\n",
+ 					vreg->rdesc.name);
+ 
 +		list_add_tail(&vreg->list, vregs);
- 	}
- 
- 	return 0;
- }
- 
++	}
++
++	return 0;
++}
++
 +/*
 + * A hibernation restore is programmed by two kernels: the one that loaded the
 + * image and this one. The loader's consumers left their enable, voltage and
@@ -331,11 +342,11 @@ s2idle. Only the x1e80100 NoC driver is wired to the shared icc pm ops here.
 +		}
 +
 +		ww_mutex_unlock(&vreg->rdev->mutex);
-+	}
-+
-+	return 0;
-+}
-+
+ 	}
+ 
+ 	return 0;
+ }
+ 
 +static const struct dev_pm_ops rpmh_regulator_pm_ops = {
 +	.restore = rpmh_regulator_restore,
 +};
@@ -343,7 +354,7 @@ s2idle. Only the x1e80100 NoC driver is wired to the shared icc pm ops here.
  static const struct of_device_id __maybe_unused rpmh_regulator_match_table[] = {
  	{
  		.compatible = "qcom,pm8005-rpmh-regulators",
-@@ -2010,6 +2073,7 @@
+@@ -2134,6 +2196,7 @@ static struct platform_driver rpmh_regulator_driver = {
  		.name = "qcom-rpmh-regulator",
  		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
  		.of_match_table	= of_match_ptr(rpmh_regulator_match_table),

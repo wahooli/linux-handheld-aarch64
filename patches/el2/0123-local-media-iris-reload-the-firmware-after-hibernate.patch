@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] media: iris: reload the firmware after a hibernation restore
 
 Hardware video decode is dead for the rest of the boot after a cross-boot
@@ -61,7 +61,7 @@ expands to, since it assigns .restore as well.
 
 ---
 diff --git a/drivers/media/platform/qcom/iris/iris_core.c b/drivers/media/platform/qcom/iris/iris_core.c
-index 8c335dbfc..1033bdae9 100644
+index 8c335dbfc..5d4c03d88 100644
 --- a/drivers/media/platform/qcom/iris/iris_core.c
 +++ b/drivers/media/platform/qcom/iris/iris_core.c
 @@ -32,6 +32,43 @@ void iris_core_deinit(struct iris_core *core)
@@ -120,11 +120,11 @@ index b878da43f..0d4f26543 100644
  
  #endif
 diff --git a/drivers/media/platform/qcom/iris/iris_firmware.c b/drivers/media/platform/qcom/iris/iris_firmware.c
-index 08cdbda1a..69533231b 100644
+index 6550a9bff..08409e7aa 100644
 --- a/drivers/media/platform/qcom/iris/iris_firmware.c
 +++ b/drivers/media/platform/qcom/iris/iris_firmware.c
-@@ -166,6 +166,32 @@ int iris_fw_load(struct iris_core *core)
- 	return ret;
+@@ -252,6 +252,32 @@ int iris_fw_load(struct iris_core *core)
+ 	return 0;
  }
  
 +/*
@@ -169,10 +169,10 @@ index 1a077a587..5fb486325 100644
  
  int iris_fw_init(struct iris_core *core);
 diff --git a/drivers/media/platform/qcom/iris/iris_probe.c b/drivers/media/platform/qcom/iris/iris_probe.c
-index 38556d2dd..11de7114d 100644
+index fc139a179..eae7a077d 100644
 --- a/drivers/media/platform/qcom/iris/iris_probe.c
 +++ b/drivers/media/platform/qcom/iris/iris_probe.c
-@@ -360,9 +360,30 @@ static int __maybe_unused iris_pm_resume(struct device *dev)
+@@ -356,9 +356,30 @@ static int __maybe_unused iris_pm_resume(struct device *dev)
  	return ret;
  }
  

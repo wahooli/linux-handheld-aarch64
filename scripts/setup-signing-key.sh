@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 #
 # Generate the repo signing key and load it into GitHub Actions secrets.
-#
-#   scripts/setup-signing-key.sh                 generate + upload via gh
-#   OUT_DIR=~/keys scripts/setup-signing-key.sh  also keep a backup copy there
-#   NO_UPLOAD=1 scripts/setup-signing-key.sh     generate only, do not touch gh
-#
-# The private key is never printed. It goes from a throwaway keyring straight
-# into `gh secret set` over stdin, and into a 0600 backup file if you asked for
-# one; only the fingerprint and public key are ever shown.
+#   OUT_DIR=<dir>   also keep a 0600 backup there
+#   NO_UPLOAD=1     generate only, do not touch gh
+# The private key is never printed: it goes from a throwaway keyring into `gh secret set` over stdin.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,8 +21,7 @@ NO_UPLOAD="${NO_UPLOAD:-}"
 }
 
 # ── preflight ───────────────────────────────────────────────────────────────
-# Everything that can fail is checked before a key exists, so a gh problem does
-# not leave a freshly generated key to throw away.
+# Checked before a key exists, so a gh problem does not waste one.
 command -v gpg >/dev/null || { echo "!! gpg not found" >&2; exit 1; }
 if [ -z "${NO_UPLOAD}" ]; then
     command -v gh >/dev/null || { echo "!! gh not found (or set NO_UPLOAD=1)" >&2; exit 1; }
@@ -46,8 +40,6 @@ MSG
     fi
 fi
 
-# Generated, not chosen: only scripts ever handle it, so a memorable one buys
-# nothing.
 PASS="$(gpg --gen-random --armor 1 24)"
 
 W="$(mktemp -d)"; chmod 700 "${W}"
@@ -55,8 +47,7 @@ trap 'rm -rf "${W}"' EXIT
 export GNUPGHOME="${W}/gnupg"; mkdir -p "${GNUPGHOME}"; chmod 700 "${GNUPGHOME}"
 
 echo "==> generating ed25519 signing key for '${UID_NAME} <${UID_EMAIL}>'"
-# No expiry: an expiring repo key means every device stops trusting updates on a
-# date you will not remember. Rotation should be deliberate.
+# No expiry: an expiring repo key silently stops every device trusting updates.
 gpg --batch --passphrase "${PASS}" \
     --quick-gen-key "${UID_NAME} <${UID_EMAIL}>" ed25519 sign never 2>/dev/null
 
@@ -69,8 +60,7 @@ gpg --batch --yes --pinentry-mode loopback --passphrase "${PASS}" \
 gpg --batch --yes --armor --export "${FPR}" > "${W}/public.asc"
 chmod 600 "${W}/private.asc"
 
-# Before the upload, deliberately: the key exists only in a temp directory the
-# exit trap removes, so an upload that fails first would take it with it.
+# Before the upload: the key otherwise exists only in a temp dir the exit trap removes.
 if [ -n "${OUT_DIR}" ]; then
     mkdir -p "${OUT_DIR}"; chmod 700 "${OUT_DIR}"
     cp "${W}/private.asc" "${OUT_DIR}/handheld-repo-private.asc"
@@ -89,8 +79,7 @@ if [ -z "${NO_UPLOAD}" ]; then
         echo "    REPO_SIGNING_KEY"
         echo "    REPO_SIGNING_KEY_PASSPHRASE"
     else
-        # Without a backup, keep the temp directory alive and say where it is
-        # rather than letting the trap take the key.
+        # No backup: keep the key in a new temp dir rather than let the trap delete it.
         if [ -n "${OUT_DIR}" ]; then
             echo "!! upload failed -- the key is safe in ${OUT_DIR}/, add the secrets by hand" >&2
         else

@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] local: soc: qcom: rpmh: expose the sleep/wake vote cache and
  TCS via debugfs
 

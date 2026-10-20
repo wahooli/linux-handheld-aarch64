@@ -1,25 +1,9 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2154  # pkgver/pkgrel/_* all come from version.env
 #
-# Decide this build's pkgrel and write it into version.env.
-#
-#   pkgrel = 1 + the highest EVER used for this pkgbase-pkgver,
-#            floored on both the R2 listing and the git tags.
-#
-# pkgver does not encode the armada commit, so a patch-only change rebuilds an
-# identical pkgver; without a distinct pkgrel pacman sees no upgrade.
-#
-# The floor is "ever used" rather than "currently in R2" because packages are
-# served immutable: reusing a filename leaves the edge serving the old bytes
-# against the new signature, which on the device reads as a corrupted package and
-# cannot be cleared there. An R2 listing cannot answer "ever used" -- pruning
-# frees names whose cached URL may still be alive, and a failed listing is
-# indistinguishable from an empty one.
-#
-# Tags are written only after a successful publish and are never pruned, so they
-# are the durable record. CI must check out with fetch-tags: true.
-#
-# PKGREL_REQUIRE_R2 makes a missing credential or a failed listing an error.
+# Set version.env's pkgrel to 1 + the highest ever used for this pkgbase-pkgver, floored on R2 and git tags.
+# Tags matter: R2 is pruned but packages are served immutable, so a reused filename breaks devices.
+# PKGREL_REQUIRE_R2 makes missing credentials or a failed listing an error. CI needs fetch-tags: true.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,17 +23,13 @@ source ./version.env
 
 ARCH_DIR="aarch64"
 
-# The workflow passes the string 'true' or 'false' -- a GitHub expression cannot
-# cleanly produce an empty string -- so a plain -n test would read 'false' as
-# "yes, require it".
+# CI passes the string 'true'/'false', so a plain -n test would read 'false' as set.
 case "${PKGREL_REQUIRE_R2:-}" in
     1|true|yes) REQUIRE_R2=1 ;;
     *)          REQUIRE_R2=  ;;
 esac
 
-# ---------------------------------------------------------------------------
-# Floor 1: git tags. Works with no credentials and survives pruning.
-# ---------------------------------------------------------------------------
+# --- floor 1: git tags (no credentials needed, survive pruning) ---
 highest_tag=0
 n_tags=0
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -60,9 +40,7 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         n_tags=$((n_tags + 1))
         [ "${rel}" -gt "${highest_tag}" ] && highest_tag="${rel}"
     done < <(git tag --list "${TAG_PREFIX}${pkgver}-*" 2>/dev/null || true)
-    # A checkout with no tags is indistinguishable from "never published", which
-    # is the case this floor exists to cover. Say so rather than pass it as
-    # evidence.
+    # No tags at all looks exactly like 'never published', the case this floor exists for.
     if [ "$(git tag --list | wc -l)" -eq 0 ]; then
         echo "==> note: this checkout has NO tags at all, so they contribute no floor."
         echo "    In CI that means actions/checkout ran without fetch-tags: true."
@@ -71,9 +49,7 @@ else
     echo "==> note: not a git checkout; tags contribute no floor"
 fi
 
-# ---------------------------------------------------------------------------
-# Floor 2: what is in R2 right now
-# ---------------------------------------------------------------------------
+# --- floor 2: the R2 listing ---
 highest_r2=0
 have_r2=
 
@@ -99,10 +75,7 @@ else
     export RCLONE_CONTIMEOUT=15s
     export RCLONE_TIMEOUT=120s
 
-    # Not `|| true`: an empty and a failed listing look identical afterwards, and
-    # treating the second as the first is how a live filename gets reused. rclone
-    # exits 0 with no output for an empty prefix, so the exit status is the only
-    # thing that separates them.
+    # Not || true: rclone exits 0 with no output for an empty prefix, so only the status tells failed from empty.
     if ! listing="$(rclone lsf "R2:${R2_BUCKET}/${ARCH_DIR}" \
                         --include "${_pkgbase}-*-aarch64.pkg.tar.zst" 2>"${HERE}/.rclone-err")"; then
         sed 's/^/    /' "${HERE}/.rclone-err" >&2 || true
@@ -115,9 +88,7 @@ else
     rm -f "${HERE}/.rclone-err"
     have_r2=1
 
-    # Only this pkgbase's own packages, at this exact pkgver. The headers package
-    # ships in lockstep and is not consulted; the kernel package is the one
-    # devices resolve against.
+    # The kernel package only; headers ship in lockstep.
     while read -r f; do
         [ -n "${f}" ] || continue
         rel="$(sed -E "s/^${_pkgbase}-${pkgver//./\\.}-([0-9]+)-aarch64\.pkg\.tar\.zst$/\1/" <<< "${f}")"
@@ -126,17 +97,8 @@ else
     done <<< "${listing}"
 fi
 
-# ---------------------------------------------------------------------------
-# Is this pkgver even an upgrade?
-# ---------------------------------------------------------------------------
-# A base swap can move pkgver backwards in pacman's ordering while looking like
-# progress: 7.2.1.ogc3 -> 7.2.1.cachy1 is a downgrade, because the trailing
-# segment compares alphabetically and 'c' < 'o'. Nothing else in the pipeline
-# would notice -- devices would just stop offering the update.
-#
-# vercmp is the only authority on that ordering, and it lives in pacman, which
-# the runner does not have. So: the builder container when available, skipped
-# with a note when not.
+# --- downgrade check ---
+# A base swap can sort backwards (7.2.1.ogc3 -> 7.2.1.cachy1: 'c' < 'o'). vercmp decides, via pacman or the builder image.
 IMAGE="${IMAGE:-linux-handheld-builder:latest}"
 vercmp_() {   # $1 $2 -> -1/0/1 on stdout, or nothing if unavailable
     if command -v vercmp >/dev/null 2>&1; then
@@ -183,9 +145,7 @@ highest="${highest_r2}"
 next=$((highest + 1))
 
 sed -i "s/^pkgrel=.*/pkgrel=${next}/" version.env
-# Prove the edit landed: a silently failed sed builds with the old pkgrel and
-# publishes over an existing filename, which is the failure mode this file exists
-# to prevent.
+# Prove the edit landed: a stale pkgrel would publish over an existing filename.
 ( source ./version.env; [ "${pkgrel}" = "${next}" ] ) \
     || { echo "!! version.env did not take pkgrel=${next}" >&2; exit 1; }
 

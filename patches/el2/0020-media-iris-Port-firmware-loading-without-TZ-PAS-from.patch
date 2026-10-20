@@ -35,12 +35,19 @@ qcom_mdt_load_no_init() has not taken one since 7.1 (see
 include/linux/soc/qcom/mdt_loader.h), and carrying that as a separate
 fixup: patch meant this one produced code that did not compile on its own.
 
+Rebased onto cachyos-7.3.0-2: 7.3 moved firmware selection into
+iris_detect_firmware() (gen1/gen2) and the TZ calls to the generic
+qcom_pas_*() layer; the use_tz branches now call those, and probe no longer
+calls iris_session_init_caps(), which 7.3 does at open.
+
 Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
 
 ---
+diff --git a/drivers/media/platform/qcom/iris/iris_core.h b/drivers/media/platform/qcom/iris/iris_core.h
+index 24da60448..b878da43f 100644
 --- a/drivers/media/platform/qcom/iris/iris_core.h
 +++ b/drivers/media/platform/qcom/iris/iris_core.h
-@@ -123,6 +123,12 @@
+@@ -123,6 +123,12 @@ struct iris_core {
  	/* encoder and decoder have overlapping caps, so two different arrays are required */
  	struct platform_inst_fw_cap		inst_fw_caps_dec[INST_FW_CAP_MAX];
  	struct platform_inst_fw_cap		inst_fw_caps_enc[INST_FW_CAP_MAX];
@@ -53,11 +60,13 @@ Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
  };
  
  int iris_core_init(struct iris_core *core);
+diff --git a/drivers/media/platform/qcom/iris/iris_firmware.c b/drivers/media/platform/qcom/iris/iris_firmware.c
+index 21cdf1c39..6550a9bff 100644
 --- a/drivers/media/platform/qcom/iris/iris_firmware.c
 +++ b/drivers/media/platform/qcom/iris/iris_firmware.c
-@@ -5,7 +5,9 @@
- 
+@@ -6,7 +6,9 @@
  #include <linux/firmware.h>
+ #include <linux/firmware/qcom/qcom_pas.h>
  #include <linux/firmware/qcom/qcom_scm.h>
 +#include <linux/iommu.h>
  #include <linux/of_address.h>
@@ -65,7 +74,7 @@ Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
  #include <linux/of_reserved_mem.h>
  #include <linux/soc/qcom/mdt_loader.h>
  
-@@ -16,6 +18,45 @@
+@@ -17,6 +19,45 @@
  
  #define MAX_FIRMWARE_NAME_SIZE	128
  
@@ -108,10 +117,10 @@ Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
 +	return 0;
 +}
 +
- static int iris_load_fw_to_memory(struct iris_core *core, const char *fw_name)
- {
- 	const struct firmware *firmware = NULL;
-@@ -53,10 +94,29 @@
+ /* Detect Gen2 firmware by scanning the blob for:
+  *   QC_IMAGE_VERSION_STRING=<version>
+  * and then checking:
+@@ -145,10 +186,29 @@ static int iris_load_fw_to_memory(struct iris_core *core)
  		goto err_release_fw;
  	}
  
@@ -143,11 +152,11 @@ Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
  err_release_fw:
  	release_firmware(firmware);
  
-@@ -80,23 +140,27 @@
- 		return -ENOMEM;
+@@ -166,23 +226,27 @@ int iris_fw_load(struct iris_core *core)
+ 		return ret;
  	}
  
--	ret = qcom_scm_pas_auth_and_reset(IRIS_PAS_ID);
+-	ret = qcom_pas_auth_and_reset(IRIS_PAS_ID);
 -	if (ret)  {
 -		dev_err(core->dev, "auth and reset failed: %d\n", ret);
 -		return ret;
@@ -161,9 +170,9 @@ Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
 -						     cp_config->cp_nonpixel_size);
 -		if (ret) {
 -			dev_err(core->dev, "qcom_scm_mem_protect_video_var failed: %d\n", ret);
--			qcom_scm_pas_shutdown(IRIS_PAS_ID);
+-			qcom_pas_shutdown(IRIS_PAS_ID);
 +	if (core->use_tz) {
-+		ret = qcom_scm_pas_auth_and_reset(IRIS_PAS_ID);
++		ret = qcom_pas_auth_and_reset(IRIS_PAS_ID);
 +		if (ret)  {
 +			dev_err(core->dev, "auth and reset failed: %d\n", ret);
  			return ret;
@@ -177,7 +186,7 @@ Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
 +							     cp_config->cp_nonpixel_size);
 +			if (ret) {
 +				dev_err(core->dev, "qcom_scm_mem_protect_video_var failed: %d\n", ret);
-+				qcom_scm_pas_shutdown(IRIS_PAS_ID);
++				qcom_pas_shutdown(IRIS_PAS_ID);
 +				return ret;
 +			}
 +		}
@@ -185,16 +194,16 @@ Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
 +		iris_reset_cpu_no_tz(core);
  	}
  
- 	return ret;
-@@ -104,10 +168,98 @@
+ 	return 0;
+@@ -190,10 +254,98 @@ int iris_fw_load(struct iris_core *core)
  
  int iris_fw_unload(struct iris_core *core)
  {
--	return qcom_scm_pas_shutdown(IRIS_PAS_ID);
+-	return qcom_pas_shutdown(IRIS_PAS_ID);
 +	int ret;
 +
 +	if (core->use_tz)
-+		ret = qcom_scm_pas_shutdown(IRIS_PAS_ID);
++		ret = qcom_pas_shutdown(IRIS_PAS_ID);
 +	else
 +		ret = iris_set_hw_state_no_tz(core, false);
 +
@@ -213,9 +222,9 @@ Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
  
  int iris_set_hw_state(struct iris_core *core, bool resume)
  {
--	return qcom_scm_set_remote_state(resume, 0);
+-	return qcom_pas_set_remote_state(resume, 0);
 +	if (core->use_tz)
-+		return qcom_scm_set_remote_state(resume, 0);
++		return qcom_pas_set_remote_state(resume, 0);
 +	else
 +		return iris_set_hw_state_no_tz(core, resume);
 +}
@@ -287,9 +296,11 @@ Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
 +	iommu_domain_free(core->fw.iommu_domain);
 +	platform_device_unregister(core->fw.pdev);
  }
+diff --git a/drivers/media/platform/qcom/iris/iris_firmware.h b/drivers/media/platform/qcom/iris/iris_firmware.h
+index e833ecd34..1a077a587 100644
 --- a/drivers/media/platform/qcom/iris/iris_firmware.h
 +++ b/drivers/media/platform/qcom/iris/iris_firmware.h
-@@ -12,4 +12,7 @@
+@@ -12,4 +12,7 @@ int iris_fw_load(struct iris_core *core);
  int iris_fw_unload(struct iris_core *core);
  int iris_set_hw_state(struct iris_core *core, bool resume);
  
@@ -297,6 +308,8 @@ Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
 +void iris_fw_deinit(struct iris_core *core);
 +
  #endif
+diff --git a/drivers/media/platform/qcom/iris/iris_probe.c b/drivers/media/platform/qcom/iris/iris_probe.c
+index e4acf4a74..fc139a179 100644
 --- a/drivers/media/platform/qcom/iris/iris_probe.c
 +++ b/drivers/media/platform/qcom/iris/iris_probe.c
 @@ -14,6 +14,7 @@
@@ -307,7 +320,7 @@ Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
  #include "iris_vidc.h"
  
  static int iris_init_icc(struct iris_core *core)
-@@ -207,6 +208,8 @@
+@@ -207,6 +208,8 @@ static void iris_remove(struct platform_device *pdev)
  
  	v4l2_device_unregister(&core->v4l2_dev);
  
@@ -316,7 +329,7 @@ Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
  	mutex_destroy(&core->lock);
  }
  
-@@ -271,6 +274,10 @@
+@@ -269,6 +272,10 @@ static int iris_probe(struct platform_device *pdev)
  	if (ret)
  		return ret;
  
@@ -324,6 +337,6 @@ Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
 +	if (ret)
 +		return ret;
 +
- 	iris_session_init_caps(core);
- 
  	ret = v4l2_device_register(dev, &core->v4l2_dev);
+ 	if (ret)
+ 		return ret;

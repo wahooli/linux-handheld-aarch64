@@ -2,26 +2,11 @@
 # shellcheck shell=bash
 # shellcheck disable=SC2034
 #
-# SC2034 is off for the whole file: setting variables for other scripts to read
-# is the job here, and shellcheck cannot see across that boundary.
-#
-# Product resolution, shared by every script that needs to know what is being
-# built. Sourced, never executed:
-#
-#   . scripts/lib-product.sh          # resolves $PRODUCT and loads its conf
-#
-# Resolution order, loudest last:
-#
-#   sources.env                       refs and defaults shared by all products
-#   products/$PRODUCT.conf            everything this product decides itself
-#   *_OVERRIDE environment variables  CI inputs and one-off experiments
+# SC2034 off: this file sets variables for other scripts.
+# Product resolution, sourced: sources.env, then products/$PRODUCT.conf, then *_OVERRIDE env (loudest last).
 
-# ---------------------------------------------------------------------------
-# Which product
-# ---------------------------------------------------------------------------
-# $PRODUCT wins; otherwise PRODUCTS must name exactly one. Two products and no
-# choice is an error, not a default: a wrong guess builds one kernel and
-# publishes it under the other's name.
+# --- which product ---
+# Two products and no PRODUCT is an error: a wrong guess publishes one kernel under the other's name.
 lp_load() {
     local here="$1"
     cd "${here}" || { echo "!! cannot cd to ${here}" >&2; return 1; }
@@ -46,20 +31,16 @@ lp_load() {
     local conf="products/${PRODUCT}.conf"
     [ -f "${conf}" ] || { echo "!! no ${conf} for PRODUCT='${PRODUCT}'" >&2; return 1; }
 
-    # Cleared before sourcing, so a stale environment cannot pass for a setting
-    # the conf makes. All documented in products/handheld.conf.
+    # Cleared so a stale environment cannot pass for a conf setting.
     PRODUCT_DESC=; PRODUCT_BOARDS=; PKGBASE=; KERNEL_SOURCE=; KERNEL_REF=
     CONFIG_DIRS=(); CONFIG_BASE=; SERIES=; SERIES_DENY=(); SERIES_EXTRA=()
     REPLACE_STOCK_KERNEL=; CACHY_SCHED=
     USE_OGC=; USE_ARMADA=; USE_ROCKNIX=; TAG_PREFIX=
     KERNEL_IMAGE=; KERNEL_IMAGE_DEST=; INITRAMFS_IMAGE=; INITRAMFS_FALLBACK=
     DTB_DEST=; INSTALL_VMLINUZ=
-    # Arrays, so reset rather than blanked -- a leftover DTS from an earlier
-    # lp_load in the same shell would be copied into the tree and registered.
+    # Arrays too: a leftover DTS from an earlier lp_load would be copied into the tree.
     DTS=(); DTS_DELTA=(); DTB=(); ROCKNIX_STAGED=(); ROCKNIX_DIRS=()
-    # BASE_VERSION exists in both files: the sources.env global is an escape hatch
-    # across all products, the per-product one pins just this one. Save the
-    # global, let the conf set its own, then decide.
+    # The sources.env BASE_VERSION is a global fallback; the conf's own pin wins.
     local base_global="${BASE_VERSION:-}"
     BASE_VERSION=
     # shellcheck source=/dev/null
@@ -67,8 +48,7 @@ lp_load() {
     BASE_VERSION="${BASE_VERSION:-${base_global}}"
 
     # ---- environment overrides --------------------------------------------
-    # KERNEL_SOURCE_OVERRIDE needs KERNEL_REF_OVERRIDE with it: the two sources
-    # name their bases differently (cachyos-7.2.2-1 vs 7.2.2).
+    # KERNEL_SOURCE_OVERRIDE needs KERNEL_REF_OVERRIDE: the sources name bases differently.
     KERNEL_SOURCE="${KERNEL_SOURCE_OVERRIDE:-${KERNEL_SOURCE}}"
     KERNEL_REF="${KERNEL_REF_OVERRIDE:-${KERNEL_REF}}"
     BASE_VERSION="${BASE_VERSION_OVERRIDE:-${BASE_VERSION}}"
@@ -92,8 +72,6 @@ lp_load() {
         compgen -G "config/${d}/*.config" >/dev/null \
             || { echo "!! ${conf}: config/${d}/ holds no *.config fragments" >&2; return 1; }
     done
-    # SERIES is either the literal `armada` or a path to a local file. Checked
-    # here so a typo fails in a second instead of 404ing mid-fetch.
     case "${SERIES}" in
         '')     echo "!! ${conf}: SERIES is empty" >&2; return 1 ;;
         armada) [ "${USE_ARMADA}" = yes ] || {
@@ -103,21 +81,16 @@ lp_load() {
     esac
     [ ${#SERIES_DENY[@]} -eq 0 ] || [ "${SERIES}" = armada ] \
         || { echo "!! ${conf}: SERIES_DENY only applies to SERIES=armada" >&2; return 1; }
-    # A DTS with no delta is fine; a delta with no DTS would patch a file that
-    # nothing fetched.
+    # A delta with no DTS would patch a file nothing fetched.
     [ ${#DTS_DELTA[@]} -eq 0 ] || [ ${#DTS[@]} -gt 0 ] \
         || { echo "!! ${conf}: DTS_DELTA is set but DTS is empty" >&2; return 1; }
     [ -n "${TAG_PREFIX}" ] || TAG_PREFIX="${PRODUCT}/v"
 
-    # `defconfig` means `make ARCH=arm64 defconfig`; anything else is a path to a
-    # full .config, which is what a product replacing a distro kernel wants.
     CONFIG_BASE="${CONFIG_BASE:-defconfig}"
     if [ "${CONFIG_BASE}" != defconfig ]; then
         [ -f "${CONFIG_BASE}" ] \
             || { echo "!! ${conf}: CONFIG_BASE names ${CONFIG_BASE}, which does not exist" >&2; return 1; }
-        # A base config inside a CONFIG_DIRS directory would also be merged as a
-        # fragment, and sorts after every numeric prefix -- so it would merge last
-        # and silently override every fragment.
+        # Inside a fragment dir it would also merge as a fragment, sort last and override everything.
         for d in "${CONFIG_DIRS[@]}"; do
             case "${CONFIG_BASE}" in
                 "config/${d}/"*) echo "!! ${conf}: CONFIG_BASE is inside config/${d}/, which is a fragment directory -- put it in config/base/" >&2; return 1 ;;
@@ -125,31 +98,24 @@ lp_load() {
         done
     fi
 
-    # Whether this kernel replaces ALARM's stock linux-aarch64 (provides +
-    # conflicts) or installs alongside it. Alongside needs every installed path
-    # -- image, dtb directory, initramfs -- to be distinct.
+    # 'no' installs alongside, which needs every installed path distinct.
     REPLACE_STOCK_KERNEL="${REPLACE_STOCK_KERNEL:-yes}"
     case "${REPLACE_STOCK_KERNEL}" in
         yes|no) ;;
         *) echo "!! ${conf}: REPLACE_STOCK_KERNEL must be yes or no" >&2; return 1 ;;
     esac
 
-    # An extra CachyOS scheduler patch on top of their tarball. Empty means the
-    # tree's own scheduler, which is what plain linux-cachyos ships.
     case "${CACHY_SCHED:-}" in
         ''|bore) ;;
         *) echo "!! ${conf}: CACHY_SCHED='${CACHY_SCHED}' is not '' or 'bore'" >&2; return 1 ;;
     esac
     if [ -n "${CACHY_SCHED:-}" ]; then
-        # The -cachy patches are rebased onto CachyOS's tree, whose fair.c
-        # already carries gaming-sched; on kernel.org they do not apply.
         [ "${KERNEL_SOURCE}" = cachyos ] || {
             echo "!! ${conf}: CACHY_SCHED=${CACHY_SCHED} needs KERNEL_SOURCE=cachyos" >&2
             echo "!! (the -cachy patches are rebased onto their tree, not mainline)" >&2
             echo "!! For the kernel.org A/B, drop the scheduler patch too:" >&2
             echo "!!   CACHY_SCHED_OVERRIDE= KERNEL_SOURCE_OVERRIDE=kernel.org ..." >&2
             return 1; }
-        # BORE and the OGC block are both large kernel/sched/fair.c reworks.
         [ "${USE_OGC}" != yes ] || {
             echo "!! ${conf}: CACHY_SCHED=${CACHY_SCHED} and USE_OGC=yes both rework kernel/sched/fair.c" >&2
             return 1; }
@@ -162,13 +128,11 @@ lp_load() {
     INITRAMFS_FALLBACK="${INITRAMFS_FALLBACK:-/boot/initramfs-${PKGBASE}-fallback.img}"
     DTB_DEST="${DTB_DEST:-/boot/dtb/qcom}"
 
-    # KERNEL_IMAGE is both a make target and a file under arch/arm64/boot/, so a
-    # path in it breaks the build rather than moving the output.
+    # Also a make target, so a path breaks the build rather than moving the output.
     case "${KERNEL_IMAGE}" in
         */*) echo "!! ${conf}: KERNEL_IMAGE='${KERNEL_IMAGE}' must be a bare name (Image, Image.gz)" >&2; return 1 ;;
     esac
-    # Pasted after ${pkgdir}, so a relative path silently writes into the build
-    # directory instead of the package.
+    # Pasted after ${pkgdir}: a relative path would write into the build directory.
     local v
     for v in KERNEL_IMAGE_DEST INITRAMFS_IMAGE INITRAMFS_FALLBACK DTB_DEST; do
         case "${!v}" in
@@ -179,8 +143,6 @@ lp_load() {
     [ "${INITRAMFS_IMAGE}" != "${INITRAMFS_FALLBACK}" ] \
         || { echo "!! ${conf}: INITRAMFS_IMAGE and INITRAMFS_FALLBACK are the same path" >&2; return 1; }
 
-    # Also install the image as usr/lib/modules/<kver>/vmlinuz, which is what
-    # makes mkinitcpio's pacman hook fire. See products/handheld.conf.
     INSTALL_VMLINUZ="${INSTALL_VMLINUZ:-no}"
     case "${INSTALL_VMLINUZ}" in
         yes|no) ;;
@@ -191,29 +153,18 @@ lp_load() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# One destructive operation per working tree
-# ---------------------------------------------------------------------------
-# fetch-patches.sh prunes patches/ and rewrites version.env; `makepkg
-# --cleanbuild` deletes src/ and re-extracts it. Either one racing a build in the
-# same checkout makes the compile fail on headers that exist, in a tree that was
-# replaced underneath it. To build two products at once, use two checkouts.
-#
-# LP_LOCK_HELD is exported, so build.sh calling fetch-patches.sh with FETCH=1
-# does not deadlock against itself.
+# --- one destructive operation per checkout ---
+# fetch prunes patches/ and makepkg --cleanbuild re-extracts src/: either racing a build breaks it.
+# LP_LOCK_HELD is exported so build.sh's own FETCH=1 does not deadlock.
 lp_lock() {
     local here="$1"
     [ -z "${LP_LOCK_HELD:-}" ] || return 0
     command -v flock >/dev/null || { echo "==> note: no flock; concurrent-run guard is off" >&2; return 0; }
-    # 9<> not 9>: opening with > truncates, wiping the holder's stamp before a
-    # contender gets to print it.
+    # 9<> not 9>: > truncates and would wipe the holder's stamp.
     exec 9<>"${here}/.build.lock"
-    # Seconds to block instead of failing. Default 0 (fail fast) suits CI; a human
-    # usually wants to wait: LOCK_WAIT=1800 ./scripts/build.sh
+    # Seconds to wait instead of failing (default 0, for CI), e.g. LOCK_WAIT=1800.
     if ! flock -w "${LOCK_WAIT:-0}" 9; then
         echo "!! another build or fetch is already running in ${here}:" >&2
-        # The holder stamps its own identity, so "something is running" says
-        # whether to wait four minutes or fifty.
         sed 's/^/!!   /' "${here}/.build.lock" >&2 2>/dev/null || true
         echo "!! Wait for it, set LOCK_WAIT=<seconds> to block, or use a second checkout." >&2
         return 1
@@ -226,12 +177,8 @@ lp_lock() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# The fragment list, in merge order
-# ---------------------------------------------------------------------------
-# Sorted by BASENAME across the union of CONFIG_DIRS, so the numeric prefix
-# decides order regardless of which directory a fragment lives in. The same
-# basename in two directories is an error: merging would silently drop one.
+# --- fragment list, in merge order ---
+# Sorted by basename across CONFIG_DIRS; a duplicate basename would silently drop one.
 lp_config_fragments() {
     local d f b prev=
     local -a lines=()
@@ -247,14 +194,9 @@ lp_config_fragments() {
     done < <(printf '%s\n' "${lines[@]}" | LC_ALL=C sort -t'|' -k1,1)
 }
 
-# ---------------------------------------------------------------------------
-# Kernel source resolution
-# ---------------------------------------------------------------------------
-# Sets, for the caller: KERNEL_REF (resolved), BASE, IS_RC, SRC_URL, SRC_TAR,
-# SRC_TOPDIR, SRC_SIG_URL, PKGVER_TAIL. Appends advisory lines to LP_NOTES.
-#
-# SRC_TOPDIR is the directory the tarball extracts to and is not derivable from
-# the base version: mainline gives linux-7.2.2/, CachyOS gives cachyos-7.2.2-1/.
+# --- kernel source resolution ---
+# Sets KERNEL_REF, BASE, IS_RC, SRC_URL, SRC_TAR, SRC_SIG_URL, PKGVER_TAIL, and SRC_TOPDIR
+# (not derivable: linux-7.2.2/ vs cachyos-7.2.2-1/). Appends notes to LP_NOTES.
 LP_NOTES=()
 
 # Pinned, so a swapped key is an error rather than trust-on-first-use.
@@ -275,15 +217,13 @@ lp_resolve_kernel_source() {
     cachyos)
         KERNEL_REF="${KERNEL_REF:-${CACHYOS_REF:-}}"
         [ -n "${KERNEL_REF}" ] || { echo "!! KERNEL_SOURCE=cachyos but neither KERNEL_REF nor CACHYOS_REF is set" >&2; return 1; }
-        # cachyos-<base>-<tagrel>; the base may itself contain a dash (7.3-rc1),
-        # so the greedy group takes everything up to the last dash-number.
+        # Greedy: the base may itself contain a dash (7.3-rc1).
         [[ "${KERNEL_REF}" =~ ^cachyos-(.+)-([0-9]+)$ ]] || {
             echo "!! KERNEL_REF='${KERNEL_REF}' is not a cachyos-<version>-<N> tag" >&2; return 1; }
         local cachy_base="${BASH_REMATCH[1]}" cachy_rel="${BASH_REMATCH[2]}"
         BASE="${cachy_base}"
         if [ -n "${BASE_VERSION}" ] && [ "${BASE_VERSION}" != "${cachy_base}" ]; then
-            # Refused, not noted: the tarball would be the tag's while the pkgver
-            # was the pin's, and nothing downstream could tell them apart.
+            # Refused: the tarball would be the tag's while pkgver was the pin's.
             echo "!! BASE_VERSION=${BASE_VERSION} contradicts ${KERNEL_REF}, which is base ${cachy_base}." >&2
             echo "!! A cachyos tag carries its own base; clear BASE_VERSION or pin KERNEL_REF instead." >&2
             return 1
@@ -295,13 +235,7 @@ lp_resolve_kernel_source() {
         PKGVER_TAIL="cachy${cachy_rel}"
         ;;
     kernel.org)
-        # Precedence: explicit ref, then the shared KERNELORG_REF, then -- only
-        # for a product that uses OGC -- the base the OGC tag implies.
-        #
-        # A plain mainline build gets no pkgver tail (7.2.2, not 7.2.2.mainline):
-        # pacman sorts a bare version below any suffixed one, so a comparison
-        # build never offers itself as an upgrade. '.mainline' would sort above
-        # '.cachy1' ('m' > 'c').
+        # No tail for plain mainline: a bare 7.2.2 sorts below any suffixed pkgver, so an A/B is never an upgrade.
         KERNEL_REF="${KERNEL_REF:-${KERNELORG_REF:-}}"
         if [ -z "${KERNEL_REF}" ] && [ "${USE_OGC}" = yes ] && [ -n "${OGC_REF:-}" ]; then
             [[ "${OGC_REF}" =~ ^v?(.+)-ogc([0-9]+)$ ]] || {
@@ -340,15 +274,8 @@ lp_resolve_kernel_source() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# Tarball verification
-# ---------------------------------------------------------------------------
-# Returns 0 verified, 1 not verified (the caller decides how loud that is), 2 if
-# there is nothing to verify against (an rc snapshot). Verdict on stdout.
-#
-# The two sources sign different things: kernel.org signs the uncompressed tar,
-# CachyOS signs the .tar.gz as shipped. Getting it backwards reports "no signed
-# data", which reads as a missing signature rather than a wrong input.
+# --- tarball verification ---
+# 0 verified, 1 not, 2 nothing to verify (rc). kernel.org signs the uncompressed tar, CachyOS the .tar.gz.
 lp_verify_tarball() {
     local file="$1" tmp="$2"
     local -a signers=()
@@ -368,8 +295,7 @@ lp_verify_tarball() {
     export GNUPGHOME="${tmp}/gnupg"; mkdir -p "${GNUPGHOME}"; chmod 700 "${GNUPGHOME}"
     local fpr got=0
     for fpr in "${signers[@]}"; do
-        # WKD first (kernel.org publishes it), then a keyserver. Only pinned
-        # fingerprints, so neither source decides who may sign.
+        # Only pinned fingerprints, so neither WKD nor the keyserver decides who may sign.
         gpg --batch --quiet --auto-key-locate wkd,keyserver \
             --keyserver hkps://keyserver.ubuntu.com --recv-keys "${fpr}" >/dev/null 2>&1 \
             && got=$((got + 1))

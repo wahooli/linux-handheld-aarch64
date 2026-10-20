@@ -1,5 +1,5 @@
 From e4e63760ec0829215ea11a2d9fb430843dcc554e Mon Sep 17 00:00:00 2001
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Date: Fri, 14 Aug 2026 15:35:33 +0300
 Subject: [PATCH 23/28] wip: firmware: qcom: tzmem: self-owner SHM bridge via
  qcom,shm-bridge-vmid (Gerhold, hand-merged onto 7.1 helper)

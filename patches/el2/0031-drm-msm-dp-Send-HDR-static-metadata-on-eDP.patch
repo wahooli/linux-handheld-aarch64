@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Date: Sat, 6 Sep 2026 02:40:00 +0300
 Subject: [PATCH 31/32] drm/msm/dp: Send HDR static metadata on eDP
 
@@ -37,31 +37,35 @@ compositor performing a modeset when it changes the metadata.
 Tested on a Lenovo Yoga Slim 7x, eDP-1 at 2944x1840@90, bpp 30, HBR2 x4,
 playing HDR10 content under Hyprland.
 
-Signed-off-by: Waltteri Hooli <wahooli@localhost>
+Signed-off-by: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 ---
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 59070f399..0d68a952d 100644
 --- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
 +++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
-@@ -2561,7 +2561,7 @@
+@@ -2648,7 +2648,7 @@ void msm_dp_ctrl_off_link(struct msm_dp_ctrl *msm_dp_ctrl,
  	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
  	phy = ctrl->phy;
  
--	msm_dp_panel_disable_vsc_sdp(ctrl->panel);
-+	msm_dp_panel_disable_sdp(ctrl->panel);
- 
- 	/* set dongle to D3 (power off) mode */
- 	msm_dp_link_psm_config(ctrl->link, &ctrl->panel->link_info, true);
-@@ -2591,7 +2591,7 @@
- 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
- 	phy = ctrl->phy;
- 
--	msm_dp_panel_disable_vsc_sdp(ctrl->panel);
-+	msm_dp_panel_disable_sdp(ctrl->panel);
+-	msm_dp_panel_disable_vsc_sdp(panel);
++	msm_dp_panel_disable_sdp(panel);
  
  	msm_dp_ctrl_mainlink_disable(ctrl);
  
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 4dcbd9b99..a23f2b7f4 100644
 --- a/drivers/gpu/drm/msm/dp/dp_display.c
 +++ b/drivers/gpu/drm/msm/dp/dp_display.c
-@@ -1321,6 +1321,16 @@
+@@ -718,7 +718,7 @@ static int msm_dp_display_disable(struct msm_dp_display_private *dp,
+ 	if (!msm_dp_display->power_on)
+ 		return 0;
+ 
+-	msm_dp_panel_disable_vsc_sdp(msm_dp_panel);
++	msm_dp_panel_disable_sdp(msm_dp_panel);
+ 
+ 	msm_dp_ctrl_off_pixel_clk(dp->ctrl);
+ 
+@@ -1375,6 +1375,16 @@ void msm_dp_display_debugfs_init(struct msm_dp *msm_dp_display, struct dentry *r
  		DRM_ERROR("failed to initialize debug, rc = %d\n", rc);
  }
  
@@ -78,19 +82,23 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  int msm_dp_modeset_init(struct msm_dp *msm_dp_display, struct drm_device *dev,
  			struct drm_encoder *encoder, bool yuv_supported)
  {
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.h b/drivers/gpu/drm/msm/dp/dp_display.h
+index 83117e761..1495a8bb9 100644
 --- a/drivers/gpu/drm/msm/dp/dp_display.h
 +++ b/drivers/gpu/drm/msm/dp/dp_display.h
-@@ -33,5 +33,7 @@
- void msm_dp_display_signal_audio_complete(struct msm_dp *msm_dp_display);
- void msm_dp_display_set_psr(struct msm_dp *dp, bool enter);
- void msm_dp_display_debugfs_init(struct msm_dp *msm_dp_display, struct dentry *dentry, bool is_edp);
+@@ -42,5 +42,7 @@ void msm_dp_display_atomic_enable(struct msm_dp *dp_display,
+ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
+ 					       const struct drm_display_info *info,
+ 					       const struct drm_display_mode *mode);
 +int msm_dp_display_set_hdr_metadata(struct msm_dp *msm_dp_display,
 +				    const struct drm_connector_state *conn_state);
  
  #endif /* _DP_DISPLAY_H_ */
+diff --git a/drivers/gpu/drm/msm/dp/dp_drm.c b/drivers/gpu/drm/msm/dp/dp_drm.c
+index c1e4147bf..165447094 100644
 --- a/drivers/gpu/drm/msm/dp/dp_drm.c
 +++ b/drivers/gpu/drm/msm/dp/dp_drm.c
-@@ -95,6 +95,7 @@
+@@ -141,6 +141,7 @@ static void msm_edp_bridge_atomic_enable(struct drm_bridge *drm_bridge,
  {
  	struct drm_crtc *crtc;
  	struct drm_crtc_state *old_crtc_state;
@@ -98,7 +106,7 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  	struct msm_dp_bridge *msm_dp_bridge = to_dp_bridge(drm_bridge);
  	struct msm_dp *dp = msm_dp_bridge->msm_dp_display;
  
-@@ -116,6 +117,11 @@
+@@ -162,6 +163,11 @@ static void msm_edp_bridge_atomic_enable(struct drm_bridge *drm_bridge,
  		return;
  	}
  
@@ -107,10 +115,10 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
 +		msm_dp_display_set_hdr_metadata(dp,
 +				drm_atomic_get_new_connector_state(state, connector));
 +
- 	msm_dp_bridge_atomic_enable(drm_bridge, state);
+ 	msm_dp_display_atomic_enable(dp, state);
  }
  
-@@ -325,5 +331,14 @@
+@@ -371,5 +377,14 @@ struct drm_connector *msm_dp_drm_connector_init(struct msm_dp *msm_dp_display,
  	if (!msm_dp_display->is_edp)
  		drm_connector_attach_dp_subconnector_property(connector);
  
@@ -125,6 +133,8 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
 +
  	return connector;
  }
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.c b/drivers/gpu/drm/msm/dp/dp_panel.c
+index e76dad0f6..a2d9e9200 100644
 --- a/drivers/gpu/drm/msm/dp/dp_panel.c
 +++ b/drivers/gpu/drm/msm/dp/dp_panel.c
 @@ -7,11 +7,13 @@
@@ -141,7 +151,7 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  #include <linux/io.h>
  #include <linux/types.h>
  #include <asm/byteorder.h>
-@@ -482,21 +484,22 @@
+@@ -442,21 +444,22 @@ void msm_dp_panel_clear_dsc_dto(struct msm_dp_panel *msm_dp_panel)
  	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO, 0x0);
  }
  
@@ -172,15 +182,15 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  	}
  }
  
-@@ -511,36 +514,156 @@
+@@ -471,36 +474,156 @@ static void msm_dp_panel_update_sdp(struct msm_dp_panel_private *panel)
  	}
  }
  
 -void msm_dp_panel_enable_vsc_sdp(struct msm_dp_panel *msm_dp_panel, struct dp_sdp *vsc_sdp)
 +static int msm_dp_panel_setup_vsc_sdp_yuv_420(struct msm_dp_panel *msm_dp_panel)
- {
- 	struct msm_dp_panel_private *panel =
- 		container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
++{
++	struct msm_dp_panel_private *panel =
++		container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
 +	struct msm_dp_display_mode *msm_dp_mode = &msm_dp_panel->msm_dp_mode;
 +	struct drm_dp_vsc_sdp vsc_sdp_data;
 +	struct dp_sdp vsc_sdp;
@@ -275,9 +285,9 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
 + * or neither may be enabled.
 + */
 +static void msm_dp_panel_setup_sdps(struct msm_dp_panel *msm_dp_panel)
-+{
-+	struct msm_dp_panel_private *panel =
-+		container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
+ {
+ 	struct msm_dp_panel_private *panel =
+ 		container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
 +	bool send_vsc = msm_dp_panel->msm_dp_mode.out_fmt_is_yuv_420;
 +	bool send_hdr = msm_dp_panel->hdr_sdp_valid;
  	u32 cfg, cfg2, misc;
@@ -340,7 +350,7 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  {
  	struct msm_dp_panel_private *panel =
  		container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
-@@ -550,16 +673,16 @@
+@@ -510,16 +633,16 @@ void msm_dp_panel_disable_vsc_sdp(struct msm_dp_panel *msm_dp_panel)
  	cfg2 = msm_dp_read_link(panel, MMSS_DP_SDP_CFG2);
  	misc = msm_dp_read_link(panel, REG_DP_MISC1_MISC0);
  
@@ -360,7 +370,7 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  
  	pr_debug("misc settings = 0x%x\n", misc);
  	msm_dp_write_link(panel, REG_DP_MISC1_MISC0, misc);
-@@ -567,48 +690,6 @@
+@@ -527,48 +650,6 @@ void msm_dp_panel_disable_vsc_sdp(struct msm_dp_panel *msm_dp_panel)
  	msm_dp_panel_update_sdp(panel);
  }
  
@@ -409,7 +419,7 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  
  int msm_dp_panel_timing_cfg(struct msm_dp_panel *msm_dp_panel, bool wide_bus_en)
  {
-@@ -679,8 +760,7 @@
+@@ -639,8 +720,7 @@ int msm_dp_panel_timing_cfg(struct msm_dp_panel *msm_dp_panel, bool wide_bus_en)
  
  	msm_dp_write_p0(panel, MMSS_DP_INTF_CONFIG, reg);
  
@@ -419,6 +429,8 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  
  	panel->panel_on = true;
  
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.h b/drivers/gpu/drm/msm/dp/dp_panel.h
+index 4519ac374..755bc74ea 100644
 --- a/drivers/gpu/drm/msm/dp/dp_panel.h
 +++ b/drivers/gpu/drm/msm/dp/dp_panel.h
 @@ -13,6 +13,7 @@
@@ -429,7 +441,7 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  
  struct msm_dp_display_mode {
  	struct drm_display_mode drm_mode;
-@@ -41,6 +42,14 @@
+@@ -40,6 +41,14 @@ struct msm_dp_panel {
  	bool vsc_sdp_supported;
  	u32 hw_revision;
  
@@ -444,7 +456,7 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  	u32 max_bw_code;
  };
  
-@@ -60,8 +69,9 @@
+@@ -58,8 +67,9 @@ void msm_dp_panel_tpg_config(struct msm_dp_panel *msm_dp_panel, bool enable);
  
  void msm_dp_panel_clear_dsc_dto(struct msm_dp_panel *msm_dp_panel);
  
@@ -456,9 +468,11 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  
  /**
   * is_link_rate_valid() - validates the link rate
+diff --git a/drivers/gpu/drm/msm/dp/dp_reg.h b/drivers/gpu/drm/msm/dp/dp_reg.h
+index dda4b642c..a5dadbde6 100644
 --- a/drivers/gpu/drm/msm/dp/dp_reg.h
 +++ b/drivers/gpu/drm/msm/dp/dp_reg.h
-@@ -230,10 +230,12 @@
+@@ -232,10 +232,12 @@
  #define MMSS_DP_AUDIO_CTRL_RESET		(0x00000214)
  
  #define MMSS_DP_SDP_CFG				(0x00000228)
@@ -473,4 +487,3 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
  #define MMSS_DP_AUDIO_STREAM_0			(0x00000240)
 -- 
 2.51.0
-

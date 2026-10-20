@@ -30,10 +30,10 @@ Signed-off-by: Stephan Gerhold <stephan@gerhold.net>
  1 file changed, 29 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/remoteproc/qcom_q6v5_pas.c b/drivers/remoteproc/qcom_q6v5_pas.c
-index dbaec3ed4..1441f3284 100644
+index 56b247441..db8d8fcb6 100644
 --- a/drivers/remoteproc/qcom_q6v5_pas.c
 +++ b/drivers/remoteproc/qcom_q6v5_pas.c
-@@ -562,6 +562,13 @@ static const struct rproc_ops qcom_pas_minidump_ops = {
+@@ -590,6 +590,13 @@ static const struct rproc_ops qcom_pas_minidump_ops = {
  	.attach = qcom_pas_attach,
  };
  
@@ -47,7 +47,7 @@ index dbaec3ed4..1441f3284 100644
  static int qcom_pas_init_clock(struct qcom_pas *pas)
  {
  	pas->xo = devm_clk_get(pas->dev, "xo");
-@@ -797,6 +804,9 @@ static int qcom_pas_probe(struct platform_device *pdev)
+@@ -827,6 +834,9 @@ static int qcom_pas_probe(struct platform_device *pdev)
  	if (desc->minidump_id)
  		ops = &qcom_pas_minidump_ops;
  
@@ -57,7 +57,7 @@ index dbaec3ed4..1441f3284 100644
  	rproc = devm_rproc_alloc(&pdev->dev, desc->sysmon_name, ops, fw_name, sizeof(*pas));
  
  	if (!rproc) {
-@@ -805,10 +815,14 @@ static int qcom_pas_probe(struct platform_device *pdev)
+@@ -835,10 +845,14 @@ static int qcom_pas_probe(struct platform_device *pdev)
  	}
  
  	rproc->has_iommu = of_property_present(pdev->dev.of_node, "iommus");
@@ -75,7 +75,7 @@ index dbaec3ed4..1441f3284 100644
  	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
  
  	pas = rproc->priv;
-@@ -869,6 +883,13 @@ static int qcom_pas_probe(struct platform_device *pdev)
+@@ -899,6 +913,13 @@ static int qcom_pas_probe(struct platform_device *pdev)
  	 */
  	qcom_q6v5_read_smp2p_state(&pas->q6v5);
  
@@ -89,7 +89,7 @@ index dbaec3ed4..1441f3284 100644
  	qcom_add_glink_subdev(rproc, &pas->glink_subdev, desc->ssr_name);
  	qcom_add_smd_subdev(rproc, &pas->smd_subdev);
  	qcom_add_pdm_subdev(rproc, &pas->pdm_subdev);
-@@ -914,6 +935,7 @@ static int qcom_pas_probe(struct platform_device *pdev)
+@@ -934,6 +955,7 @@ static int qcom_pas_probe(struct platform_device *pdev)
  	qcom_remove_pdm_subdev(rproc, &pas->pdm_subdev);
  	qcom_remove_smd_subdev(rproc, &pas->smd_subdev);
  	qcom_remove_glink_subdev(rproc, &pas->glink_subdev);
@@ -97,7 +97,7 @@ index dbaec3ed4..1441f3284 100644
  	qcom_q6v5_deinit(&pas->q6v5);
  detach_proxy_pds:
  	qcom_pas_pds_detach(pas, pas->proxy_pds, pas->proxy_pd_count);
-@@ -921,6 +943,7 @@ static int qcom_pas_probe(struct platform_device *pdev)
+@@ -941,6 +963,7 @@ static int qcom_pas_probe(struct platform_device *pdev)
  	qcom_pas_unassign_memory_region(pas);
  free_rproc:
  	device_init_wakeup(pas->dev, false);
@@ -105,13 +105,13 @@ index dbaec3ed4..1441f3284 100644
  
  	return ret;
  }
-@@ -929,6 +952,9 @@ static void qcom_pas_remove(struct platform_device *pdev)
+@@ -949,6 +972,9 @@ static void qcom_pas_remove(struct platform_device *pdev)
  {
  	struct qcom_pas *pas = platform_get_drvdata(pdev);
  
 +	if (!pas->rproc)
 +		return;
 +
- 	rproc_del(pas->rproc);
+ 	if (pas->bam_dmux)
+ 		of_platform_device_destroy(&pas->bam_dmux->dev, NULL);
  
- 	qcom_q6v5_deinit(&pas->q6v5);

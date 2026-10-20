@@ -1,28 +1,18 @@
 # Maintainer: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 #
-# One kernel product, packaged for Arch Linux ARM. Which product -- pkgbase,
-# kernel source, config fragments, devices, patch stack -- is decided by
-# products/<name>.conf; this file is the same for every product.
-#
-# Run scripts/fetch-patches.sh first. It writes the two files read here:
-#
-#   version.env              which product, which kernel, from where, checksum
-#   patches/series.generated the single ordered list of patches to apply
+# Same for every product. Reads version.env + patches/series.generated from scripts/fetch-patches.sh.
+# https://github.com/wahooli/linux-handheld-aarch64/wiki/Building-and-Publishing#pkgbuild-flow
 
 # shellcheck source=/dev/null
 source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/version.env"
 
 pkgbase="${_pkgbase}"
 pkgname=("${_pkgbase}" "${_pkgbase}-headers")
-# pkgver (base version + patchset revision) and pkgrel (build counter, set by CI
-# from what is already in R2) come from version.env. vercmp orders these right:
-#   7.2.1.ogc3 < 7.2.1.ogc4 < 7.2.1.ogc10 < 7.2.2.ogc1, and 7.2.ogc9 < 7.2.1.ogc1
 pkgdesc="${_pkgdesc}"
 arch=('aarch64')
 url='https://github.com/wahooli/linux-handheld-aarch64'
 license=('GPL-2.0-only')
-# pahole is not optional: without it DEBUG_INFO_BTF -- and therefore
-# SCHED_CLASS_EXT -- is silently dropped from .config at build time.
+# pahole is required: without it DEBUG_INFO_BTF, and with it SCHED_CLASS_EXT, silently drop out.
 makedepends=('bc' 'cpio' 'gettext' 'kmod' 'libelf' 'pahole' 'perl' 'python'
              'tar' 'xz' 'zstd' 'dtc' 'bison' 'flex' 'openssl')
 options=('!strip' '!debug')
@@ -32,9 +22,7 @@ sha256sums=("${_srcsha256}")
 
 _srcdir="${_srcname}"
 
-# Where the fetched-but-uncommitted inputs live. startdir rather than the source
-# array because the patch set is only known at fetch time; the trade-off is that
-# this PKGBUILD needs its sibling directories.
+# Fetched inputs live beside the PKGBUILD: the patch set is only known at fetch time.
 _repo() { printf '%s' "${startdir}"; }
 
 prepare() {
@@ -42,12 +30,7 @@ prepare() {
     local repo; repo="$(_repo)"
 
     # ---- patch stack -------------------------------------------------------
-    # Dry-run before applying, always: GNU patch can exit 0 after consuming only
-    # the first hunk, and a half-applied patch fails later during compile,
-    # pointing at nothing.
-    #
-    # Upstream and local failures are reported separately because the fix
-    # differs: upstream means waiting for a rebase, local means doing it.
+    # Dry-run first: GNU patch can exit 0 after applying only the first hunk.
     local p f n=0 kind
     local -a failed_upstream=() failed_local=() already=()
 
@@ -58,7 +41,7 @@ prepare() {
         [ -f "${f}" ] || { echo "::  missing patch: ${p} (run scripts/fetch-patches.sh)"; return 1; }
 
         # patches/<product>/ holds ours; anything else was fetched.
-        case "${p}" in "${_product}"/*) kind=local ;; *) kind=upstream ;; esac
+        case "${p}" in "${_product}"/*|shared/*) kind=local ;; *) kind=upstream ;; esac
 
         # -F0 unless version.env's _fuzzallow lists this patch.
         local fuzz=0
@@ -67,10 +50,7 @@ prepare() {
         esac
 
         if ! patch -p1 --batch --forward -F"${fuzz}" --dry-run --quiet < "${f}"; then
-            # A patch that will not apply may already be in the tree. A reverse
-            # dry-run tells that from "no longer applies", and only the second is
-            # a failure. A partly applied patch fails both directions, so it is
-            # reported as a failure -- which is correct.
+            # Reverse dry-run: already in the tree is skipped; a partly applied patch fails both ways.
             if patch -p1 -R --batch -F0 --dry-run --quiet < "${f}"; then
                 echo "::  already in the base (${kind}), skipped: ${p}"
                 already+=("${p}")
@@ -83,8 +63,7 @@ prepare() {
         if [ "${fuzz}" = 0 ]; then
             patch -p1 --batch --forward -F0 --no-backup-if-mismatch --quiet < "${f}"
         else
-            # Not --quiet: fuzz and offset lines reach the build log, so an
-            # upstream rebase that moves a hunk is visible.
+            # Not --quiet: fuzz and offset lines reach the log, so a moved hunk is visible.
             local out
             out="$(patch -p1 --batch --forward -F"${fuzz}" --no-backup-if-mismatch < "${f}")"
             echo "::  applied with fuzz ${fuzz} (allowed): ${p}"
@@ -119,9 +98,7 @@ prepare() {
     echo "::  applied ${n} patches to ${_srcname}, ${#already[@]} already present"
 
     # ---- device trees ------------------------------------------------------
-    # Boards not in mainline: vendored verbatim plus a delta patch, so the copy
-    # has to precede the delta. A board whose .dts is already in the tree appears
-    # in DTB and not in DTS.
+    # Copy before the delta that patches it; boards already in the tree are only in DTB.
     local dts dtsbase
     # shellcheck source=/dev/null
     DTS=(); DTS_DELTA=(); DTB=(); source "${repo}/products/${_product}.conf"
@@ -133,8 +110,7 @@ prepare() {
     for dts in "${DTS_DELTA[@]}"; do
         patch -p1 -F0 --no-backup-if-mismatch -s < "${repo}/dts/${dts}"
     done
-    # Register vendored boards so `make dtbs` builds them; the grep skips the
-    # ones the Makefile already lists.
+    # Register vendored boards with `make dtbs` unless the Makefile already lists them.
     for dts in "${DTS[@]}"; do
         [[ "${dts}" == *.dts ]] || continue     # .dtsi are included, not built
         dtsbase="${dts%.dts}"
@@ -144,13 +120,7 @@ prepare() {
     echo "::  ${#DTS[@]} vendored device tree source(s), ${#DTB[@]} dtb(s) to ship"
 
     # ---- config ------------------------------------------------------------
-    # A base, then fragments in filename order: identity first, hardware
-    # enablement next, Arch userland last so it wins any collision.
-    #
-    # _configbase is `defconfig` or a committed full .config -- the latter for a
-    # product replacing a distro kernel, since arm64 defconfig is thousands of
-    # symbols short of one. olddefconfig resolves the symbols an older full
-    # config does not mention yet; syncconfig, which `make prepare` runs, does not.
+    # olddefconfig, not syncconfig: it resolves symbols an older full base config does not mention.
     if [ "${_configbase}" = defconfig ]; then
         make ARCH=arm64 defconfig > /dev/null
     else
@@ -160,9 +130,7 @@ prepare() {
         make ARCH=arm64 olddefconfig > /dev/null
         echo "::  base config: ${_configbase} ($(grep -c '^CONFIG_' .config) symbols after olddefconfig)"
     fi
-    # Fragments come from the product's _configdirs, sorted by BASENAME across all
-    # of them so the numeric prefix keeps deciding merge order. Glob order would
-    # merge all of common/ before all of handheld/ and silently invert it.
+    # Sort by basename across dirs so the numeric prefix, not the directory, decides order.
     local -a frags=()
     local cdir frag
     for cdir in ${_configdirs}; do
@@ -182,16 +150,8 @@ prepare() {
     ARCH=arm64 bash scripts/kconfig/merge_config.sh -m .config "${frags[@]}"
     make ARCH=arm64 olddefconfig > /dev/null
 
-    # Verify the final request for each symbol survived (later fragments win,
-    # including ignored *.local.config overrides). merge_config.sh warns about
-    # overrides but exits 0, and a dropped CONFIG_DRM_MSM=y is a black screen you
-    # debug on the device instead of in CI. Each form goes missing differently:
-    #
-    #   =y            must be y
-    #   =m            m or y -- something else may `select` it builtin
-    #   ="str", =num  exact match, or LOCALVERSION="-el2" can be overridden and
-    #                 still report success
-    #   is not set    must not be set to anything
+    # merge_config.sh only warns on overrides: check each symbol's last request survived.
+    # =y exact, =m also accepts y (selected builtin), strings/numbers exact, 'is not set' must be absent.
     local missing=0 line key want
     while read -r line; do
         case "${line}" in
@@ -222,50 +182,27 @@ prepare() {
     ' "${frags[@]}")
     [ "${missing}" = 0 ] || { echo "::  config fragments did not fully apply"; return 1; }
 
-    # No `make kernelrelease > version` here: setlocalversion reads the
-    # localversion out of include/config/auto.conf, which syncconfig only writes
-    # during the build. Right now it would report a bare "7.2.1" while modules go
-    # on to install under "7.2.1-handheld". The package functions read
-    # include/config/kernel.release, generated by the build, instead.
+    # No `make kernelrelease` here: auto.conf is not written yet, so it would omit LOCALVERSION.
     echo "::  configured $(grep -c '^CONFIG_' .config) symbols"
 }
 
 build() {
     cd "${srcdir}/${_srcdir}"
-    # Explicit targets rather than `all`: on arm64 `all` resolves to KBUILD_IMAGE
-    # and does not necessarily build the device trees.
+    # Explicit targets: arm64 `all` resolves to KBUILD_IMAGE and may skip the dtbs.
     make ARCH=arm64 "${_kernelimage}" dtbs modules
 }
 
 _package() {
     pkgdesc="${_pkgdesc} -- ${_srcname}"
-    # NOT depends=('initramfs'): the Odin 3 builds its storage stack in and never
-    # installs mkinitcpio.
-    #
-    # The preset below is written regardless, but that alone does not get an
-    # initramfs built: mkinitcpio's install hook triggers on
-    # `usr/lib/modules/*/vmlinuz`, not on `pkgbase`, so a package keeping its
-    # image only in /boot never fires it. INSTALL_VMLINUZ picks:
-    #
-    #   no  (default)  run `mkinitcpio -p <pkgbase>` by hand
-    #   yes            also install the image as usr/lib/modules/<kver>/vmlinuz so
-    #                  the hook fires, at ~30 MiB per package
+    # No depends=('initramfs'): the Odin 3 never installs mkinitcpio. Its install hook fires only on
+    # usr/lib/modules/*/vmlinuz, hence INSTALL_VMLINUZ.
     depends=('coreutils' 'kmod')
     optdepends=('linux-firmware: firmware for most devices'
                 'mkinitcpio: to generate an initramfs from the shipped preset'
                 'scx-scheds: sched_ext schedulers, incl. the latency-tuned scx_lavd')
     provides=('KSMBD-MODULE' 'VIRTUALBOX-GUEST-MODULES' 'WIREGUARD-MODULE')
 
-    # Whether to displace ALARM's stock kernel. The two halves do different jobs:
-    #
-    #   conflicts  pacman refuses to co-install the stock kernel. Without it, two
-    #              kernels end up installed and an installer picking a module tree
-    #              with `ls -d /usr/lib/modules/*/` chooses alphabetically.
-    #   provides   anything depending on linux-aarch64 resolves to us instead of
-    #              erroring out on the conflict.
-    #
-    # _replacestock=no coexists instead, which only works because its image, dtb
-    # directory and initramfs paths are all distinct.
+    # conflicts keeps the stock kernel out; provides lets its dependents resolve to this one.
     if [ "${_replacestock}" = yes ]; then
         provides+=("linux-aarch64=${pkgver}" "linux=${pkgver}")
         conflicts=('linux-aarch64')
@@ -275,14 +212,9 @@ _package() {
     local repo; repo="$(_repo)"
     local kver; kver="$(<include/config/kernel.release)"
 
-    # The Odin 3 boot chain wants an uncompressed Image at /boot/Image -- its
-    # image builder gzips it itself and appends the DTBs. Products booting through
-    # UEFI or another loader set KERNEL_IMAGE/KERNEL_IMAGE_DEST instead.
     install -Dm644 "arch/arm64/boot/${_kernelimage}" "${pkgdir}${_kernelimagedest}"
 
-    # /dev/ntsync is a misc device with no autoload path, so as a module nothing
-    # opens it on demand and Proton just sees no node. Keyed off the built config,
-    # so NTSYNC=y never leaves a stale loader behind for a built-in.
+    # /dev/ntsync has no autoload path; keyed off the built config so =y leaves no stale loader.
     if grep -qx 'CONFIG_NTSYNC=m' .config; then
         install -Dm644 /dev/stdin \
             "${pkgdir}/usr/lib/modules-load.d/${pkgbase}-ntsync.conf" <<< "ntsync"
@@ -294,8 +226,6 @@ _package() {
             "${pkgdir}/usr/lib/modules/${kver}/vmlinuz"
     fi
 
-    # From the product conf, not version.env: the conf is where the list is
-    # edited, and this is the only consumer that needs the array form.
     local dtb
     # shellcheck source=/dev/null
     DTB=(); source "${repo}/products/${_product}.conf"
@@ -303,21 +233,16 @@ _package() {
         install -Dm644 "arch/arm64/boot/dts/qcom/${dtb}" "${pkgdir}${_dtbdest}/${dtb}"
     done
 
-    # DEPMOD=/doesnt/exist skips depmod at package time -- pacman's hook runs it
-    # on the device instead. The loud "requires /doesnt/exist" warning is expected.
+    # DEPMOD=/doesnt/exist: pacman's hook runs depmod on the device; the warning is expected.
     make ARCH=arm64 INSTALL_MOD_PATH="${pkgdir}/usr" INSTALL_MOD_STRIP=1 \
          DEPMOD=/doesnt/exist modules_install
     rm -f "${pkgdir}/usr/lib/modules/${kver}"/{source,build}
 
-    # The PKGBASE, not the kernel version: Arch's mkinitcpio hooks read this to
-    # find which /etc/mkinitcpio.d/<pkgbase>.preset belongs to a module tree. A
-    # version here looks plausible and silently generates no initramfs.
+    # The pkgbase, not the version: mkinitcpio's hooks map it to /etc/mkinitcpio.d/<pkgbase>.preset.
     echo "${pkgbase}" > "${pkgdir}/usr/lib/modules/${kver}/pkgbase"
 
     # ---- mkinitcpio preset -------------------------------------------------
-    # ALL_kver is the literal version rather than a path to the image, the way
-    # Arch's presets do it: mkinitcpio can extract a version from an x86 bzImage,
-    # but not from a bare arm64 `Image`.
+    # Literal ALL_kver: mkinitcpio cannot read a version out of an arm64 Image.
     install -d "${pkgdir}/etc/mkinitcpio.d"
     cat > "${pkgdir}/etc/mkinitcpio.d/${pkgbase}.preset" <<PRESET
 # mkinitcpio preset for ${pkgbase}, generated by the PKGBUILD.
@@ -332,9 +257,7 @@ fallback_image="${_initramfsfallback}"
 fallback_options="-S autodetect"
 PRESET
 
-    # Fires mkinitcpio's pacman hook, which triggers on usr/lib/initcpio/* and
-    # not on anything else this package installs. Named by kver so it cannot
-    # collide with ALARM's own marker or the other product's.
+    # Fires mkinitcpio's pacman hook (usr/lib/initcpio/*); named by kver so it cannot collide.
     install -Dm644 /dev/stdin "${pkgdir}/usr/lib/initcpio/${kver}" \
         <<< "dummy file to trigger mkinitcpio to run (${pkgbase})"
 }
@@ -351,23 +274,15 @@ _package-headers() {
     local kver; kver="$(<include/config/kernel.release)"
     local builddir="${pkgdir}/usr/lib/modules/${kver}/build"
 
-    # Modelled on Arch's own linux PKGBUILD. Module.symvers is the easy one to
-    # miss: without it modpost cannot resolve a single exported symbol and every
-    # out-of-tree or DKMS module fails to link.
+    # Modelled on Arch's linux PKGBUILD. Without Module.symvers no out-of-tree module links.
     install -Dt "${builddir}" -m644 .config Makefile Module.symvers System.map vmlinux
     install -Dm644 include/config/kernel.release "${builddir}/version"
     install -Dt "${builddir}/kernel" -m644 kernel/Makefile
     install -Dt "${builddir}/arch/arm64" -m644 arch/arm64/Makefile
     cp -t "${builddir}" -a scripts
 
-    # vmlinux is most of the package's size and is deliberate: full DEBUG_INFO is
-    # on for DEBUG_INFO_BTF (SCHED_CLASS_EXT depends on it), DEBUG_INFO_BTF_MODULES
-    # then defaults y, and resolve_btfids needs vmlinux's BTF to link any
-    # out-of-tree module. If size ever matters more, the knob is
-    # CONFIG_DEBUG_INFO_BTF_MODULES=n in a fragment -- not deleting vmlinux here.
-    #
-    # objtool and resolve_btfids are build artefacts, copied rather than rebuilt
-    # on the device.
+    # vmlinux is deliberate: resolve_btfids needs its BTF for out-of-tree modules. To shrink,
+    # set DEBUG_INFO_BTF_MODULES=n in a fragment rather than dropping vmlinux.
     [ -f tools/objtool/objtool ] && install -Dt "${builddir}/tools/objtool" tools/objtool/objtool
     [ -f tools/bpf/resolve_btfids/resolve_btfids ] \
         && install -Dt "${builddir}/tools/bpf/resolve_btfids" tools/bpf/resolve_btfids/resolve_btfids
@@ -384,19 +299,16 @@ _package-headers() {
     # Every Kconfig, so `make menuconfig` works against the installed tree.
     find . -name 'Kconfig*' -exec install -Dm644 {} "${builddir}/{}" \;
 
-    # Drop the other architectures -- a surprising amount of dead weight here.
     local arch
     for arch in "${builddir}"/arch/*/; do
         [[ "${arch}" == */arm64/ ]] && continue
         rm -r "${arch}"
     done
 
-    # Remove dangling symlinks and build leftovers.
     find -L "${builddir}" -type l -delete
     find "${builddir}" -type f -name '*.o' -delete
 
-    # options=('!strip') is set for the kernel package's sake, so the host
-    # binaries in scripts/ and tools/ are stripped explicitly here.
+    # !strip is for the kernel package; strip the host tools here.
     local file
     while read -rd '' file; do
         case "$(file -Sib "${file}")" in
@@ -409,10 +321,7 @@ _package-headers() {
 }
 
 # ---- split-package glue -----------------------------------------------------
-# makepkg dispatches to package_<pkgname>() by name, and pkgname is not known
-# until version.env is read -- so the builders above are defined under fixed
-# names and bound to the real ones here. ${_p#$pkgbase} is the suffix: empty for
-# the kernel package, "-headers" for the other.
+# package_<pkgname>() names are only known once version.env is read, so bind them here.
 for _p in "${pkgname[@]}"; do
     eval "package_${_p}() {
         $(declare -f "_package${_p#$pkgbase}")

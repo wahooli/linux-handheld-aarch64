@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Date: Fri, 12 Sep 2026 02:40:00 +0300
 Subject: [PATCH 94/94] local: drm/msm/a6xx: reload the zap shader after
  hibernate
@@ -90,7 +90,7 @@ requested value by construction, while the silicon was reset underneath it.
 See 0090 (clk rate cache), 0086 (OPP cache), 0093 (RSC sequencer), 0068
 (GMU_STATUS_PDC_SLEEP), 0069 (SMMU).
 
-Signed-off-by: Waltteri Hooli <wahooli@localhost>
+Signed-off-by: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 ---
 --- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
 +++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c

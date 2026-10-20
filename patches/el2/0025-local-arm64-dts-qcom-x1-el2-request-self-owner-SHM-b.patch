@@ -1,5 +1,5 @@
 From 73d9f9e9465626e8339d616c88f0fab3f81fafc9 Mon Sep 17 00:00:00 2001
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Date: Fri, 14 Aug 2026 15:36:42 +0300
 Subject: [PATCH 25/28] local: arm64: dts: qcom: x1-el2: request self-owner SHM
  bridge VMID for scm

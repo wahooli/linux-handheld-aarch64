@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Date: Wed, 10 Sep 2026 22:00:00 +0300
 Subject: [PATCH 81/81] local: mailbox: qcom-ipcc: re-arm receive signals after
  hibernation
@@ -45,7 +45,7 @@ request or probe time, lost to the reboot, and never replayed because the
 driver's software state came back from the hibernation image believing it was
 still there.
 
-Signed-off-by: Waltteri Hooli <wahooli@localhost>
+Signed-off-by: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 ---
  drivers/mailbox/qcom-ipcc.c | 50 ++++++++++++++++++++
  1 file changed, 50 insertions(+)

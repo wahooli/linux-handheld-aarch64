@@ -1,3 +1,4 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] local: wifi: ath12k: split 6 GHz discovery scans on WCN7850
 
 A trace on the Yoga Slim 7x with scan-priority fix 0232 shows a successful

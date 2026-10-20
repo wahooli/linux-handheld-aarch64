@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Date: Sat, 6 Sep 2026 16:10:00 +0300
 Subject: [PATCH] drm/msm: Set FBINFO_VIRTFB on the fbdev framebuffer
 
@@ -15,11 +15,13 @@ The framebuffer is in virtual address space; the flag was simply never set.
 Every other driver in this shape sets it -- drm_fbdev_dma, drm_fbdev_shmem,
 omapdrm, exynos and tegra all do.
 
-Signed-off-by: Waltteri Hooli <wahooli@localhost>
+Signed-off-by: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 ---
+diff --git a/drivers/gpu/drm/msm/msm_fbdev.c b/drivers/gpu/drm/msm/msm_fbdev.c
+index dd6d6c507..3bf5fa459 100644
 --- a/drivers/gpu/drm/msm/msm_fbdev.c
 +++ b/drivers/gpu/drm/msm/msm_fbdev.c
-@@ -144,6 +144,11 @@
+@@ -168,6 +168,11 @@ int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
  	fbi->fix.smem_start = paddr;
  	fbi->fix.smem_len = bo->size;
  
@@ -29,5 +31,5 @@ Signed-off-by: Waltteri Hooli <wahooli@localhost>
 +	fbi->flags |= FBINFO_VIRTFB;
 +
  	DBG("par=%p, %dx%d", fbi->par, fbi->var.xres, fbi->var.yres);
- 	DBG("allocated %dx%d fb", fb->width, fb->height);
+ 	DBG("allocated %dx%d fb", buffer->fb->width, buffer->fb->height);
  

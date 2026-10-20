@@ -1,0 +1,50 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] local: drm/msm: serialize devcoredump reads
+
+adreno_show_object() encodes a captured buffer to ascii85 on the first
+read of a devcoredump, frees the raw copy and flags it encoded. The read
+callback runs show() without any lock, so two processes reading the same
+devcoredump at once both see the buffer unencoded, both encode it and both
+free it:
+
+  WARNING: mm/slub.c:6608 at free_large_kmalloc+0xb0/0xf8, CPU#2: cat/5264
+   kvfree+0x44/0x60
+   adreno_show_object+0x1f0/0x2a0 [msm]
+   adreno_show+0x2b8/0x450 [msm]
+   a6xx_show+0x6c/0x1380 [msm]
+   msm_gpu_devcoredump_read+0x128/0x1e0 [msm]
+  page dumped because: Not a kmalloc allocation
+
+followed by a SLUB freelist BUG that killed both readers. It happened when
+a udev-started saver and a second reader opened the same GPU page-fault
+devcoredump in the same second.
+
+Hold a mutex across the whole read. The debugfs gpu file captures its own
+state, so it does not share buffers with a devcoredump.
+
+diff --git a/drivers/gpu/drm/msm/msm_gpu.c b/drivers/gpu/drm/msm/msm_gpu.c
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -176,6 +176,13 @@
+ }
+ 
+ #ifdef CONFIG_DEV_COREDUMP
++/*
++ * adreno_show_object() ascii85-encodes each captured buffer in place on the
++ * first read and frees the raw copy, so two readers of the same state must
++ * not run show() at the same time.
++ */
++static DEFINE_MUTEX(msm_gpu_devcoredump_read_lock);
++
+ static ssize_t msm_gpu_devcoredump_read(char *buffer, loff_t offset,
+ 		size_t count, void *data, size_t datalen)
+ {
+@@ -184,6 +191,8 @@
+ 	struct drm_printer p;
+ 	struct msm_gpu_state *state;
+ 
++	guard(mutex)(&msm_gpu_devcoredump_read_lock);
++
+ 	state = msm_gpu_crashstate_get(gpu);
+ 	if (!state)
+ 		return 0;

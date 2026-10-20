@@ -1,15 +1,7 @@
 #!/usr/bin/env bash
 #
-# Check that a published repo is actually consumable, from the outside.
-#
-#   REPO_URL=https://repo.wahoo.li scripts/verify-repo.sh
-#
-# Run this after the first publish. It does what a device does -- fetch the
-# database, fetch the key, verify a signature -- so it catches what a successful
-# upload cannot: a bucket that is not public, a domain that resolves but is not
-# bound, a database that shipped unsigned, cache headers pinning a stale index.
-#
-# Needs only curl and gpg. Safe to run from anywhere, including the device.
+# Check a published repo the way a device consumes it. Needs only curl and gpg; safe on the device.
+#   REPO_URL=https://<repo-url> scripts/verify-repo.sh
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-}"
@@ -29,17 +21,14 @@ W="$(mktemp -d)"; trap 'rm -rf "${W}"' EXIT
 
 echo "==> ${REPO_URL}"
 
-# 1. By the name pacman asks for. repo-add leaves this as a symlink locally, so a
-#    publish that uploaded the link rather than its target 404s here while
-#    <repo>.db.tar.gz is fine.
+# 1. By the name pacman asks for: an uploaded symlink 404s here while .db.tar.gz is fine.
 if curl -fsL --max-time 60 -o "${W}/db" "${REPO_URL}/${ARCH_DIR}/${REPO_NAME}.db"; then
     ok "${REPO_NAME}.db  ($(stat -c%s "${W}/db") bytes)"
 else
     bad "${REPO_NAME}.db is not reachable -- bucket not public, or domain not bound to it?"
 fi
 
-# 2. A missing .db.sig is the silent-unsigned-database failure: a client on
-#    DatabaseOptional accepts it and never tells you.
+# 2. A missing .db.sig is a silently unsigned database to DatabaseOptional clients.
 if curl -fsL --max-time 60 -o "${W}/db.sig" "${REPO_URL}/${ARCH_DIR}/${REPO_NAME}.db.sig"; then
     ok "${REPO_NAME}.db.sig present"
 else
@@ -65,8 +54,7 @@ else
     bad "${REPO_NAME}.gpg missing at the bucket root -- devices cannot bootstrap trust"
 fi
 
-# 4. Getting these backwards leaves an edge-cached database pointing at packages
-#    retention has already pruned, and it self-heals only when the cache expires.
+# 4. An immutable database leaves the edge serving an index that points at pruned packages.
 hdr="$(curl -fsI --max-time 60 "${REPO_URL}/${ARCH_DIR}/${REPO_NAME}.db" 2>/dev/null || true)"
 cc="$(grep -i '^cache-control:' <<< "${hdr}" | tr -d '\r' | cut -d' ' -f2- || true)"
 case "${cc}" in
@@ -75,15 +63,13 @@ case "${cc}" in
     *)                              ok  "database Cache-Control: ${cc}" ;;
 esac
 
-# 5. Pull one package name out of the database and check that it and its
-#    detached signature are both fetchable.
+# 5. A package the database names, and its .sig, must be fetchable.
 if [ -f "${W}/db" ] && command -v bsdtar >/dev/null; then
     mkdir -p "${W}/x"
     bsdtar -xf "${W}/db" -C "${W}/x" 2>/dev/null || true
     pkgfile="$(grep -rhA1 '^%FILENAME%$' "${W}/x" 2>/dev/null | grep -m1 '\.pkg\.tar\.zst$' || true)"
     if [ -n "${pkgfile}" ]; then
         ok "database indexes ${pkgfile}"
-        # HEAD only: no reason to pull 160 MB to prove the object exists.
         if curl -fsI --max-time 60 -o /dev/null "${REPO_URL}/${ARCH_DIR}/${pkgfile}"; then
             ok "package object reachable"
         else

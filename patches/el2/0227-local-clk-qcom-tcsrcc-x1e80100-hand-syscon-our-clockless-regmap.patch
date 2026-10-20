@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] local: clk: qcom: tcsrcc-x1e80100: hand syscon our clockless regmap
 
 The TCSR node is a clock provider and a syscon at once. pcie6a_phy's

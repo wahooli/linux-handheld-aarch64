@@ -1,0 +1,57 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] local: clk: qcom: gcc-x1e80100: keep the display AXI clock through the unused sweep
+
+The intermittent blue screen on the Yoga Slim 7x is the DMA0 display pipe
+never fetching a pixel after msm's first modeset. The interface underruns five
+lines into active video, the MDP answers with a hardware-initiated CTL reset,
+and that reset never completes. Measured live on a blue boot (2026-10-05):
+
+  - the SMMU context for the display is clean: translating, no fault, no stall;
+  - forcing the reset through with CTL_SW_RESET_OVERRIDE works, and re-sending
+    the lost flush is consumed at the next vsync, yet DMA0's fetch counters
+    stay at 0 and the underrun and reset come straight back;
+  - DMA0 is VBIF client 1, and its idle bit in VBIF_XIN_HALT_CTRL1 is clear in
+    every failing capture, even after 30 minutes without a single fetch;
+  - asked to halt, the idle VIG0 client acks in 1 us, DMA0's client never acks
+    in 200 ms. A client cannot halt while one of its reads is outstanding.
+
+So DMA0 has a memory read outstanding that will never retire. Nothing in the
+MDSS clears it: not the CTL reset, not the MDSS core reset at probe. Only a
+power cycle does.
+
+The only point in boot where Linux cuts the display's memory path under a live
+transfer is clk_disable_unused(), at 2.0 s. GCC is built in, so
+gcc_disp_hf_axi_clk exists then, has no consumer yet (msm loads at ~4.3 s), and
+the firmware's boot display is actively fetching through it. Gating it strands
+whatever read is in flight. Then msm_mdss_reset() asserts the MDSS core reset
+with the clock still off, and the port on the far side of the AXI interface
+is left holding a transaction the reset master no longer knows about. Whether
+a read is in flight at that instant is down to timing, which fits a failure
+that hits roughly one boot in ten.
+
+Glymur, the next generation of this SoC, marks the same clock CLK_IS_CRITICAL.
+Take the narrower fix here: CLK_IGNORE_UNUSED keeps it running only until msm
+owns it, after which runtime PM gates it normally while the display is idle.
+
+Expected: no blue boots over enough warm reboots to matter (baseline 4 in 39),
+and the firmware console should no longer freeze or blank at ~2 s before msm
+takes over.
+
+--- a/drivers/clk/qcom/gcc-x1e80100.c
++++ b/drivers/clk/qcom/gcc-x1e80100.c
+@@ -2999,6 +2999,15 @@
+ 		.hw.init = &(const struct clk_init_data) {
+ 			.name = "gcc_disp_hf_axi_clk",
+ 			.ops = &clk_branch2_ops,
++			/*
++			 * The firmware's boot display is still fetching through
++			 * this clock when clk_disable_unused() runs, seconds
++			 * before msm loads. Gating it under a live scanout can
++			 * strand an AXI read that the MDSS reset at msm probe
++			 * cannot reach, and that pipe never fetches again.
++			 * msm takes ownership of the clock once it probes.
++			 */
++			.flags = CLK_IGNORE_UNUSED,
+ 		},
+ 	},
+ };

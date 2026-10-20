@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
 #
-# Install a pinned rclone into /usr/local/bin. Used by both CI jobs that talk to
-# R2 -- the build job needs it for next-pkgrel.sh's listing, the publish job for
-# the upload -- so the version and its checksum live in one place.
-#
-# Not from apt: Ubuntu 24.04 ships 1.60.1, from before much of the R2
-# compatibility work. Not piped from install.sh either -- these jobs run with the
-# signing key and R2 credentials in scope, so the tarball is checksum-verified.
+# Pinned, checksum-verified rclone for the CI jobs that talk to R2. Not apt (1.60.1 predates R2
+# fixes), not a piped install.sh (these jobs hold the signing key and R2 credentials).
 set -euo pipefail
 
 RCLONE_VER="${RCLONE_VER:-v1.75.0}"

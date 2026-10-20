@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
 #
-# Runs inside the builder container, as root, and drops to the build user. Not
-# meant to be run on a host -- use scripts/build.sh.
-#
-# The uid dance is why this file exists. The ALARM rootfs already has `alarm` at
-# uid 1000, so `build` lands on 1001; host uids vary, and makepkg writes into the
-# bind-mounted repo, so a mismatch is "You do not have write permission for the
-# directory $BUILDDIR" and nothing else.
+# Runs inside the builder as root: maps the build user onto the host uid/gid, then drops to it.
+# ALARM's `alarm` holds uid 1000, and a mismatch only shows as a makepkg write-permission error.
 set -euo pipefail
 
 HOST_UID="${HOST_UID:?}"
@@ -16,8 +11,7 @@ if [ "$(id -u build)" != "${HOST_UID}" ] || [ "$(id -g build)" != "${HOST_GID}" 
     # Free the target ids first: alarm:1000 collides on a uid-1000 host.
     existing_u="$(getent passwd "${HOST_UID}" | cut -d: -f1 || true)"
     existing_g="$(getent group  "${HOST_GID}" | cut -d: -f1 || true)"
-    # ifs rather than `A && B || true`, where the `|| true` would also swallow a
-    # false condition. Only the delete is allowed to fail.
+    # ifs, not `A && B || true`, which would also swallow a false condition.
     if [ -n "${existing_u}" ] && [ "${existing_u}" != build ]; then
         userdel -r "${existing_u}" 2>/dev/null || true
     fi
@@ -29,17 +23,8 @@ if [ "$(id -u build)" != "${HOST_UID}" ] || [ "$(id -g build)" != "${HOST_GID}" 
     usermod  -u "${HOST_UID}" -g "${HOST_GID}" build
     chown -R build:build /home/build
 fi
-# The image's mirrorlist points at ALARM's geo-redirector, which can hand out a
-# mirror trickling at KB/s -- and pacman never abandons a connection that still
-# moves, so the -Syu below sits there for half an hour. Individual mirrors are
-# no better as a static pin: fl.us swung 500 KB/s -> 16 KB/s within an hour, and
-# this also runs on CI machines whose location varies. So race the candidates at
-# startup: each downloads core.db (~250 KB) in parallel, bounded by -m, and the
-# fastest goes first in the mirrorlist. -L because several answer 30x; a mirror
-# that times out mid-transfer still reports its partial speed, a dead one scores
-# 0 and loses. The redirector stays as fallback, and is the pick when every
-# probe fails. ParallelDownloads stops one throttled connection from
-# serializing the rest.
+# Race the mirrors: the geo-redirector can hand out a KB/s mirror pacman never abandons, and static
+# pins swing too. The fastest core.db download goes first; the redirector stays as fallback.
 mirrors=(
     de3.mirror.archlinuxarm.org
     dk.mirror.archlinuxarm.org
@@ -72,24 +57,15 @@ echo "==> mirror: ${best:-none reachable, geo-redirector only}"
 grep -q '^ParallelDownloads' /etc/pacman.conf \
     || sed -i '/^\[options\]/a ParallelDownloads = 5' /etc/pacman.conf
 
-# Sync before makepkg --syncdeps goes looking for makedepends: the builder image
-# is cached and rebuilt weekly, so by the end of that week its database names
-# versions the mirror has already replaced and every fetch 404s. -Syu rather than
-# -Sy -- a partial sync installs new packages against old dependencies.
+# The cached image's db goes stale within its week; -Syu, not -Sy (a partial upgrade).
 pacman -Syu --noconfirm >/dev/null 2>&1 || pacman -Syu --noconfirm
 
 chown build:build /ccache 2>/dev/null || true
-# Split so only the chown may fail (it legitimately does when the directory is
-# already owned correctly); as one `mkdir && chown || true` an unwritable /work
-# sailed past here and surfaced as an opaque makepkg error.
+# Separate, so only the chown may fail; an unwritable /work must fail here.
 mkdir -p /work/out
 chown build:build /work/out 2>/dev/null || true
 
-# Passed through only when actually set, because CCACHE_NOHASHDIR is
-# presence-is-truth: ccache reads it as "disable hash_dir" even when its value is
-# the empty string, so a `${VAR:-}` default would silently turn it on for a
-# caller that never asked. (There is no positive CCACHE_HASHDIR=false to use
-# instead -- ccache rejects that value outright.)
+# Only when set: ccache treats CCACHE_NOHASHDIR as true even when it is empty.
 ccache_env=(CCACHE_DIR="${CCACHE_DIR}" CCACHE_MAXSIZE="${CCACHE_MAXSIZE}")
 if [ -n "${CCACHE_NOHASHDIR:-}" ]; then
     ccache_env+=(CCACHE_NOHASHDIR="${CCACHE_NOHASHDIR}")

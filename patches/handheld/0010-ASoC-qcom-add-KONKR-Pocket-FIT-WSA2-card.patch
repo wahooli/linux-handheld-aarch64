@@ -1,0 +1,54 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] ASoC: qcom: add KONKR Pocket FIT WSA2 sound card
+
+The KONKR Pocket FIT shares the Pocket S2 WSA2-only speaker wiring.
+Give it a board-specific compatible backed by the accepted channel mapping.
+
+[handheld: rebased onto 7.3, which carries the Pocket S2 WSA2 mapping as
+ ayaneo_ps2_priv_data; this card is the SM8650 match data plus that prepare hook.]
+diff --git a/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml b/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml
+index 1536fcd96..3896f092f 100644
+--- a/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml
++++ b/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml
+@@ -34,6 +34,7 @@ properties:
+           - const: qcom,sm8450-sndcard
+       - enum:
+           - ayaneo,pocket-s2-sndcard
++          - konkr,pocket-fit-sndcard
+           - fairphone,fp4-sndcard
+           - fairphone,fp5-sndcard
+           - qcom,apq8096-sndcard
+diff --git a/sound/soc/qcom/sc8280xp.c b/sound/soc/qcom/sc8280xp.c
+index 38ce41508..d33012c62 100644
+--- a/sound/soc/qcom/sc8280xp.c
++++ b/sound/soc/qcom/sc8280xp.c
+@@ -596,6 +596,21 @@ static const struct qcom_snd_soc_common sm8650_priv_data = {
+ 			 SND_SOC_DAIFMT_I2S,
+ };
+ 
++/* SM8650 card whose speakers sit on WSA2 only, like the Pocket S2. */
++static const struct qcom_snd_soc_common konkr_pocket_fit_priv_data = {
++	.driver_name = "sm8650",
++	.dapm_widgets = sc8280xp_dapm_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(sc8280xp_dapm_widgets),
++	.wcd_jack = true,
++	/* I2S Connected to HDMI */
++	.mi2s_mclk_enable = true,
++	.mi2s_bclk_enable = true,
++	.codec_dai_fmt = SND_SOC_DAIFMT_BC_FC |
++			 SND_SOC_DAIFMT_NB_NF |
++			 SND_SOC_DAIFMT_I2S,
++	.snd_prepare = ayaneo_ps2_snd_prepare,
++};
++
+ static const struct qcom_snd_soc_common sm8750_priv_data = {
+ 	.driver_name = "sm8750",
+ 	.dapm_widgets = sc8280xp_dapm_widgets,
+@@ -605,6 +620,7 @@ static const struct qcom_snd_soc_common sm8750_priv_data = {
+ 
+ static const struct of_device_id snd_sc8280xp_dt_match[] = {
+ 	{ .compatible = "ayaneo,pocket-s2-sndcard", .data = &ayaneo_ps2_priv_data },
++	{ .compatible = "konkr,pocket-fit-sndcard", .data = &konkr_pocket_fit_priv_data },
+ 	{ .compatible = "qcom,eliza-sndcard", .data = &eliza_priv_data },
+ 	{ .compatible = "qcom,hawi-sndcard", .data = &hawi_priv_data },
+ 	{ .compatible = "qcom,kaanapali-sndcard", .data = &kaanapali_priv_data },

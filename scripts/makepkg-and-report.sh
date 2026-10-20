@@ -1,27 +1,20 @@
 #!/usr/bin/env bash
 #
-# The unprivileged half of the container build. Runs as `build` inside the
-# builder image; see scripts/build-in-container.sh.
+# Unprivileged half of the container build; runs as `build`, see scripts/build-in-container.sh.
 set -euo pipefail
 cd /work
 
-# --nobuild stops after prepare(): everything resolved, nothing compiled. The
-# reports below still work, because they read the prepared src/ tree.
+# --nobuild stops after prepare(); the reports below read the prepared src/ tree.
 args=(--noconfirm --syncdeps --cleanbuild --force)
 [ -n "${NOBUILD:-}" ] && args+=(--nobuild)
 
-# Zeroed first, because ccache's counters live in the cache directory and
-# accumulate across every build that used it -- a cumulative hit rate cannot show
-# that THIS run missed everything.
+# Zeroed: counters accumulate in the cache dir, so a cumulative rate hides a fully missed run.
 command -v ccache >/dev/null && ccache -z >/dev/null 2>&1 || true
 
-# tee'd so the report below can quote the build. pipefail is on, so makepkg's
-# exit status still fails this script.
+# pipefail keeps makepkg's exit status through tee.
 makepkg "${args[@]}" 2>&1 | tee /work/.makepkg.log
 
-# The one number that says whether this was an incremental build. A near-0% hit
-# rate on a run that restored a warm cache means the keys changed -- a new base
-# version, or a toolchain bump from the pacman -Syu above.
+# Near-0% hits on a warm cache: a new base version or a toolchain bump changed the keys.
 if command -v ccache >/dev/null; then
     echo "==> ccache"
     ccache -s | sed 's/^/    /'
@@ -29,8 +22,6 @@ fi
 
 {
     # ---- patches already in the base ------------------------------------
-    # prepare() reverse-dry-runs anything that will not apply and reports
-    # "already in the base" instead of failing. Lifted into the job summary.
     if grep -q 'already in the base' /work/.makepkg.log; then
         echo
         echo "### Patches already in the base (skipped, not applied)"
@@ -48,9 +39,7 @@ fi
     fi
 
     # ---- ROCKNIX staged dry-run ------------------------------------------
-    # Against the fully prepared tree -- after the series and after the vendored
-    # device trees are copied in, so DTS-add patches correctly report "no".
-    # Never applied; see docs/PATCHES.md.
+    # After the series and the vendored trees, so DTS-adding patches correctly report no.
     shopt -s nullglob
     staged=(patches/rocknix-staged/*.patch)
     if [ ${#staged[@]} -gt 0 ]; then

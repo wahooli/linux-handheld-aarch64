@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] pinctrl: qcom: lpass-lpi: hand the clocks back before the provider goes
 
 Cycling the audio DSP leaves six messages behind, every time:

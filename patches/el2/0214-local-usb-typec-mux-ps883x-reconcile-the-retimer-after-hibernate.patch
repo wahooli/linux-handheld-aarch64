@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] usb: typec: mux: ps883x: reconcile the retimer after a hibernation restore
 
 One of the three PS8830 retimers comes back powered and fully configured after

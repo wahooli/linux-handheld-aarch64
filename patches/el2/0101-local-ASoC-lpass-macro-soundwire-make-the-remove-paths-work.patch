@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] ASoC: lpass-macro, soundwire: qcom: make the remove paths work
 
 Nothing unbinds these drivers on a Qualcomm SoC, so their remove paths have
@@ -45,127 +45,16 @@ va_macro's equivalents -- are still released unconditionally.
 Applies on top of the patch that links the macros to their clock provider;
 without it none of these paths are reachable.
 
+Rebased onto cachyos-7.3.0-2, which converted all four macros to pm_clk,
+devm_pm_runtime_enable() and devm_clk_hw_register(): the macro half is
+upstream's now, only the soundwire hclk fix is left.
+
 ---
---- a/sound/soc/codecs/lpass-va-macro.c
-+++ b/sound/soc/codecs/lpass-va-macro.c
-@@ -1707,10 +1707,20 @@
- {
- 	struct va_macro *va = dev_get_drvdata(&pdev->dev);
- 
--	if (va->has_npl_clk)
--		clk_disable_unprepare(va->npl);
-+	/*
-+	 * The driver core runtime-suspends a device before calling .remove(),
-+	 * so the clocks the runtime suspend already dropped must not be
-+	 * dropped a second time here. Only dcodec and macro are held
-+	 * from probe and untouched by runtime PM.
-+	 */
-+	pm_runtime_disable(&pdev->dev);
-+	if (!pm_runtime_status_suspended(&pdev->dev)) {
-+		if (va->has_npl_clk)
-+			clk_disable_unprepare(va->npl);
-+		clk_disable_unprepare(va->mclk);
-+	}
-+	pm_runtime_set_suspended(&pdev->dev);
- 
--	clk_disable_unprepare(va->mclk);
- 	clk_disable_unprepare(va->dcodec);
- 	clk_disable_unprepare(va->macro);
- 
---- a/sound/soc/codecs/lpass-rx-macro.c
-+++ b/sound/soc/codecs/lpass-rx-macro.c
-@@ -3939,9 +3939,20 @@
- {
- 	struct rx_macro *rx = dev_get_drvdata(&pdev->dev);
- 
--	clk_disable_unprepare(rx->mclk);
--	clk_disable_unprepare(rx->npl);
--	clk_disable_unprepare(rx->fsgen);
-+	/*
-+	 * The driver core runtime-suspends a device before calling .remove(),
-+	 * so the clocks the runtime suspend already dropped must not be
-+	 * dropped a second time here. Only macro and dcodec are held
-+	 * from probe and untouched by runtime PM.
-+	 */
-+	pm_runtime_disable(&pdev->dev);
-+	if (!pm_runtime_status_suspended(&pdev->dev)) {
-+		clk_disable_unprepare(rx->mclk);
-+		clk_disable_unprepare(rx->npl);
-+		clk_disable_unprepare(rx->fsgen);
-+	}
-+	pm_runtime_set_suspended(&pdev->dev);
-+
- 	clk_disable_unprepare(rx->macro);
- 	clk_disable_unprepare(rx->dcodec);
- }
---- a/sound/soc/codecs/lpass-wsa-macro.c
-+++ b/sound/soc/codecs/lpass-wsa-macro.c
-@@ -2656,7 +2656,7 @@
- 	init.num_parents = 1;
- 	wsa->hw.init = &init;
- 	hw = &wsa->hw;
--	ret = clk_hw_register(wsa->dev, hw);
-+	ret = devm_clk_hw_register(wsa->dev, hw);
- 	if (ret)
- 		return ret;
- 
-@@ -2846,11 +2846,22 @@
- {
- 	struct wsa_macro *wsa = dev_get_drvdata(&pdev->dev);
- 
-+	/*
-+	 * The driver core runtime-suspends a device before calling .remove(),
-+	 * so the clocks the runtime suspend already dropped must not be
-+	 * dropped a second time here. Only macro and dcodec are held
-+	 * from probe and untouched by runtime PM.
-+	 */
-+	pm_runtime_disable(&pdev->dev);
-+	if (!pm_runtime_status_suspended(&pdev->dev)) {
-+		clk_disable_unprepare(wsa->mclk);
-+		clk_disable_unprepare(wsa->npl);
-+		clk_disable_unprepare(wsa->fsgen);
-+	}
-+	pm_runtime_set_suspended(&pdev->dev);
-+
- 	clk_disable_unprepare(wsa->macro);
- 	clk_disable_unprepare(wsa->dcodec);
--	clk_disable_unprepare(wsa->mclk);
--	clk_disable_unprepare(wsa->npl);
--	clk_disable_unprepare(wsa->fsgen);
- }
- 
- static int wsa_macro_runtime_suspend(struct device *dev)
---- a/sound/soc/codecs/lpass-tx-macro.c
-+++ b/sound/soc/codecs/lpass-tx-macro.c
-@@ -2394,11 +2394,22 @@
- {
- 	struct tx_macro *tx = dev_get_drvdata(&pdev->dev);
- 
-+	/*
-+	 * The driver core runtime-suspends a device before calling .remove(),
-+	 * so the clocks the runtime suspend already dropped must not be
-+	 * dropped a second time here. Only macro and dcodec are held
-+	 * from probe and untouched by runtime PM.
-+	 */
-+	pm_runtime_disable(&pdev->dev);
-+	if (!pm_runtime_status_suspended(&pdev->dev)) {
-+		clk_disable_unprepare(tx->mclk);
-+		clk_disable_unprepare(tx->npl);
-+		clk_disable_unprepare(tx->fsgen);
-+	}
-+	pm_runtime_set_suspended(&pdev->dev);
-+
- 	clk_disable_unprepare(tx->macro);
- 	clk_disable_unprepare(tx->dcodec);
--	clk_disable_unprepare(tx->mclk);
--	clk_disable_unprepare(tx->npl);
--	clk_disable_unprepare(tx->fsgen);
- 
- 	lpass_macro_pds_exit(tx->pds);
- }
+diff --git a/drivers/soundwire/qcom.c b/drivers/soundwire/qcom.c
+index 55678a30c..b69c67520 100644
 --- a/drivers/soundwire/qcom.c
 +++ b/drivers/soundwire/qcom.c
-@@ -1698,7 +1698,15 @@
+@@ -1716,7 +1716,15 @@ static void qcom_swrm_remove(struct platform_device *pdev)
  	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(&pdev->dev);
  
  	sdw_bus_master_delete(&ctrl->bus);

@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Date: Wed, 10 Sep 2026 15:30:00 +0300
 Subject: [PATCH 75/75] local: drm/msm/a6xx: do not claim the RSC slept after a
  failed power-off
@@ -42,7 +42,7 @@ the other way -- the bring-up that follows the failed power-off reports a
 Depends on 0068 (both touch a6xx_gmu.c; 0068 clears the same bit on a cold
 boot).
 
-Signed-off-by: Waltteri Hooli <wahooli@localhost>
+Signed-off-by: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 ---
  drivers/gpu/drm/msm/adreno/a6xx_gmu.c | 13 ++++++++++++-
  1 file changed, 12 insertions(+), 1 deletion(-)

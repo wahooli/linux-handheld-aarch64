@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Neil Armstrong <neil.armstrong@linaro.org>
+Date: Fri, 29 May 2026 21:23:08 +0200
+Subject: [PATCH v5 1/2] dt-bindings: leds: backlight: document the SY7758 6-channel High Efficiency LED Driver
+
+Document the Silergy SY7758 6-channel High Efficiency LED Driver
+used for backlight brightness control.
+
+Reviewed-by: Krzysztof Kozlowski <krzysztof.kozlowski@oss.qualcomm.com>
+Signed-off-by: Neil Armstrong <neil.armstrong@linaro.org>
+Reviewed-by: Daniel Thompson (RISCstar) <danielt@kernel.org>
+
+[handheld: the binding is upstream since 7.3; what is left is armada's change making
+ enable-gpios optional, matching the driver.]
+---
+ Documentation/devicetree/bindings/leds/backlight/silergy,sy7758.yaml | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/leds/backlight/silergy,sy7758.yaml b/Documentation/devicetree/bindings/leds/backlight/silergy,sy7758.yaml
+index 64af6b346..bf1d9c2b8 100644
+--- a/Documentation/devicetree/bindings/leds/backlight/silergy,sy7758.yaml
++++ b/Documentation/devicetree/bindings/leds/backlight/silergy,sy7758.yaml
+@@ -31,7 +31,6 @@ properties:
+ required:
+   - compatible
+   - reg
+-  - enable-gpios
+ 
+ unevaluatedProperties: false
+ 

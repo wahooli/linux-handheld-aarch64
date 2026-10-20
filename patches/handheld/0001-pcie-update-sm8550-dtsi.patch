@@ -1,0 +1,46 @@
+
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8550.dtsi b/arch/arm64/boot/dts/qcom/sm8550.dtsi
+index f1042cfe6..ff457df54 100644
+--- a/arch/arm64/boot/dts/qcom/sm8550.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8550.dtsi
+@@ -2398,9 +2398,6 @@ &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>,
+ 
+ 			power-domains = <&gcc PCIE_0_GDSC>;
+ 
+-			phys = <&pcie0_phy>;
+-			phy-names = "pciephy";
+-
+ 			operating-points-v2 = <&pcie0_opp_table>;
+ 
+ 			status = "disabled";
+@@ -2465,6 +2462,8 @@ pcie0_port0: pcie@0 {
+ 				#address-cells = <3>;
+ 				#size-cells = <2>;
+ 				ranges;
++
++				phys = <&pcie0_phy>;
+ 			};
+ 		};
+ 
+@@ -2584,9 +2583,6 @@ &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>,
+ 
+ 			power-domains = <&gcc PCIE_1_GDSC>;
+ 
+-			phys = <&pcie1_phy>;
+-			phy-names = "pciephy";
+-
+ 			operating-points-v2 = <&pcie1_opp_table>;
+ 
+ 			status = "disabled";
+@@ -2667,6 +2663,8 @@ pcie1_port0: pcie@0 {
+ 				#address-cells = <3>;
+ 				#size-cells = <2>;
+ 				ranges;
++
++				phys = <&pcie1_phy>;
+ 			};
+ 		};
+ 
+-- 
+2.51.0

@@ -10,16 +10,16 @@ the proxy votes, since we expect that handover has already happened.
 
 Signed-off-by: Stephan Gerhold <stephan.gerhold@linaro.org>
 ---
- drivers/remoteproc/qcom_q6v5.c | 44 ++++++++++++++++++++++++++++------
+ drivers/remoteproc/qcom_q6v5.c | 44 ++++++++++++++++++++++++++++++++------
  drivers/remoteproc/qcom_q6v5.h |  1 +
  2 files changed, 38 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/remoteproc/qcom_q6v5.c b/drivers/remoteproc/qcom_q6v5.c
-index d4d978cca..94c75d9cc 100644
+index e7407d333..800c351bf 100644
 --- a/drivers/remoteproc/qcom_q6v5.c
 +++ b/drivers/remoteproc/qcom_q6v5.c
-@@ -36,6 +36,25 @@ static int q6v5_load_state_toggle(struct qcom_q6v5 *q6v5, bool enable)
- 	return ret;
+@@ -70,6 +70,25 @@ static void q6v5_handover_irq_disable(struct qcom_q6v5 *q6v5, bool sync)
+ 		synchronize_irq(q6v5->handover_irq);
  }
  
 +static int q6v5_init(struct qcom_q6v5 *q6v5, bool handover_issued)
@@ -37,14 +37,14 @@ index d4d978cca..94c75d9cc 100644
 +	q6v5->running = true;
 +	q6v5->handover_issued = handover_issued;
 +
-+	enable_irq(q6v5->handover_irq);
++	q6v5_handover_irq_enable(q6v5);
 +	return 0;
 +}
 +
  /**
   * qcom_q6v5_prepare() - reinitialize the qcom_q6v5 context before start
   * @q6v5:	reference to qcom_q6v5 context to be reinitialized
-@@ -52,23 +71,34 @@ int qcom_q6v5_prepare(struct qcom_q6v5 *q6v5)
+@@ -86,23 +105,34 @@ int qcom_q6v5_prepare(struct qcom_q6v5 *q6v5)
  		return ret;
  	}
  
@@ -73,7 +73,7 @@ index d4d978cca..94c75d9cc 100644
 +{
 +	int ret;
  
--	enable_irq(q6v5->handover_irq);
+-	q6v5_handover_irq_enable(q6v5);
 +	ret = q6v5_init(q6v5, true);
 +	if (ret)
 +		return ret;
@@ -87,10 +87,10 @@ index d4d978cca..94c75d9cc 100644
  /**
   * qcom_q6v5_unprepare() - unprepare the qcom_q6v5 context after stop
 diff --git a/drivers/remoteproc/qcom_q6v5.h b/drivers/remoteproc/qcom_q6v5.h
-index 59970adb0..f034bb628 100644
+index 61039b3be..ca6611743 100644
 --- a/drivers/remoteproc/qcom_q6v5.h
 +++ b/drivers/remoteproc/qcom_q6v5.h
-@@ -50,6 +50,7 @@ void qcom_q6v5_deinit(struct qcom_q6v5 *q6v5);
+@@ -54,6 +54,7 @@ void qcom_q6v5_deinit(struct qcom_q6v5 *q6v5);
  void qcom_q6v5_read_smp2p_state(struct qcom_q6v5 *q6v5);
  
  int qcom_q6v5_prepare(struct qcom_q6v5 *q6v5);

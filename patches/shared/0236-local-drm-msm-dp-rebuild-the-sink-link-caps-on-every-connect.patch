@@ -1,0 +1,63 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] local: drm/msm/dp: rebuild the sink's link caps on every connect
+
+msm_dp_panel_read_dpcd() fills msm_dp_panel->link_info in place and never
+clears it. The MAX_LINK_RATE read and the DT link-frequencies and LTTPR rate
+limits all sit under "if (!link_info->rate)", which is meant as "no eDP rate
+table". So from the second connect on, the previous sink's rate is kept and
+none of those limits apply, while the lane count is recomputed and clamped
+every time. Seen: a PS8830 advertising HBR2 x1 in its LTTPR caps got a link
+trained at HBR3 x1. The enhanced-framing capability bit likewise only ever
+accumulates.
+
+msm_dp_display_lttpr_init() has the same problem. When the LTTPR caps read
+fails it returns a repeater count of 0, but lttpr_common_caps keeps the
+previous sink's values, and msm_dp_panel_read_dpcd() clamps rate and lanes to
+those caps whatever the count.
+
+Clear both before they are refilled. Log one line per connect with the sink's
+caps, the LTTPR count and caps, and the resulting link. The next time a USB-C
+retimer comes up advertising fewer lanes than its pin assignment carries, the
+journal will say when and what.
+
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -250,8 +250,11 @@
+ {
+ 	int rc, lttpr_count;
+ 
+-	if (drm_dp_read_lttpr_common_caps(dp->aux, dpcd, dp->link->lttpr_common_caps))
++	/* msm_dp_panel_read_dpcd() clamps to these caps whatever the count */
++	if (drm_dp_read_lttpr_common_caps(dp->aux, dpcd, dp->link->lttpr_common_caps)) {
++		memset(dp->link->lttpr_common_caps, 0, sizeof(dp->link->lttpr_common_caps));
+ 		return 0;
++	}
+ 
+ 	lttpr_count = drm_dp_lttpr_count(dp->link->lttpr_common_caps);
+ 	rc = drm_dp_lttpr_init(dp->aux, lttpr_count);
+--- a/drivers/gpu/drm/msm/dp/dp_panel.c
++++ b/drivers/gpu/drm/msm/dp/dp_panel.c
+@@ -103,6 +103,11 @@
+ 
+ 	msm_dp_panel->vsc_sdp_supported = drm_dp_vsc_sdp_supported(panel->aux, dpcd);
+ 	link_info = &msm_dp_panel->link_info;
++	/*
++	 * Rebuilt on every connect: a rate left over from the last sink skips
++	 * the MAX_LINK_RATE read and the DT/LTTPR rate limits below.
++	 */
++	memset(link_info, 0, sizeof(*link_info));
+ 	link_info->revision = dpcd[DP_DPCD_REV];
+ 	major = (link_info->revision >> 4) & 0x0f;
+ 	minor = link_info->revision & 0x0f;
+@@ -199,6 +204,11 @@
+ 	if (max_lttpr_lanes && max_lttpr_lanes < link_info->num_lanes)
+ 		link_info->num_lanes = max_lttpr_lanes;
+ 
++	dev_info(panel->dev, "sink %d kHz x%d, %d LTTPR (%d kHz x%d): link %u kHz x%u\n",
++		 drm_dp_max_link_rate(dpcd), drm_dp_max_lane_count(dpcd),
++		 link->lttpr_count, max_lttpr_rate, max_lttpr_lanes,
++		 link_info->rate, link_info->num_lanes);
++
+ 	drm_dbg_dp(panel->drm_dev, "version: %d.%d\n", major, minor);
+ 	drm_dbg_dp(panel->drm_dev, "link_rate=%d\n", link_info->rate);
+ 	drm_dbg_dp(panel->drm_dev, "link_rate_set=%d\n", link_info->rate_set);

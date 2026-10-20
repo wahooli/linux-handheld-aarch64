@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] local: usb: typec: mux: ps883x: gate the reference clock with the reset line
 
 The driver enables the retimer's XO reference clock in probe and only disables

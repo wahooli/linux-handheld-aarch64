@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2154  # pkgver/pkgrel/_* all come from version.env
 #
-# Tag a successful publish and cut the matching GitHub release.
-#
-# Runs only after scripts/publish-r2.sh succeeds: a tag with nothing published
-# behind it is a provenance record that looks authoritative and is not.
-#
-# Needs GH_TOKEN and a git checkout with push rights.
+# Tag a successful publish and cut the matching GitHub release. Needs GH_TOKEN and push rights.
+# Only after publish-r2.sh succeeds: an unpublished tag is false provenance and burns a pkgrel.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,25 +15,16 @@ source ./version.env
 [ "${_product}" = "${PRODUCT}" ] || {
     echo "!! version.env is for product '${_product}' but PRODUCT is '${PRODUCT}'" >&2; exit 1; }
 
-# The tag prefix is per product and must not be renamed: next-pkgrel.sh uses
-# these tags as the floor that stops a published pkgrel being handed out twice,
-# so a product whose prefix changes loses its history and can reuse a live
-# filename.
+# Never rename TAG_PREFIX: tags are next-pkgrel.sh's floor, so lost history can reuse a live filename.
 TAG="${TAG_PREFIX}${pkgver}-${pkgrel}"
+# Entries of a local series live in patches/<product>/ or patches/shared/; 'armada' is not a file.
 NCOMMITTED=0
-[ -d "patches/${PRODUCT}" ] \
-    && NCOMMITTED="$(find "patches/${PRODUCT}" -name '*.patch' | wc -l)"
+[ -f "${_series}" ] && NCOMMITTED="$(grep -cvE '^[[:space:]]*(#|$)' "${_series}")"
 
-# Only the inputs that actually contributed: naming an OGC ref on a build that
-# fetched no OGC patch would be a false provenance record.
+# Name OGC only if it contributed; anything else is false provenance.
 if [ "${_useogc}" = yes ]; then OGC_LINE="OGC           ${_ogcref}"; else OGC_LINE="OGC           not used"; fi
 
-# Checked before the tag exists: a phantom tag burns a pkgrel through
-# next-pkgrel.sh's floor and then blocks the re-run that could fix it.
-#
-# Only this product's files -- the publish job merges every product's artifacts
-# into one out/ so the pacman database is written once, and a bare
-# out/*.pkg.tar.zst would attach the other product's kernel to this release.
+# Checked before tagging: a phantom tag burns a pkgrel. Only this product's files: out/ holds every product's.
 mapfile -t ASSETS < <(ls "out/${_pkgbase}"-*.pkg.tar.zst "out/${_pkgbase}"-*.pkg.tar.zst.sig 2>/dev/null)
 [ ${#ASSETS[@]} -gt 0 ] || {
     echo "!! no out/${_pkgbase}-*.pkg.tar.zst -- nothing published for ${_product}, refusing to tag" >&2; exit 1; }
@@ -52,9 +39,7 @@ TAGGER_EMAIL="${GIT_AUTHOR_EMAIL:-41898282+github-actions[bot]@users.noreply.git
 git config user.name  "${TAGGER_NAME}"
 git config user.email "${TAGGER_EMAIL}"
 
-# The resolved refs, not whatever sources.env said at checkout time: armada is
-# tracked by moving subtree HEAD, so this is the only lasting answer to "which
-# armada commit is on the kernel my device is running?"
+# Resolved refs, not sources.env: the lasting answer to which inputs are on a device.
 MSG="$(cat <<MSG
 ${_pkgbase} ${pkgver}-${pkgrel}
 
@@ -68,18 +53,12 @@ ROCKNIX       ${_rocknixref}
 series        ${_series} (${_npatches} patches)
 config        ${_configdirs}
 dtbs          ${_dtbs}
-committed     ${NCOMMITTED} patch(es) in patches/${_product}/
+committed     ${NCOMMITTED} patch(es) in patches/${_product}/ + patches/shared/
 MSG
 )"
 
-# Created through the Git Data API rather than `git push origin "${TAG}"`:
-# GitHub diffs a pushed tag ref against the default branch, so tagging a commit
-# main has moved past reads as a workflow edit and is rejected for lacking the
-# `workflows` permission -- which GITHUB_TOKEN cannot be granted. The API creates
-# the identical annotated tag object against a commit that already exists
-# server-side, so `contents: write` is enough.
-#
-# The git path stays for local runs, where the pusher has a PAT or an SSH key.
+# Via the Git Data API: a pushed tag on a commit main has moved past reads as a workflow edit and
+# needs the workflows permission GITHUB_TOKEN cannot have. Local runs push with git.
 if command -v gh >/dev/null && [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
     command -v jq >/dev/null || { echo "!! jq is required to create the tag via the API" >&2; exit 1; }
     REPO="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
@@ -95,8 +74,7 @@ if command -v gh >/dev/null && [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
         | gh api "repos/${REPO}/git/tags" --input - --jq .sha)"
     gh api "repos/${REPO}/git/refs" \
         -f "ref=refs/tags/${TAG}" -f "sha=${TAGOBJ}" >/dev/null
-    # Bring the ref back rather than re-creating it locally, which would mint a
-    # second tag object with a different timestamp.
+    # Fetch the ref back; re-creating it locally would mint a second tag object.
     git fetch -q origin "refs/tags/${TAG}:refs/tags/${TAG}" || true
 else
     git tag -a "${TAG}" -F - <<< "${MSG}"
@@ -128,6 +106,6 @@ and as a fallback if the bucket is ever unreachable.
 | series | \`${_series}\` -- ${_npatches} patches |
 | config | \`${_configdirs}\` |
 | dtbs | \`${_dtbs}\` |
-| committed patches | ${NCOMMITTED} in \`patches/${_product}/\` |
+| committed patches | ${NCOMMITTED} in \`patches/${_product}/\` + \`patches/shared/\` |
 NOTES
 echo "==> released ${TAG}"

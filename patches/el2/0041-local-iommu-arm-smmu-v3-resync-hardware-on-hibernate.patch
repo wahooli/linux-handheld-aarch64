@@ -1,5 +1,5 @@
 From 6a2d9c4e8b13f7a05d2c1e9f4b8a3d6205c7e194 Mon Sep 17 00:00:00 2001
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Date: Tue, 8 Sep 2026 21:30:00 +0300
 Subject: [PATCH 41/41] local: iommu: arm-smmu-v3: resync hardware on
  hibernate restore

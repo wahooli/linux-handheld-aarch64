@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Neil Armstrong <neil.armstrong@linaro.org>
+Date: Fri, 29 May 2026 21:23:09 +0200
+Subject: [PATCH v5 2/2] backlight: Add SY7758 6-channel High Efficiency LED Driver support
+
+From: KancyJoe <kancy2333@outlook.com>
+
+Implement support for the Silergy SY7758 6-channel High Efficiency LED
+Driver used for backlight brightness control in the Ayaneo Pocket S2
+dual-DSI panel.
+
+Signed-off-by: KancyJoe <kancy2333@outlook.com>
+Signed-off-by: Neil Armstrong <neil.armstrong@linaro.org>
+Reviewed-by: Daniel Thompson (RISCstar) <danielt@kernel.org>
+
+[handheld: the driver is upstream since 7.3; what is left is armada's change making
+ the enable GPIO optional, for boards (Pocket DS) that do not describe one.]
+---
+ drivers/video/backlight/sy7758.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/video/backlight/sy7758.c b/drivers/video/backlight/sy7758.c
+index 786589cb8..a36019a92 100644
+--- a/drivers/video/backlight/sy7758.c
++++ b/drivers/video/backlight/sy7758.c
+@@ -184,8 +184,11 @@ static int sy7758_probe(struct i2c_client *client)
+ 
+ 	fsleep(100);
+ 
+-	/* Get enable GPIO and set to high */
+-	sydev->gpio = devm_gpiod_get(dev, "enable", GPIOD_OUT_HIGH);
++	/*
++	 * Some boards route SY7758 EN through a dedicated GPIO, while Pocket DS
++	 * leaves the chip reachable without a separately-described enable pin.
++	 */
++	sydev->gpio = devm_gpiod_get_optional(dev, "enable", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(sydev->gpio))
+ 		return dev_err_probe(dev, PTR_ERR(sydev->gpio),
+ 				     "failed to get enable GPIO\n");

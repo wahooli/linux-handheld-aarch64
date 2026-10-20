@@ -1,0 +1,81 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] local: watchdog: qcom: let the core emulate timeouts longer than the counter
+
+The KPSS bark/bite counters are 20 bits wide, so at the 32 kHz sleep clock
+the longest hardware timeout is 32 s, and the driver advertises that as
+max_timeout. The watchdog core then rejects anything longer with -EINVAL.
+systemd asks for its RebootWatchdogSec (10 min by default) on every
+shutdown and reboot:
+
+  systemd-shutdown[1]: Failed to set watchdog hardware timeout to 10min: Invalid argument
+
+and on that error it disarms and closes the device, so the final shutdown
+runs with no watchdog at all.
+
+Advertise the limit as max_hw_heartbeat_ms instead, as sbsa_gwdt does. The
+core then accepts any timeout and pings the hardware from its worker until
+the userspace deadline passes. qcom_wdt_start() programs at most one
+hardware period, and a pretimeout that does not fit in one is rejected,
+because the core only checks it against the emulated timeout.
+
+Timeouts up to 32 s and the 30 s default behave as before. sysfs
+max_timeout now reads 0, as for the other max_hw_heartbeat_ms drivers.
+
+diff --git a/drivers/watchdog/qcom-wdt.c b/drivers/watchdog/qcom-wdt.c
+index 49bd048..07d6f2c 100644
+--- a/drivers/watchdog/qcom-wdt.c
++++ b/drivers/watchdog/qcom-wdt.c
+@@ -76,12 +76,14 @@ static irqreturn_t qcom_wdt_isr(int irq, void *arg)
+ static int qcom_wdt_start(struct watchdog_device *wdd)
+ {
+ 	struct qcom_wdt *wdt = to_qcom_wdt(wdd);
+-	unsigned int bark = wdd->timeout - wdd->pretimeout;
++	/* The core pings the hardware to emulate anything longer */
++	unsigned int timeout = min(wdd->timeout, wdd->max_hw_heartbeat_ms / 1000);
++	unsigned int bark = timeout - wdd->pretimeout;
+ 
+ 	writel(0, wdt_addr(wdt, WDT_EN));
+ 	writel(1, wdt_addr(wdt, WDT_RST));
+ 	writel(bark * wdt->rate, wdt_addr(wdt, WDT_BARK_TIME));
+-	writel(wdd->timeout * wdt->rate, wdt_addr(wdt, WDT_BITE_TIME));
++	writel(timeout * wdt->rate, wdt_addr(wdt, WDT_BITE_TIME));
+ 	writel(QCOM_WDT_ENABLE, wdt_addr(wdt, WDT_EN));
+ 	return 0;
+ }
+@@ -112,6 +114,13 @@ static int qcom_wdt_set_timeout(struct watchdog_device *wdd,
+ static int qcom_wdt_set_pretimeout(struct watchdog_device *wdd,
+ 				   unsigned int timeout)
+ {
++	/*
++	 * The core checks this against the emulated timeout only. The bark
++	 * has to land inside one hardware period or qcom_wdt_start() wraps.
++	 */
++	if (timeout >= wdd->max_hw_heartbeat_ms / 1000)
++		return -EINVAL;
++
+ 	wdd->pretimeout = timeout;
+ 	return qcom_wdt_start(wdd);
+ }
+@@ -306,7 +315,12 @@ static int qcom_wdt_probe(struct platform_device *pdev)
+ 
+ 	wdt->wdd.ops = &qcom_wdt_ops;
+ 	wdt->wdd.min_timeout = 1;
+-	wdt->wdd.max_timeout = data->max_tick_count / wdt->rate;
++	/*
++	 * Not max_timeout: at 32 kHz the 20-bit KPSS counter tops out at 32 s,
++	 * and systemd's 10 min RebootWatchdogSec then fails with -EINVAL. The
++	 * core pings the hardware to cover longer timeouts.
++	 */
++	wdt->wdd.max_hw_heartbeat_ms = data->max_tick_count / wdt->rate * 1000;
+ 	wdt->wdd.parent = dev;
+ 	wdt->layout = data->offset;
+ 
+@@ -319,7 +333,7 @@ static int qcom_wdt_probe(struct platform_device *pdev)
+ 	 * default, unless the max timeout is less than 30 seconds, then use
+ 	 * the max instead.
+ 	 */
+-	wdt->wdd.timeout = min(wdt->wdd.max_timeout, 30U);
++	wdt->wdd.timeout = min(wdt->wdd.max_hw_heartbeat_ms / 1000, 30U);
+ 	watchdog_init_timeout(&wdt->wdd, 0, dev);
+ 
+ 	/*

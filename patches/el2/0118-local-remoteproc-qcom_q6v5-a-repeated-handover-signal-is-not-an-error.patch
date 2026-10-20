@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] remoteproc: qcom_q6v5: a repeated handover signal is not an error
 
 Every audio DSP stop opens with an error that describes normal SMP2P
@@ -34,14 +34,23 @@ timeout, for no gain beyond this one log line.
 Not hibernation-specific: a plain SSR reproduces it, and the hibernate path
 merely performs a stop/start.
 
+Rebased onto cachyos-7.3.0-2, which deleted the guard and instead disables
+the handover irq inside the handler, tracked by handover_irq_enabled. That
+covers a normal start, but not 0010's attach: it enables the irq with
+handover_issued already true, and the remote's handover bit is still set,
+so the first doorbell would run ->handover() on proxy votes attach never
+took. So this now reinstates the guard rather than demoting it.
+
 ---
+diff --git a/drivers/remoteproc/qcom_q6v5.c b/drivers/remoteproc/qcom_q6v5.c
+index dcce542c1..6d7c60155 100644
 --- a/drivers/remoteproc/qcom_q6v5.c
 +++ b/drivers/remoteproc/qcom_q6v5.c
-@@ -229,7 +229,16 @@
+@@ -263,6 +263,20 @@ static irqreturn_t q6v5_handover_interrupt(int irq, void *data)
+ {
  	struct qcom_q6v5 *q6v5 = data;
  
- 	if (q6v5->handover_issued) {
--		dev_err(q6v5->dev, "Handover signaled, but it already happened\n");
++	if (q6v5->handover_issued) {
 +		/*
 +		 * Not an error, and routine on SMP2P: once the SSR-ack feature
 +		 * is negotiated, qcom_smp2p_check_ssr() drops the cached copy
@@ -52,6 +61,9 @@ merely performs a stop/start.
 +		 * released the first time round; there is nothing left to do.
 +		 */
 +		dev_dbg(q6v5->dev, "handover signaled again, already handled\n");
- 		return IRQ_HANDLED;
- 	}
++		return IRQ_HANDLED;
++	}
++
+ 	q6v5->handover_issued = true;
  
+ 	q6v5_handover_irq_disable(q6v5, false);

@@ -1,0 +1,54 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] local: drm/msm/dp: drive only the first segment from the PHY behind an LTTPR
+
+With a non-transparent LTTPR the link is trained segment by segment: first
+source PHY -> LTTPR, then LTTPR -> sink. Only the first segment is driven by
+our PHY. The later ones are driven by the LTTPR, which applies the levels
+the source writes to the downstream receiver's TRAINING_LANEx_SET.
+
+msm_dp_ctrl_update_phy_vx_px() calls phy_configure() for every segment. The
+last segment trained is the sink's, so its CR phase first resets our PHY to
+swing 0 / pre-emphasis 0, and it ends with our PHY at whatever levels the sink
+asked the LTTPR for. The first segment, trained moments before to the levels
+the LTTPR asked for, is left under- or over-driven.
+
+Seen on the Yoga Slim 7x (PS8830 behind every USB-C port) with a Samsung
+C49G95T at 5120x1440@120, HBR3 x4. The sink counts symbol errors every second
+on all four lanes. The screen jumps sideways for a frame several times a
+minute, and the link occasionally loses lock entirely. The same dock, KVM and
+cables are clean from other laptops. dp_debug reports v_level 1 / p_level 0,
+which is the sink's adjust request (0x206 = 0x11), not the LTTPR's.
+
+Program the PHY only for the segment directly downstream of it, as i915
+does in intel_dp_set_signal_levels() via
+intel_dp_phy_is_downstream_of_source(). TRAINING_LANEx_SET is still written
+for every segment. link->phy_params, and so dp_debug, still end up holding
+the last segment's levels.
+
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -1393,11 +1393,20 @@
+ 	drm_dbg_dp(ctrl->drm_dev,
+ 		"voltage level: %d emphasis level: %d\n",
+ 			voltage_swing_level, pre_emphasis_level);
+-	ret = msm_dp_ctrl_set_vx_px(ctrl,
+-		voltage_swing_level, pre_emphasis_level);
+ 
+-	if (ret)
+-		return ret;
++	/*
++	 * Behind a non-transparent LTTPR only the first segment is driven by
++	 * this PHY; later segments are driven by the LTTPR from the
++	 * TRAINING_LANEx_SET written below. Reprogramming the PHY there would
++	 * leave the first segment at the last segment's levels.
++	 */
++	if (ctrl->link->lttpr_count <= 0 ||
++	    dp_phy == DP_PHY_LTTPR(ctrl->link->lttpr_count - 1)) {
++		ret = msm_dp_ctrl_set_vx_px(ctrl,
++			voltage_swing_level, pre_emphasis_level);
++		if (ret)
++			return ret;
++	}
+ 
+ 	if (voltage_swing_level >= DP_TRAIN_LEVEL_MAX) {
+ 		drm_dbg_dp(ctrl->drm_dev,

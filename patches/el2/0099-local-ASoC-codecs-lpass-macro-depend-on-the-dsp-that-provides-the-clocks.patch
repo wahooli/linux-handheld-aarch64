@@ -1,4 +1,4 @@
-From: Waltteri Hooli <wahooli@localhost>
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] ASoC: codecs: lpass-macro: depend on the DSP that provides the clocks
 
 Restart the audio DSP on an x1e80100 and every LPASS macro codec is left

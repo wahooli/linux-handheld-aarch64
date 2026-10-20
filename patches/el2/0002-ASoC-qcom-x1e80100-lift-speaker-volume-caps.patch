@@ -1,3 +1,4 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
 Subject: [PATCH] ASoC: qcom: x1e80100: lift the speaker volume caps
 
 Upstream commit "ASoC: qcom: x1e80100: limit speaker volumes" (2026-04-22, in
