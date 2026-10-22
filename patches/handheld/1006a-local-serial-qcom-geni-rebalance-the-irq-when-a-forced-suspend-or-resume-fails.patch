@@ -1,0 +1,52 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] local: serial: qcom-geni: rebalance the IRQ when a forced
+ suspend or resume fails
+
+7.3 carries upstream d0cd9c8d0fd5 ("serial: qcom-geni: add force
+suspend/resume to system sleep callbacks"). 1006 masks a non-console port's
+IRQ in qcom_geni_serial_suspend() and unmasks it in resume, and upstream's
+error paths know nothing of that mask:
+
+  - pm_runtime_force_suspend() failing returns the error with the port
+    suspended and its IRQ masked. The PM core does not call resume for the
+    device whose suspend failed, so nothing ever unmasks it.
+  - pm_runtime_force_resume() failing returns before the enable_irq() that
+    balances the suspend.
+
+Either way the port stays deaf. On the AYN Odin 3 that port is the gamepad
+MCU's (rsinput, 89c000.serial): built-in controls dead until reboot.
+
+armada (packages/kernel/patches/0534 at d2bcf6fd3343) backported the
+upstream commit to 7.2 with exactly this handling folded in; this is that
+handling alone, on 7.3's version of the code.
+
+---
+--- a/drivers/tty/serial/qcom_geni_serial.c
++++ b/drivers/tty/serial/qcom_geni_serial.c
+@@ -2129,7 +2129,12 @@
+ 	if (!console_suspend_enabled && uart_console(uport))
+ 		return 0;
+ 
+-	return pm_runtime_force_suspend(dev);
++	ret = pm_runtime_force_suspend(dev);
++	if (ret && !uart_console(uport)) {
++		uart_resume_port(private_data->drv, uport);
++		enable_irq(uport->irq);
++	}
++	return ret;
+ }
+ 
+ static int qcom_geni_serial_resume(struct device *dev)
+@@ -2141,8 +2146,11 @@
+ 
+ 	if (console_suspend_enabled || !uart_console(uport)) {
+ 		ret = pm_runtime_force_resume(dev);
+-		if (ret)
++		if (ret) {
++			if (!uart_console(uport))
++				enable_irq(uport->irq);
+ 			return ret;
++		}
+ 	}
+ 
+ 	ret = uart_resume_port(private_data->drv, uport);

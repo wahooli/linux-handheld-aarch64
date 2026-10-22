@@ -1,0 +1,64 @@
+From: Waltteri Hooli <waltteri.hooli@nortal.com>
+Subject: [PATCH] arm64: dts: qcom: cq8725s-ayn: drop the SS redriver, fix the QMP PHY supplies
+
+Two Type-C fixes on top of the vendored Odin 3 tree (9000):
+
+- The NB7VPQ904M at i2c 0x1c never acks: plugging a USB-C hub logs a burst
+  of "geni_i2c a94000.i2c: GPI transfer failed: -5" and the hub never
+  enumerates. Route the connector's SS port straight to the QMP PHY again and
+  disable the redriver node. With that the hub enumerates and DP AUX reads the
+  sink's DPCD. Verified on hardware 2026-10-21.
+
+- usb_dp_qmpphy had vdda-phy and vdda-pll swapped (1.2 V on phy, 0.88 V on
+  pll). Same fix as armada-os/armada#722, "fix the swapped USB QMP PHY
+  supplies".
+
+---
+--- a/arch/arm64/boot/dts/qcom/cq8725s-ayn-common.dtsi	2026-10-21 17:43:17.525200529 +0300
++++ b/arch/arm64/boot/dts/qcom/cq8725s-ayn-common.dtsi	2026-10-21 17:43:17.542859577 +0300
+@@ -231,7 +231,7 @@
+ 					reg = <1>;
+ 
+ 					pmic_glink_ss_in: endpoint {
+-						remote-endpoint = <&redriver_ss_out>;
++						remote-endpoint = <&usb_dp_qmpphy_out>;
+ 					};
+ 				};
+ 
+@@ -907,9 +907,16 @@
+ 		sound-name-prefix = "SPK_R";
+ 	};
+ 
++	/*
++	 * Out of the Type-C graph and disabled: it never acks on this bus (every
++	 * write fails with -EIO), and with it in the SS path a USB-C hub never
++	 * enumerates. Without it the hub does, and AUX reads the sink's DPCD.
++	 * Revisit if an enable GPIO for it turns up.
++	 */
+ 	typec_mux_redriver: typec-mux@1c {
+ 		compatible = "onnn,nb7vpq904m";
+ 		reg = <0x1c>;
++		status = "disabled";
+ 
+ 		vcc-supply = <&vreg_l15b_1p8>;
+ 
+@@ -1448,8 +1455,8 @@
+ };
+ 
+ &usb_dp_qmpphy {
+-	vdda-phy-supply = <&vreg_l3g_1p2>;
+-	vdda-pll-supply = <&vreg_l2d_0p88>;
++	vdda-phy-supply = <&vreg_l2d_0p88>;
++	vdda-pll-supply = <&vreg_l3g_1p2>;
+ 
+ 	mode-switch;
+ 
+@@ -1457,7 +1464,7 @@
+ };
+ 
+ &usb_dp_qmpphy_out {
+-	remote-endpoint = <&redriver_ss_in>;
++	remote-endpoint = <&pmic_glink_ss_in>;
+ };
+ 
+ &usb_dwc3_hs {

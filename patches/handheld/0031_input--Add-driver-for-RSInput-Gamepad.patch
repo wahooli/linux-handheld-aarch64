@@ -3,6 +3,10 @@ From: Philippe Simons <simons.philippe@gmail.com>
 Date: Sat, 21 Feb 2026 19:06:28 +0100
 Subject: [PATCH] input: Add driver for RSInput Gamepad
 
+[handheld: the MCU parameters (DATA_COMMOD_SET_PAR) are armada's current
+ 0x06/0x02, from 475b776ec5 "kernel: rsinput: improve analog report
+ response" (armada packages/kernel at d2bcf6fd3343); were 0x28/0x07.]
+
 ---
  drivers/input/joystick/Kconfig   |   4 +
  drivers/input/joystick/Makefile  |   1 +
@@ -258,8 +262,8 @@ index 000000000000..913c499ad30a
 +    uint8_t mcu_params[] = {
 +        DATA_COMMOD_SET_PAR,
 +        0x01,
-+        0x00, 0x00, 0x00, 0x28,
-+        0x00, 0x00, 0x00, 0x07
++        0x00, 0x00, 0x00, 0x06,
++        0x00, 0x00, 0x00, 0x02
 +    };
 +    error = rsinput_send_command(drv, CMD_COMMOD, mcu_params, sizeof(mcu_params));
 +    if (error < 0) {
