@@ -1,0 +1,50 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: qcom: cq8725s-ayn-odin3: charge LED follows charging state
+
+The three LED channels on the PM8550 LPG (reg 1-3, as in the stock
+Android devicetree) had no DT node, so the charge LED never lit.
+Declare them as one RGB multi-led with the power-supply
+battery-charging-orange-full-green trigger: orange while charging,
+green when full, with no userspace involved.
+
+The trigger name follows the battery power supply, which 0503
+(ROCKNIX battery-name) names "battery". Channel 4 stays the fan PWM
+(pwm-fan's <&pm8550_pwm 3 ...> in the common dtsi).
+
+Ported from armada-os/armada 7f36e760ce70 ("feat(kernel): drive the
+Odin 3 charge LED from charging state", PR #764), where it is part of
+their dts/cq8725s-ayn-odin3.dts.patch.
+
+---
+--- a/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts
++++ b/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts
+@@ -394,3 +394,29 @@
+ 			"DMIC3", "MIC BIAS3",
+ 			"TX SWR_INPUT6", "DMIC3_OUTPUT";
+ };
++
++&pm8550_pwm {
++	multi-led {
++		color = <LED_COLOR_ID_RGB>;
++		function = LED_FUNCTION_CHARGING;
++		linux,default-trigger = "battery-charging-orange-full-green";
++
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		led@1 {
++			reg = <1>;
++			color = <LED_COLOR_ID_RED>;
++		};
++
++		led@2 {
++			reg = <2>;
++			color = <LED_COLOR_ID_GREEN>;
++		};
++
++		led@3 {
++			reg = <3>;
++			color = <LED_COLOR_ID_BLUE>;
++		};
++	};
++};

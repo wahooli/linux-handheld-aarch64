@@ -1,0 +1,52 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] local: soc: qcom: aoss: keep X1E out of AOSD at EL2
+
+With Linux at EL2 the SoC hard-resets (PS_HOLD, Hard Reset) whenever an
+hourly firmware event, counted from boot, finds it in AOSD (XO shutdown).
+Every s2idle reset on the Yoga Slim 7x lands at boot + N h + 48-50 s,
+including sleeps only 15 and 32 minutes old, and the Vivobook S15 shows
+the same pattern. CXSD and DDR low-power mode are not affected.
+
+Ask AOP for CXSD only, as the x1e-sleep project does with an out-of-tree
+module: {class: aoss_slp, res: sleep, val: disable}. Measured on the Yoga:
+without it, s2idle enters AOSD within seconds; with it, s2idle stays in
+CXSD/DDR LPM for ~99% of the sleep (202 mW on battery) and sleeps through
+the reset point.
+
+Limited to x1e80100 booted at EL2, where it was observed. The debugfs
+prevent_aoss_sleep knob cannot do this: its message has no val key.
+
+--- a/drivers/soc/qcom/qcom_aoss.c
++++ b/drivers/soc/qcom/qcom_aoss.c
+@@ -8,6 +8,7 @@
+ #include <linux/io.h>
+ #include <linux/mailbox_client.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/thermal.h>
+@@ -15,6 +16,8 @@
+ #include <linux/string_choices.h>
+ #include <linux/soc/qcom/qcom_aoss.h>
+ 
++#include <asm/virt.h>
++
+ #define CREATE_TRACE_POINTS
+ #include "trace-aoss.h"
+ 
+@@ -623,6 +626,14 @@
+ 
+ 	qmp_debugfs_create(qmp);
+ 
++	/* local: an hourly firmware event resets X1E at EL2 if it lands in AOSD */
++	if (of_machine_is_compatible("qcom,x1e80100") && is_hyp_mode_available()) {
++		if (qmp_send(qmp, "{class: aoss_slp, res: sleep, val: disable}"))
++			dev_warn(&pdev->dev, "failed to disable AOSD\n");
++		else
++			dev_info(&pdev->dev, "AOSD disabled, system sleep stops at CXSD\n");
++	}
++
+ 	return 0;
+ 
+ err_close_qmp:

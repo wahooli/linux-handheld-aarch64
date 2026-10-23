@@ -91,3 +91,4 @@ shared/0236-local-drm-msm-dp-rebuild-the-sink-link-caps-on-every-connect.patch
 shared/0243-local-drm-msm-serialize-devcoredump-reads.patch
 0246-clocksource-arm_arch_timer-park-stopped-timers.patch
 shared/0247-soc-qcom-add-ADSP-power-limits-Modern-Standby-notifier.patch
+0248-local-soc-qcom-aoss-keep-X1E-out-of-AOSD-at-EL2.patch

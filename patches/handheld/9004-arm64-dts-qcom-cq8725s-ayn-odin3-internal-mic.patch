@@ -1,0 +1,39 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: qcom: cq8725s-ayn-odin3: route the internal mic
+
+The internal mic never powered: the DT had no route from the codec's
+DMIC3 to the TX macro, and wcd939x registers no input widget for its
+DMICs, so DAPM never found a complete path to power DMIC3 or its bias.
+Add a "Microphone" widget, feed DMIC3 from it and from MIC BIAS3, and
+route DMIC3_OUTPUT into TX SWR_INPUT6.
+
+audio-routing is replaced as a whole, so the four routes the common
+dtsi already sets (headphones and the headset mic on AMIC2) are
+repeated ahead of the new ones.
+
+Ported from armada-os/armada c1cda0a8f49d ("fix(kernel): enable the
+Odin 3 mics and stop headphone clipping"), where it is part of their
+dts/cq8725s-ayn-odin3.dts.patch. Goes with 0073 (HPH PCM remap kept off
+the TX device, else headset-mic capture fails "All ports busy") and
+0080 (two-decimator captures). The capture devices themselves come
+from the AYN/Odin3 UCM, which is userspace.
+
+---
+--- a/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts
++++ b/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts
+@@ -382,3 +382,15 @@
+ 		};
+ 	};
+ };
++
++/* wcd939x has no DMIC input widget; without one DAPM never powers DMIC3 */
++&{/sound} {
++	widgets = "Microphone", "Internal Mic";
++	audio-routing = "IN1_HPHL", "HPHL_OUT",
++			"IN2_HPHR", "HPHR_OUT",
++			"AMIC2", "MIC BIAS2",
++			"TX SWR_INPUT1", "ADC2_OUTPUT",
++			"DMIC3", "Internal Mic",
++			"DMIC3", "MIC BIAS3",
++			"TX SWR_INPUT6", "DMIC3_OUTPUT";
++};
