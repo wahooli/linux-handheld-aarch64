@@ -1,0 +1,69 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] local: remoteproc: qcom_q6v5_pas: unbind q6prm before releasing the GLINK edge
+
+On 7.3 every hibernation resets the SoC (PS_HOLD) inside the
+PM_HIBERNATION_PREPARE teardown of the ADSP edge. pm_test=freezer
+reproduces it on a fresh boot; hibernate_restart=N avoids it.
+
+qcom_glink_native_remove() sets abort_tx before it removes its rpmsg
+children, so every GPR request made during the q6prm consumer walk fails.
+That was harmless while the LPASS macros held their macro and dcodec votes
+from probe. 7.3 moved them to pm_clk: idle macros drop every vote, the
+walk runtime-resumes them, pm_clk_resume() logs the failed enable and
+returns 0, and regcache_sync() writes unclocked LPASS registers.
+
+Unbind q6prm first, while GPR still answers. The driver core then runs the
+same consumer walk with working clocks, and the edge removal that follows
+finds q6prm already unbound. Unbinding qcom-prm by hand before a
+pm_test=freezer hibernation turned the reset into a clean return.
+
+--- a/drivers/remoteproc/qcom_q6v5_pas.c
++++ b/drivers/remoteproc/qcom_q6v5_pas.c
+@@ -959,6 +959,22 @@
+ };
+ 
+ /*
++ * Edge removal fails every send before it walks its children, and the LPASS
++ * macros clock themselves through pm_clk, which ignores a failed enable. Left
++ * to the edge, the q6prm consumer walk writes unclocked LPASS registers and
++ * the firmware resets the SoC, so unbind q6prm while GPR still answers.
++ */
++static int qcom_pas_unbind_q6prm(struct device *dev, void *data)
++{
++	if (of_device_is_compatible(dev->of_node, "qcom,q6prm")) {
++		device_release_driver(dev);
++		return 1;
++	}
++
++	return device_for_each_child(dev, NULL, qcom_pas_unbind_q6prm);
++}
++
++/*
+  * Release the attach-only edge before the snapshot rather than after it.
+  *
+  * Removing the edge removes its rpmsg children, and the audio one pulls the
+@@ -968,11 +984,10 @@
+  * in device_release_driver_internal() on one of those codecs and did not come
+  * back.
+  *
+- * Here the DSP is still the one this image has been talking to, GPR still
+- * answers, and PM_HIBERNATION_PREPARE runs before freeze_processes(), so
+- * userspace can still close its ALSA files. That makes this the same teardown
+- * the SSR path takes, which 0099-0104 already made survivable -- and a stall
+- * here leaves a live machine with a shell and a journal.
++ * Here the DSP is still the one this image has been talking to, and
++ * PM_HIBERNATION_PREPARE runs before freeze_processes(), so userspace can still
++ * close its ALSA files. That makes this the same teardown the SSR path takes,
++ * which 0099-0104 already made survivable.
+  */
+ static void qcom_pas_glink_teardown(struct qcom_pas *pas)
+ {
+@@ -989,6 +1004,8 @@
+ 	if (!rproc->ops->start && rproc->state == RPROC_ATTACHED &&
+ 	    !IS_ERR_OR_NULL(glink->edge)) {
+ 		dev_info(pas->dev, "hibernate: releasing GLINK before the image\n");
++		if (device_for_each_child(&rproc->dev, NULL, qcom_pas_unbind_q6prm))
++			dev_info(pas->dev, "hibernate: q6prm unbound while GPR still answers\n");
+ 		qcom_glink_smem_unregister(glink->edge);
+ 		glink->edge = NULL;
+ 		pas->hibernate_glink_torn = true;
