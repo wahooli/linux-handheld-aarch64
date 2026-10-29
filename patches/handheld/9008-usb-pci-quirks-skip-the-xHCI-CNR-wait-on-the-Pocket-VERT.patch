@@ -1,0 +1,24 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] usb: pci-quirks: skip the xHCI CNR wait on the Pocket VERT too
+
+The AYANEO Pocket VERT's gamepad sits behind a uPD720201 on PCIe1 with no
+firmware EEPROM: its controller-not-ready bit stays set until
+xhci-pci-renesas uploads renesas_usb_fw.mem, so the early handoff spun
+for 5 s inside PCI enumeration. That pushed the modular display clock
+driver past the deferred probe timeout and left the panel black. The same
+case as SM8550/SM8650's in patch 0071.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/usb/host/pci-quirks.c
++++ b/drivers/usb/host/pci-quirks.c
+@@ -1227,7 +1227,8 @@
+ 	op_reg_base = base + XHCI_HC_LENGTH(readl(base));
+
+ 	if (!of_machine_is_compatible("qcom,sm8550") &&
+-	    !of_machine_is_compatible("qcom,sm8650")) {
++	    !of_machine_is_compatible("qcom,sm8650") &&
++	    !of_machine_is_compatible("ayaneo,pocket-vert")) {
+ 		/* Wait for the host controller to be ready before writing any
+ 		 * operational or runtime registers.  Wait 5 seconds and no more.
+ 		 */

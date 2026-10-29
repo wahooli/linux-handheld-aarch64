@@ -1,0 +1,46 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] ASoC: qcom: treat LPI MI2S ports as MI2S too
+
+The AYANEO Pocket VERT's speaker amps sit on the LPASS VA domain's MI2S
+(LPI_MI2S_RX_0, Android's "MI2S-LPAIF_VA-RX-PRIMARY"), not on one of the
+PRIMARY..QUINARY ports. Patches 0060 and 0612/0613 only knew those, so an
+LPI port got neither its bit clock at backend startup nor the early port
+start the Awinic amps need to see BCLK at DAPM power-up. LPI MI2S already
+gets the I2S DAI ops (q6dsp-lpass-ports.c); count it here too, with the
+same two ranges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/sound/soc/qcom/sc8280xp.c
++++ b/sound/soc/qcom/sc8280xp.c
+@@ -231,6 +231,8 @@
+ 	switch (cpu_dai->id) {
+ 	case PRIMARY_MI2S_RX...QUATERNARY_MI2S_TX:
+ 	case QUINARY_MI2S_RX...QUINARY_MI2S_TX:
++	case LPI_MI2S_RX_0...LPI_MI2S_TX_4:
++	case LPI_MI2S_RX_5...LPI_MI2S_TX_6:
+ 		if (++pdata->mi2s_clk_count == 1) {
+ 			ret = clk_prepare_enable(pdata->i2s_clk);
+ 			if (ret) {
+@@ -261,6 +263,8 @@
+ 	switch (cpu_dai->id) {
+ 	case PRIMARY_MI2S_RX...QUATERNARY_MI2S_TX:
+ 	case QUINARY_MI2S_RX...QUINARY_MI2S_TX:
++	case LPI_MI2S_RX_0...LPI_MI2S_TX_4:
++	case LPI_MI2S_RX_5...LPI_MI2S_TX_6:
+ 		if (--pdata->mi2s_clk_count == 0)
+ 			clk_disable_unprepare(pdata->i2s_clk);
+ 		break;
+--- a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
++++ b/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
+@@ -274,7 +274,9 @@
+ 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
+ 	    ((dai->id >= PRIMARY_MI2S_RX && dai->id <= QUATERNARY_MI2S_TX) ||
+ 	     (dai->id >= QUINARY_MI2S_RX &&
+-	      dai->id <= QUINARY_MI2S_TX))) {
++	      dai->id <= QUINARY_MI2S_TX) ||
++	     (dai->id >= LPI_MI2S_RX_0 && dai->id <= LPI_MI2S_TX_4) ||
++	     (dai->id >= LPI_MI2S_RX_5 && dai->id <= LPI_MI2S_TX_6))) {
+ 		rc = q6apm_graph_start(dai_data->graph[dai->id]);
+ 		if (rc < 0) {
+ 			dev_err(dai->dev, "Failed to start APM port %d\n", dai->id);

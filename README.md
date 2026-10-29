@@ -12,7 +12,7 @@ No fetched patch content is committed here: the repository holds the manifests
 
 | product | package | base | patches | device |
 |---|---|---|---|---|
-| `handheld` | `linux-handheld-aarch64` | CachyOS release + BORE | local series in `patches/handheld/` (taken over from [armada-packages](https://github.com/armada-os/armada-packages)) | AYN Odin 3 (Qualcomm CQ8725S / SM8750) |
+| `handheld` | `linux-handheld-aarch64` | CachyOS release + BORE | local series in `patches/series.d/`; entries without a copy in `patches/handheld/` come from [armada](https://github.com/armada-os/armada) (`packages/kernel/`) | AYN Odin 3 (Qualcomm CQ8725S / SM8750) |
 | `el2` | `linux-el2-aarch64` | CachyOS release + BORE | local series in `patches/el2/` | Lenovo Yoga Slim 7x (X1E80100), booted at EL2 for KVM |
 
 Patches both products carry live once, in `patches/shared/`, and each series lists them as `shared/<name>`.

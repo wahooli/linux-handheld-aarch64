@@ -1,0 +1,328 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] drm/panel: add the AYANEO Pocket VERT panel
+
+The AYANEO Pocket VERT's 1440x1600 LCD: a Novatek-style controller fed by
+two DSI links (720x1600 each, 4 lanes, video burst mode). Mode, timings and
+command sequences are the stock devicetree's "ar13 90hz video mode dsi
+panel", which defines one 60 Hz timing only.
+
+It switches vddio and the SGM3804 bias rails (avdd/avee) and takes the
+SY7758 backlight. The two other enable GPIOs and vci stay as the bootloader
+left them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/gpu/drm/panel/Kconfig
++++ b/drivers/gpu/drm/panel/Kconfig
+@@ -1512,6 +1512,17 @@
+ 
+ 	  To compile this driver as a module, choose M here.
+ 
++config DRM_PANEL_AYANEO_POCKET_VERT
++	tristate "AYANEO Pocket VERT dual-DSI video mode panel"
++	depends on OF
++	depends on DRM_MIPI_DSI
++	depends on BACKLIGHT_CLASS_DEVICE
++	help
++	  Say Y here if you want to enable support for the 1440x1600 60Hz
++	  dual-DSI video mode LCD of the AYANEO Pocket VERT handheld.
++
++	  To compile this driver as a module, choose M here.
++
+ config DRM_PANEL_XINPENG_XPP055C272
+ 	tristate "Xinpeng XPP055C272 panel driver"
+ 	depends on OF
+--- a/drivers/gpu/drm/panel/Makefile
++++ b/drivers/gpu/drm/panel/Makefile
+@@ -146,4 +146,5 @@
+ obj-$(CONFIG_DRM_PANEL_WIDECHIPS_WS2401) += panel-widechips-ws2401.o
+ obj-$(CONFIG_DRM_PANEL_AYANEO_WT0600_2K) += panel-wt0600-2k.o
+ obj-$(CONFIG_DRM_PANEL_AYANEO_WT0600_1K) += panel-wt0600-1k.o
++obj-$(CONFIG_DRM_PANEL_AYANEO_POCKET_VERT) += panel-ayaneo-pocket-vert.o
+ obj-$(CONFIG_DRM_PANEL_XINPENG_XPP055C272) += panel-xinpeng-xpp055c272.o
+--- /dev/null
++++ b/drivers/gpu/drm/panel/panel-ayaneo-pocket-vert.c
+@@ -0,0 +1,283 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * AYANEO Pocket VERT panel: 1440x1600 LCD on a Novatek-style controller,
++ * fed by two DSI links (720x1600 each, 4 lanes, video burst mode).
++ *
++ * Mode, timings and command sequences are the stock devicetree's
++ * "ar13 90hz video mode dsi panel", which defines one 60 Hz timing only.
++ *
++ * shortcut: TLMM 42 ("en"), TLMM 46 ("3v3-en") and vci (L13C, an off-step
++ * voltage RPMh rejects) stay as the bootloader left them; only vddio and the
++ * SGM3804 bias are cut. Add them once it is known what else hangs off them.
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_graph.h>
++#include <linux/regulator/consumer.h>
++
++#include <video/mipi_display.h>
++
++#include <drm/drm_connector.h>
++#include <drm/drm_mipi_dsi.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_of.h>
++#include <drm/drm_panel.h>
++#include <drm/drm_probe_helper.h>
++
++struct pocket_vert {
++	struct drm_panel panel;
++	struct mipi_dsi_device *dsi[2];
++	struct regulator_bulk_data *supplies;
++	struct gpio_desc *reset_gpio;
++	enum drm_panel_orientation orientation;
++};
++
++static inline struct pocket_vert *to_pocket_vert(struct drm_panel *panel)
++{
++	return container_of(panel, struct pocket_vert, panel);
++}
++
++/* Power-on order; off is the reverse. avdd/avee are the SGM3804 bias rails. */
++static const struct regulator_bulk_data pocket_vert_supplies[] = {
++	{ .supply = "vddio" },
++	{ .supply = "avdd" },
++	{ .supply = "avee" },
++};
++
++/* Full width: msm splits the horizontal timings across the two links. */
++static const struct drm_display_mode pocket_vert_mode = {
++	.clock = (1440 + 128 + 64 + 120) * (1600 + 30 + 1 + 10) * 60 / 1000,
++	.hdisplay = 1440,
++	.hsync_start = 1440 + 128,
++	.hsync_end = 1440 + 128 + 64,
++	.htotal = 1440 + 128 + 64 + 120,
++	.vdisplay = 1600,
++	.vsync_start = 1600 + 30,
++	.vsync_end = 1600 + 30 + 1,
++	.vtotal = 1600 + 30 + 1 + 10,
++	.width_mm = 60,
++	.height_mm = 66,
++	.type = DRM_MODE_TYPE_DRIVER,
++};
++
++/* qcom,mdss-dsi-reset-sequence = <0 10 1 10 1 10>, reset is active low. */
++static void pocket_vert_reset(struct pocket_vert *ctx)
++{
++	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++	usleep_range(10000, 11000);
++	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
++	usleep_range(20000, 21000);
++}
++
++static int pocket_vert_on(struct pocket_vert *ctx)
++{
++	struct mipi_dsi_device *dsi0 = ctx->dsi[0], *dsi1 = ctx->dsi[1];
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi0 };
++
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0xe0);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x53, 0x22);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x25);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x65, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x66, 0x7b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x67, 0x56);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xc4, 0x90);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x26);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x02, 0xce);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x4d, 0x8b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x10);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xc0, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x3b, 0x00, 0x0a, 0x00, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xbe, 0x00, 0x0a, 0x00, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xbb, 0x13);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xba, 0x03);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x35, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x36, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, MIPI_DCS_EXIT_SLEEP_MODE);
++	mipi_dsi_msleep(&dsi_ctx, 20);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, MIPI_DCS_SET_DISPLAY_ON);
++	mipi_dsi_msleep(&dsi_ctx, 10);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x2b, 0x00, 0x00, 0x06, 0x40);
++
++	return dsi_ctx.accum_err;
++}
++
++static int pocket_vert_off(struct pocket_vert *ctx)
++{
++	struct mipi_dsi_device *dsi0 = ctx->dsi[0], *dsi1 = ctx->dsi[1];
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi0 };
++
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, MIPI_DCS_SET_DISPLAY_OFF);
++	mipi_dsi_msleep(&dsi_ctx, 70);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, MIPI_DCS_ENTER_SLEEP_MODE);
++	mipi_dsi_msleep(&dsi_ctx, 150);
++
++	return dsi_ctx.accum_err;
++}
++
++static int pocket_vert_prepare(struct drm_panel *panel)
++{
++	struct pocket_vert *ctx = to_pocket_vert(panel);
++	int i, ret;
++
++	/* One by one: regulator_bulk_enable() enables in parallel. */
++	for (i = 0; i < ARRAY_SIZE(pocket_vert_supplies); i++) {
++		ret = regulator_enable(ctx->supplies[i].consumer);
++		if (ret) {
++			dev_err(panel->dev, "failed to enable %s: %d\n",
++				ctx->supplies[i].supply, ret);
++			regulator_bulk_disable(i, ctx->supplies);
++			return ret;
++		}
++	}
++
++	pocket_vert_reset(ctx);
++
++	ret = pocket_vert_on(ctx);
++	if (ret < 0) {
++		dev_err(panel->dev, "failed to initialize panel: %d\n", ret);
++		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++		regulator_bulk_disable(ARRAY_SIZE(pocket_vert_supplies), ctx->supplies);
++	}
++
++	return ret;
++}
++
++static int pocket_vert_unprepare(struct drm_panel *panel)
++{
++	struct pocket_vert *ctx = to_pocket_vert(panel);
++	int ret;
++
++	ret = pocket_vert_off(ctx);
++	if (ret < 0)
++		dev_err(panel->dev, "failed to un-initialize panel: %d\n", ret);
++
++	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++	regulator_bulk_disable(ARRAY_SIZE(pocket_vert_supplies), ctx->supplies);
++
++	return 0;
++}
++
++static int pocket_vert_get_modes(struct drm_panel *panel,
++				 struct drm_connector *connector)
++{
++	struct pocket_vert *ctx = to_pocket_vert(panel);
++
++	drm_connector_set_panel_orientation(connector, ctx->orientation);
++
++	return drm_connector_helper_get_modes_fixed(connector, &pocket_vert_mode);
++}
++
++static enum drm_panel_orientation pocket_vert_get_orientation(struct drm_panel *panel)
++{
++	return to_pocket_vert(panel)->orientation;
++}
++
++static const struct drm_panel_funcs pocket_vert_panel_funcs = {
++	.prepare = pocket_vert_prepare,
++	.unprepare = pocket_vert_unprepare,
++	.get_modes = pocket_vert_get_modes,
++	.get_orientation = pocket_vert_get_orientation,
++};
++
++static int pocket_vert_probe(struct mipi_dsi_device *dsi)
++{
++	const struct mipi_dsi_device_info info = { .type = "pocket-vert-dsi1", .channel = 0 };
++	struct device *dev = &dsi->dev;
++	struct mipi_dsi_host *dsi1_host;
++	struct device_node *dsi1;
++	struct pocket_vert *ctx;
++	int i, ret;
++
++	ctx = devm_drm_panel_alloc(dev, struct pocket_vert, panel,
++				   &pocket_vert_panel_funcs, DRM_MODE_CONNECTOR_DSI);
++	if (IS_ERR(ctx))
++		return PTR_ERR(ctx);
++
++	ret = devm_regulator_bulk_get_const(dev, ARRAY_SIZE(pocket_vert_supplies),
++					    pocket_vert_supplies, &ctx->supplies);
++	if (ret < 0)
++		return ret;
++
++	/* Deasserted: the bootloader's panel keeps running until prepare. */
++	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
++	if (IS_ERR(ctx->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio), "failed to get reset gpio\n");
++
++	dsi1 = of_graph_get_remote_node(dev->of_node, 1, -1);
++	if (!dsi1)
++		return dev_err_probe(dev, -ENODEV, "cannot get secondary DSI node\n");
++
++	dsi1_host = of_find_mipi_dsi_host_by_node(dsi1);
++	of_node_put(dsi1);
++	if (!dsi1_host)
++		return dev_err_probe(dev, -EPROBE_DEFER, "cannot get secondary DSI host\n");
++
++	ctx->dsi[1] = devm_mipi_dsi_device_register_full(dev, dsi1_host, &info);
++	if (IS_ERR(ctx->dsi[1]))
++		return dev_err_probe(dev, PTR_ERR(ctx->dsi[1]), "cannot get secondary DSI device\n");
++
++	ctx->dsi[0] = dsi;
++	mipi_dsi_set_drvdata(dsi, ctx);
++
++	ret = drm_of_get_panel_orientation(dev->of_node, &ctx->orientation);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "failed to get orientation\n");
++
++	/* qcom,mdss-dsi-lp11-init: lanes in LP-11 before reset and init. */
++	ctx->panel.prepare_prev_first = true;
++
++	ret = drm_panel_of_backlight(&ctx->panel);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get backlight\n");
++
++	drm_panel_add(&ctx->panel);
++
++	for (i = 0; i < ARRAY_SIZE(ctx->dsi); i++) {
++		ctx->dsi[i]->lanes = 4;
++		ctx->dsi[i]->format = MIPI_DSI_FMT_RGB888;
++		ctx->dsi[i]->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
++					  MIPI_DSI_CLOCK_NON_CONTINUOUS | MIPI_DSI_MODE_LPM;
++
++		ret = devm_mipi_dsi_attach(dev, ctx->dsi[i]);
++		if (ret < 0) {
++			drm_panel_remove(&ctx->panel);
++			return dev_err_probe(dev, ret, "cannot attach to DSI%d host\n", i);
++		}
++	}
++
++	return 0;
++}
++
++static void pocket_vert_remove(struct mipi_dsi_device *dsi)
++{
++	struct pocket_vert *ctx = mipi_dsi_get_drvdata(dsi);
++
++	drm_panel_remove(&ctx->panel);
++}
++
++static const struct of_device_id pocket_vert_of_match[] = {
++	{ .compatible = "ayaneo,pocket-vert-panel" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, pocket_vert_of_match);
++
++static struct mipi_dsi_driver pocket_vert_driver = {
++	.probe = pocket_vert_probe,
++	.remove = pocket_vert_remove,
++	.driver = {
++		.name = "panel-ayaneo-pocket-vert",
++		.of_match_table = pocket_vert_of_match,
++	},
++};
++module_mipi_dsi_driver(pocket_vert_driver);
++
++MODULE_DESCRIPTION("DRM driver for the AYANEO Pocket VERT panel");
++MODULE_LICENSE("GPL");

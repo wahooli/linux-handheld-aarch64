@@ -1,0 +1,78 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] ASoC: qcom: sc8280xp: release the MI2S clock across system
+ sleep
+
+The MI2S bit clock is taken when a back end starts up and given back when
+it shuts down, so a stream left open when the system sleeps keeps it
+enabled. The clock is a DSP (q6prm) clock, and the DSP keeps the SoC's
+XO running for it. The card had no PM ops either, so ASoC never suspended
+its PCMs or DAPM.
+
+On the AYANEO Pocket VERT, PipeWire still had the speaker open from
+Steam's UI sound when the power button suspended the device, and the SoC
+never reached AOSS sleep, CX collapse or DDR low power in s2idle.
+Suspended from a shell with the speaker closed, it spent 78.7 of 80
+seconds in all three.
+
+Use the ASoC PM ops, give the clock back once the card is suspended and
+take it again before the card resumes. DAPM powers the amps back up after
+that, with the bit clock running, and PCM operations wait for the card to
+be back at D0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/sound/soc/qcom/sc8280xp.c
++++ b/sound/soc/qcom/sc8280xp.c
+@@ -275,6 +275,35 @@
+ 	qcom_snd_sdw_shutdown(substream);
+ }
+ 
++/*
++ * A stream open across system sleep keeps the MI2S clock enabled, and with it
++ * the SoC's XO. The PCMs and DAPM (the amps) are suspended by now, and
++ * resume_pre runs before DAPM powers the amps back up.
++ */
++static int sc8280xp_snd_suspend_post(struct snd_soc_card *card)
++{
++	struct sc8280xp_snd_data *pdata = snd_soc_card_get_drvdata(card);
++
++	if (pdata->mi2s_clk_count)
++		clk_disable_unprepare(pdata->i2s_clk);
++
++	return 0;
++}
++
++static int sc8280xp_snd_resume_pre(struct snd_soc_card *card)
++{
++	struct sc8280xp_snd_data *pdata = snd_soc_card_get_drvdata(card);
++	int ret = 0;
++
++	if (pdata->mi2s_clk_count) {
++		ret = clk_prepare_enable(pdata->i2s_clk);
++		if (ret)
++			dev_err(card->dev, "failed to restart the MI2S clock: %d\n", ret);
++	}
++
++	return ret;
++}
++
+ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
+ 				     struct snd_pcm_hw_params *params)
+ {
+@@ -490,6 +519,8 @@
+ 		return dev_err_probe(dev, PTR_ERR(data->i2s_clk), "unable to get i2s clock\n");
+ 
+ 	card->driver_name = data->priv->driver_name;
++	card->suspend_post = sc8280xp_snd_suspend_post;
++	card->resume_pre = sc8280xp_snd_resume_pre;
+ 	sc8280xp_add_be_ops(card);
+ 	return devm_snd_soc_register_card(dev, card);
+ }
+@@ -666,6 +697,7 @@
+ 	.driver = {
+ 		.name = "snd-sc8280xp",
+ 		.of_match_table = snd_sc8280xp_dt_match,
++		.pm = &snd_soc_pm_ops,
+ 	},
+ };
+ module_platform_driver(snd_sc8280xp_driver);

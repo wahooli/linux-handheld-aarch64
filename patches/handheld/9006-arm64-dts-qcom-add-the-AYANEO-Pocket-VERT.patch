@@ -1,0 +1,1151 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: qcom: add the AYANEO Pocket VERT
+
+A first-boot tree for the AYANEO Pocket VERT (Snapdragon 8+ Gen 1, SM8475P),
+built on Qualcomm's Cape QRD. It boots Linux from the SD card and shows the
+console on XBL's splash framebuffer, which OpenABL keeps on screen through
+splash_region, holding the MMCX rail for it. The USB-C port is device-only
+USB 2.0 through the eUSB2 PHY and its NXP repeater, for a bring-up shell.
+The clock controllers use their sm8475 (Lucid OLE) variants. The RPMh
+rails are pinned to the stock tree's boot voltages; several differ from the
+SM8450 QRD. UFS uses the sm8475 UFS PHY at Cape's address. The Adreno 730
+renders through Turnip with the HDK zap shader. The panel is dual-DSI
+(bonded, DSI1 on DSI0's PLL), for the ayaneo,pocket-vert-panel driver.
+USB host and USB 3 and the remoteprocs come later.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/arch/arm64/boot/dts/qcom/Makefile
++++ b/arch/arm64/boot/dts/qcom/Makefile
+@@ -381,6 +381,7 @@
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8450-samsung-r0q.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8450-sony-xperia-nagara-pdx223.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8450-sony-xperia-nagara-pdx224.dtb
++dtb-$(CONFIG_ARCH_QCOM)	+= sm8475-ayaneo-pocket-vert.dtb
+ 
+ sm8550-hdk-display-card-dtbs	:= sm8550-hdk.dtb sm8550-hdk-display-card.dtbo
+ sm8550-hdk-display-card-rear-camera-card-dtbs	:= sm8550-hdk.dtb sm8550-hdk-display-card.dtbo sm8550-hdk-rear-camera-card.dtbo
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8475-ayaneo-pocket-vert.dts
+@@ -0,0 +1,1121 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/*
++ * AYANEO Pocket VERT: Snapdragon 8+ Gen 1 (SM8475P, soc_id 531), built on
++ * Qualcomm's Cape QRD ("Cape QRD Bubble evt", board-id 0x1000b), AR13 panel.
++ */
++
++/dts-v1/;
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
++#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
++#include "sm8450.dtsi"
++#include "pm8350.dtsi"
++#include "pm8350b.dtsi"
++#include "pm8350c.dtsi"
++#include "pm8450.dtsi"
++#include "pmk8350.dtsi"
++#include "pmr735a.dtsi"
++/* No pmr735b.dtsi: nothing answers at SPMI SID 5 on this board. */
++
++/ {
++	model = "AYANEO Pocket VERT";
++	compatible = "ayaneo,pocket-vert", "qcom,sm8450";
++	chassis-type = "handset";
++
++	qcom,msm-id = <531 0x10000>;
++	qcom,board-id = <0x1000b 0>;
++
++	chosen {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/* XBL's splash; OpenABL keeps it scanned out (see splash_region). */
++		framebuffer@b8000000 {
++			compatible = "simple-framebuffer";
++			reg = <0x0 0xb8000000 0x0 (1440 * 1600 * 4)>;
++			width = <1440>;
++			height = <1600>;
++			stride = <(1440 * 4)>;
++			format = "a8r8g8b8";
++			/*
++			 * Keeps XBL's scanout powered and fetching until msm takes over: rpmhpd
++			 * drops every unclaimed rail at sync_state, and clk_disable_unused gates
++			 * the MDP's memory port.
++			 */
++			clocks = <&gcc GCC_DISP_HF_AXI_CLK>;
++			power-domains = <&rpmhpd RPMHPD_MMCX>;
++			required-opps = <&rpmhpd_opp_nom>;
++		};
++	};
++
++	gpio-keys {
++		compatible = "gpio-keys";
++
++		key-volume-up {
++			label = "Volume Up";
++			gpios = <&pm8350_gpios 6 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_VOLUMEUP>;
++			debounce-interval = <15>;
++			linux,can-disable;
++			wakeup-source;
++		};
++	};
++
++	/*
++	 * The stock pwm-fan: PM8350C LPG channel 3 at 20 kHz out of PMIC GPIO 9,
++	 * tach on TLMM 55. handheld-powerd drives it through hwmon.
++	 */
++	fan {
++		compatible = "pwm-fan";
++		interrupts-extended = <&tlmm 55 IRQ_TYPE_EDGE_FALLING>;
++		pwms = <&pm8350c_pwm 3 50000>;
++		fan-supply = <&vreg_fan_pwr>;
++		#cooling-cells = <2>;
++		cooling-levels = <0 64 128 255>;
++		pinctrl-0 = <&fan_pwm_default>;
++		pinctrl-names = "default";
++	};
++
++	/*
++	 * Battery and charging through the ADSP's charger_pd (stock
++	 * qcom,pmic_glink: PMIC_RTR_ADSP_APPS, "msm/adsp/charger_pd"), which also
++	 * runs the port: UCSI switches dwc3's role, and DisplayPort alt mode
++	 * (stock qcom,altmode-glink) sets the QMP PHY and the redriver.
++	 */
++	pmic-glink {
++		compatible = "qcom,sm8450-pmic-glink", "qcom,pmic-glink";
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		connector@0 {
++			compatible = "usb-c-connector";
++			reg = <0>;
++			power-role = "dual";
++			data-role = "dual";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++
++					pmic_glink_hs_in: endpoint {
++						remote-endpoint = <&usb_1_dwc3_hs>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++
++					pmic_glink_ss_in: endpoint {
++						remote-endpoint = <&redriver_ss_out>;
++					};
++				};
++
++				port@2 {
++					reg = <2>;
++
++					pmic_glink_sbu: endpoint {
++						remote-endpoint = <&redriver_sbu>;
++					};
++				};
++			};
++		};
++	};
++
++	/*
++	 * Speakers: two AW88261 (Android's aw882xx) on the LPASS VA domain's
++	 * primary MI2S, over the LPI i2s1 pins. The topology
++	 * (qcom/sm8450/AYANEO-Pocket-VERT-tplg.bin) routes MultiMedia to
++	 * LPI_MI2S_RX_0; 1.536 MHz is 48 kHz x 16 bit x 2. The bit clock is
++	 * PRI_MI2S_IBIT: the DSP grants no INT0-6 MI2S or QAIF clock.
++	 */
++	sound {
++		compatible = "qcom,sm8450-sndcard";
++		model = "AYANEO-Pocket-VERT";
++
++		pinctrl-0 = <&lpi_i2s1_default>;
++		pinctrl-names = "default";
++
++		clocks = <&q6prmcc LPASS_CLK_ID_PRI_MI2S_IBIT LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
++		clock-names = "i2s_clk";
++		assigned-clocks = <&q6prmcc LPASS_CLK_ID_PRI_MI2S_IBIT LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
++		assigned-clock-rates = <1536000>;
++
++		spk-i2s-dai-link {
++			link-name = "Speaker Playback";
++
++			cpu {
++				sound-dai = <&q6apmbedai LPI_MI2S_RX_0>;
++			};
++
++			codec {
++				sound-dai = <&spk_amp_l>, <&spk_amp_r>;
++			};
++
++			platform {
++				sound-dai = <&q6apm>;
++			};
++		};
++	};
++
++	/* The stock fan's pwren-gpios, and its "bubble_fan_vdd" pin held high. */
++	vreg_fan_pwr: regulator-fan-pwr {
++		compatible = "regulator-fixed";
++		regulator-name = "fan_pwr";
++		gpios = <&tlmm 53 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		vin-supply = <&vreg_fan_vdd>;
++	};
++
++	vreg_fan_vdd: regulator-fan-vdd {
++		compatible = "regulator-fixed";
++		regulator-name = "fan_vdd";
++		gpios = <&tlmm 52 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++	/*
++	 * WCN6855 (Android's qca6490) Wi-Fi/BT, wired as on the SM8450 HDK and
++	 * the QRD it comes from: same enable, swctrl and XO pins. The rails are
++	 * the stock cnss node's, pinned at its voltages (see &apps_rsc).
++	 */
++	wcn6855-pmu {
++		compatible = "qcom,wcn6855-pmu";
++
++		pinctrl-0 = <&bt_en>, <&wlan_en>, <&xo_clk_default>;
++		pinctrl-names = "default";
++
++		wlan-enable-gpios = <&tlmm 80 GPIO_ACTIVE_HIGH>;
++		bt-enable-gpios = <&tlmm 81 GPIO_ACTIVE_HIGH>;
++		swctrl-gpios = <&tlmm 82 GPIO_ACTIVE_HIGH>;
++		xo-clk-gpios = <&tlmm 204 GPIO_ACTIVE_HIGH>;
++
++		vddio-supply = <&vreg_s10b_1p8>;
++		vddaon-supply = <&vreg_s11b_0p968>;
++		vddpmu-supply = <&vreg_s12b_1p352>;
++		vddpmumx-supply = <&vreg_s2e_1p012>;
++		vddpmucx-supply = <&vreg_s11b_0p968>;
++		vddrfa0p95-supply = <&vreg_s11b_0p968>;
++		vddrfa1p3-supply = <&vreg_s12b_1p352>;
++		vddrfa1p9-supply = <&vreg_s1c_1p904>;
++		vddpcie1p3-supply = <&vreg_s12b_1p352>;
++		vddpcie1p9-supply = <&vreg_s1c_1p904>;
++
++		regulators {
++			vreg_pmu_rfa_cmn_0p8: ldo0 {
++				regulator-name = "vreg_pmu_rfa_cmn_0p8";
++			};
++
++			vreg_pmu_aon_0p8: ldo1 {
++				regulator-name = "vreg_pmu_aon_0p8";
++			};
++
++			vreg_pmu_wlcx_0p8: ldo2 {
++				regulator-name = "vreg_pmu_wlcx_0p8";
++			};
++
++			vreg_pmu_wlmx_0p8: ldo3 {
++				regulator-name = "vreg_pmu_wlmx_0p8";
++			};
++
++			vreg_pmu_btcmx_0p8: ldo4 {
++				regulator-name = "vreg_pmu_btcmx_0p8";
++			};
++
++			vreg_pmu_pcie_1p8: ldo5 {
++				regulator-name = "vreg_pmu_pcie_1p8";
++			};
++
++			vreg_pmu_pcie_0p9: ldo6 {
++				regulator-name = "vreg_pmu_pcie_0p9";
++			};
++
++			vreg_pmu_rfa_0p8: ldo7 {
++				regulator-name = "vreg_pmu_rfa_0p8";
++			};
++
++			vreg_pmu_rfa_1p2: ldo8 {
++				regulator-name = "vreg_pmu_rfa_1p2";
++			};
++
++			vreg_pmu_rfa_1p7: ldo9 {
++				regulator-name = "vreg_pmu_rfa_1p7";
++			};
++		};
++	};
++
++	/*
++	 * The PCIe1 USB host's rails: the stock tree drives these pins high in
++	 * pcie1's pinctrl ("usb-hub-pwr1v05", "-vdd3v3", "-add3v3"), the same
++	 * three a uPD720201 takes on the Pocket S2. The delay is PCIe's 100 ms
++	 * of stable power before PERST# is released, which host_init does
++	 * right after powering them.
++	 */
++	upd720201_avdd33_reg: regulator-upd720201-avdd33 {
++		compatible = "regulator-fixed";
++		regulator-name = "upd720201_avdd33";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		gpios = <&tlmm 90 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100000>;
++	};
++
++	upd720201_vdd10_reg: regulator-upd720201-vdd10 {
++		compatible = "regulator-fixed";
++		regulator-name = "upd720201_vdd10";
++		regulator-min-microvolt = <1050000>;
++		regulator-max-microvolt = <1050000>;
++		gpios = <&tlmm 58 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100000>;
++	};
++
++	upd720201_vdd33_reg: regulator-upd720201-vdd33 {
++		compatible = "regulator-fixed";
++		regulator-name = "upd720201_vdd33";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		gpios = <&tlmm 54 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100000>;
++	};
++
++	/*
++	 * The stock pcie1 node's qcom,ep-gpio: the endpoint enable msm_pcie
++	 * raises before releasing PERST#, the rails above being on since probe.
++	 * Fed from vdd33 so it rises after the chip's power.
++	 */
++	upd720201_ep_reg: regulator-upd720201-ep {
++		compatible = "regulator-fixed";
++		regulator-name = "upd720201_ep";
++		gpios = <&tlmm 56 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100000>;
++		vin-supply = <&upd720201_vdd33_reg>;
++	};
++};
++
++&reserved_memory {
++	/* OpenABL finds this by name and points it at XBL's framebuffer. */
++	splash_region: splash_region@b8000000 {
++		reg = <0x0 0xb8000000 0x0 0x2b00000>;
++		no-map;
++	};
++};
++
++/*
++ * Cape's PLLs are Lucid OLE, not Waipio's Lucid EVO: the sm8475 compatibles
++ * select the OLE PLL register layout in the same drivers.
++ */
++&apps_rsc {
++	/*
++	 * Every stock RPMh VRM rail that has a boot voltage, pinned to it
++	 * (qcom,init-voltage): the core sets an unreadable RPMh regulator to the
++	 * bottom of its range at registration, so a stock range would drop a rail.
++	 * Widen one only together with the consumer that needs it. Rails with no
++	 * stock boot voltage, or one off the upstream step tables, are left out.
++	 */
++	regulators-0 {
++		compatible = "qcom,pm8350-rpmh-regulators";
++		qcom,pmic-id = "b";
++
++		vreg_s10b_1p8: smps10 {
++			regulator-name = "vreg_s10b_1p8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-always-on;
++		};
++
++		vreg_s11b_0p968: smps11 {
++			regulator-name = "vreg_s11b_0p968";
++			regulator-min-microvolt = <968000>;
++			regulator-max-microvolt = <968000>;
++		};
++
++		vreg_s12b_1p352: smps12 {
++			regulator-name = "vreg_s12b_1p352";
++			regulator-min-microvolt = <1352000>;
++			regulator-max-microvolt = <1352000>;
++		};
++
++		vreg_l1b_0p912: ldo1 {
++			regulator-name = "vreg_l1b_0p912";
++			regulator-min-microvolt = <912000>;
++			regulator-max-microvolt = <912000>;
++		};
++
++		vreg_l2b_3p072: ldo2 {
++			regulator-name = "vreg_l2b_3p072";
++			regulator-min-microvolt = <3072000>;
++			regulator-max-microvolt = <3072000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		vreg_l3b_0p904: ldo3 {
++			regulator-name = "vreg_l3b_0p904";
++			regulator-min-microvolt = <904000>;
++			regulator-max-microvolt = <904000>;
++		};
++
++		vreg_l5b_0p88: ldo5 {
++			regulator-name = "vreg_l5b_0p88";
++			regulator-min-microvolt = <880000>;
++			regulator-max-microvolt = <880000>;
++		};
++
++		vreg_l6b_1p2: ldo6 {
++			regulator-name = "vreg_l6b_1p2";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++		};
++
++		vreg_l7b_2p504: ldo7 {
++			regulator-name = "vreg_l7b_2p504";
++			regulator-min-microvolt = <2504000>;
++			regulator-max-microvolt = <2504000>;
++		};
++
++		vreg_l9b_1p2: ldo9 {
++			regulator-name = "vreg_l9b_1p2";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++		};
++	};
++
++	regulators-1 {
++		compatible = "qcom,pm8350c-rpmh-regulators";
++		qcom,pmic-id = "c";
++
++		vreg_s1c_1p904: smps1 {
++			regulator-name = "vreg_s1c_1p904";
++			regulator-min-microvolt = <1904000>;
++			regulator-max-microvolt = <1904000>;
++		};
++
++		vreg_s10c_1p052: smps10 {
++			regulator-name = "vreg_s10c_1p052";
++			regulator-min-microvolt = <1052000>;
++			regulator-max-microvolt = <1052000>;
++		};
++
++		vreg_l2c_1p8: ldo2 {
++			regulator-name = "vreg_l2c_1p8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-always-on;
++		};
++
++		vreg_l3c_3p304: ldo3 {
++			regulator-name = "vreg_l3c_3p304";
++			regulator-min-microvolt = <3304000>;
++			regulator-max-microvolt = <3304000>;
++		};
++
++		vreg_l6c_2p96: ldo6 {
++			regulator-name = "vreg_l6c_2p96";
++			regulator-min-microvolt = <2960000>;
++			regulator-max-microvolt = <2960000>;
++		};
++
++		vreg_l7c_3: ldo7 {
++			regulator-name = "vreg_l7c_3";
++			regulator-min-microvolt = <3000000>;
++			regulator-max-microvolt = <3000000>;
++		};
++
++		vreg_l8c_1p8: ldo8 {
++			regulator-name = "vreg_l8c_1p8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++		};
++
++		vreg_l9c_2p96: ldo9 {
++			regulator-name = "vreg_l9c_2p96";
++			regulator-min-microvolt = <2960000>;
++			regulator-max-microvolt = <2960000>;
++		};
++
++		vreg_l10c_1p2: ldo10 {
++			regulator-name = "vreg_l10c_1p2";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++		};
++
++		vreg_l12c_1p8: ldo12 {
++			regulator-name = "vreg_l12c_1p8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++		};
++	};
++
++	regulators-2 {
++		compatible = "qcom,pm8350b-rpmh-regulators";
++		qcom,pmic-id = "d";
++
++		vreg_l1d_1p2: ldo1 {
++			regulator-name = "vreg_l1d_1p2";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++		};
++	};
++
++	regulators-3 {
++		compatible = "qcom,pmr735a-rpmh-regulators";
++		qcom,pmic-id = "e";
++
++		vreg_s2e_1p012: smps2 {
++			regulator-name = "vreg_s2e_1p012";
++			regulator-min-microvolt = <1012000>;
++			regulator-max-microvolt = <1012000>;
++		};
++
++		vreg_l3e_1p2: ldo3 {
++			regulator-name = "vreg_l3e_1p2";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++		};
++
++		vreg_l4e_1p776: ldo4 {
++			regulator-name = "vreg_l4e_1p776";
++			regulator-min-microvolt = <1776000>;
++			regulator-max-microvolt = <1776000>;
++		};
++
++		vreg_l5e_0p88: ldo5 {
++			regulator-name = "vreg_l5e_0p88";
++			regulator-min-microvolt = <880000>;
++			regulator-max-microvolt = <880000>;
++		};
++
++		vreg_l6e_1p2: ldo6 {
++			regulator-name = "vreg_l6e_1p2";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++		};
++
++		vreg_l7e_2p8: ldo7 {
++			regulator-name = "vreg_l7e_2p8";
++			regulator-min-microvolt = <2800000>;
++			regulator-max-microvolt = <2800000>;
++			regulator-always-on;
++		};
++	};
++
++	regulators-4 {
++		compatible = "qcom,pm8450-rpmh-regulators";
++		qcom,pmic-id = "h";
++
++		vreg_s3h_0p504: smps3 {
++			regulator-name = "vreg_s3h_0p504";
++			regulator-min-microvolt = <504000>;
++			regulator-max-microvolt = <504000>;
++		};
++
++		vreg_l2h_0p88: ldo2 {
++			regulator-name = "vreg_l2h_0p88";
++			regulator-min-microvolt = <880000>;
++			regulator-max-microvolt = <880000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++&camcc {
++	compatible = "qcom,sm8475-camcc";
++};
++
++/*
++ * No QCE driver in this kernel: the engine never probes, and fw_devlink
++ * would hold its interconnect path (aggre2_noc, mc_virt) out of sync_state
++ * at the boot-time INT_MAX vote, keeping the SoC out of CX collapse.
++ */
++&crypto {
++	status = "disabled";
++};
++
++&dispcc {
++	compatible = "qcom,sm8475-dispcc";
++};
++
++&gcc {
++	compatible = "qcom,sm8475-gcc";
++};
++
++&gpucc {
++	compatible = "qcom,sm8475-gpucc";
++};
++
++&videocc {
++	compatible = "qcom,sm8475-videocc";
++};
++
++&gpu {
++	/*
++	 * Adreno 730 (stock: Adreno730v3, chip id 0x07030002, up to 900 MHz).
++	 * Upstream knows only 0x07030001 as A730, so the compatible stays
++	 * 730.1 and the frequency table SM8450's (up to 818 MHz).
++	 */
++	status = "okay";
++};
++
++&gpu_zap_shader {
++	/* Qualcomm's HDK zap from linux-firmware; AYANEO's is in the vendor partition. */
++	firmware-name = "qcom/sm8450/a730_zap.mbn";
++};
++
++&i2c1 {
++	status = "okay";
++
++	/* No reset line in the stock tree; its interrupts (TLMM 6, 10) go unused. */
++	spk_amp_l: amplifier@34 {
++		compatible = "awinic,aw88261";
++		reg = <0x34>;
++		#sound-dai-cells = <0>;
++		awinic,audio-channel = <0>;
++		awinic,sync-flag;
++		firmware-name = "qcom/sm8475/ayaneo/pocket-vert/aw88261_acf.bin";
++		sound-name-prefix = "SPK_L";
++	};
++
++	spk_amp_r: amplifier@35 {
++		compatible = "awinic,aw88261";
++		reg = <0x35>;
++		#sound-dai-cells = <0>;
++		awinic,audio-channel = <1>;
++		awinic,sync-flag;
++		firmware-name = "qcom/sm8475/ayaneo/pocket-vert/aw88261_acf.bin";
++		sound-name-prefix = "SPK_R";
++	};
++};
++
++&i2c12 {
++	status = "okay";
++
++	/*
++	 * Panel bias. Write-only: reads NACK. The stock driver writes 0x0c
++	 * (5.2 V) to both rails; which of TLMM 35 ("l") and 34 ("r") is
++	 * ENP is a guess from the order the stock tree lists them.
++	 */
++	regulator@3e {
++		compatible = "sgmicro,sgm3804";
++		reg = <0x3e>;
++
++		vreg_lcd_avdd: pos {
++			regulator-name = "lcd_avdd";
++			regulator-min-microvolt = <5200000>;
++			regulator-max-microvolt = <5200000>;
++			enable-gpios = <&tlmm 35 GPIO_ACTIVE_HIGH>;
++		};
++
++		vreg_lcd_avee: neg {
++			regulator-name = "lcd_avee";
++			regulator-min-microvolt = <5200000>;
++			regulator-max-microvolt = <5200000>;
++			enable-gpios = <&tlmm 34 GPIO_ACTIVE_HIGH>;
++		};
++	};
++
++	/* No enable pin in the stock tree. */
++	backlight: backlight@2e {
++		compatible = "silergy,sy7758";
++		reg = <0x2e>;
++	};
++};
++
++&i2c4 {
++	status = "okay";
++
++	/*
++	 * Goodix GT911 (Android's gt9xx driver). Its config (the stock
++	 * goodix,cfg-group0, which Android writes at every boot and goodix.c
++	 * only from a goodix_911_cfg.bin) reports 1600x1440 as held; inverting
++	 * x and swapping turns that into the panel's native 1440x1600, which
++	 * gamescope rotates with the display ("Left Side Up").
++	 */
++	touchscreen@5d {
++		compatible = "goodix,gt911";
++		reg = <0x5d>;
++		interrupts-extended = <&tlmm 21 IRQ_TYPE_EDGE_FALLING>;
++		irq-gpios = <&tlmm 21 GPIO_ACTIVE_HIGH>;
++		reset-gpios = <&tlmm 20 GPIO_ACTIVE_HIGH>;
++		AVDD28-supply = <&vreg_l3c_3p304>;
++		touchscreen-inverted-x;
++		touchscreen-swapped-x-y;
++		pinctrl-0 = <&ts_int_default>, <&ts_reset_default>;
++		pinctrl-names = "default";
++	};
++};
++
++&i2c5 {
++	status = "okay";
++
++	/*
++	 * The stock tree's nxp,eusb2-repeater. ptn3222 only powers it and
++	 * releases reset, which is all it needs to pass eUSB2 through; without
++	 * it USB worked only when the ABL's fastboot had brought it up.
++	 */
++	eusb2_repeater: redriver@6f {
++		compatible = "nxp,ptn3222";
++		reg = <0x6f>;
++		reset-gpios = <&pm8350c_gpios 7 GPIO_ACTIVE_LOW>;
++		vdd1v8-supply = <&vreg_s10b_1p8>;
++		vdd3v3-supply = <&vreg_l2b_3p072>;
++		pinctrl-0 = <&eusb2_reset_n>;
++		pinctrl-names = "default";
++		#phy-cells = <0>;
++	};
++
++	/*
++	 * The stock tree's onnn,redriver, its DP AUX switch too (qcom,dp-aux-switch):
++	 * no FSA4480 (the stock one is disabled), so the SBU lines go through here.
++	 * Its gpio91 is the QMP PHY's port select, muxed to usb_phy as in stock.
++	 */
++	typec-mux@1c {
++		compatible = "onnn,nb7vpq904m";
++		reg = <0x1c>;
++
++		vcc-supply = <&vreg_s10b_1p8>;
++
++		pinctrl-0 = <&usb3_portsel>;
++		pinctrl-names = "default";
++
++		retimer-switch;
++		orientation-switch;
++
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			port@0 {
++				reg = <0>;
++
++				redriver_ss_out: endpoint {
++					remote-endpoint = <&pmic_glink_ss_in>;
++				};
++			};
++
++			port@1 {
++				reg = <1>;
++
++				redriver_ss_in: endpoint {
++					remote-endpoint = <&usb_1_qmpphy_out>;
++				};
++			};
++
++			port@2 {
++				reg = <2>;
++
++				redriver_sbu: endpoint {
++					remote-endpoint = <&pmic_glink_sbu>;
++				};
++			};
++		};
++	};
++};
++
++&pm8350c_gpios {
++	eusb2_reset_n: eusb2-reset-n-state {
++		pins = "gpio7";
++		function = "normal";
++		power-source = <1>;
++		bias-disable;
++	};
++
++	/*
++	 * The LPG output, not inverted: measured, PWM 255 stops the fan with
++	 * output-high (which on these pins is the invert bit). The stock tree's
++	 * qcom,invert does not mean the same here.
++	 */
++	fan_pwm_default: fan-pwm-default-state {
++		pins = "gpio9";
++		function = "func1";
++		output-low;
++		bias-disable;
++		power-source = <1>;
++		qcom,drive-strength = <PMIC_GPIO_STRENGTH_LOW>;
++	};
++};
++
++&pm8350c_pwm {
++	status = "okay";
++};
++
++&lpass_tlmm {
++	/* As the stock lpi_i2s1 active state. */
++	lpi_i2s1_default: lpi-i2s1-default-state {
++		clk-pins {
++			pins = "gpio6";
++			function = "i2s1_clk";
++			drive-strength = <8>;
++			bias-disable;
++			output-high;
++		};
++
++		ws-pins {
++			pins = "gpio7";
++			function = "i2s1_ws";
++			drive-strength = <8>;
++			bias-disable;
++			output-high;
++		};
++
++		data-pins {
++			pins = "gpio8", "gpio9";
++			function = "i2s1_data";
++			drive-strength = <8>;
++			bias-disable;
++		};
++	};
++};
++
++&mdss {
++	status = "okay";
++};
++
++&mdss_dsi0 {
++	/* Stock: dsi-ctrl-hw-v2.6, vdda-1p2 on L10C (QRD: L6B). */
++	vdda-supply = <&vreg_l10c_1p2>;
++	qcom,dual-dsi-mode;
++	qcom,master-dsi;
++	qcom,sync-dual-dsi;
++	status = "okay";
++
++	panel@0 {
++		compatible = "ayaneo,pocket-vert-panel";
++		reg = <0>;
++		reset-gpios = <&tlmm 0 GPIO_ACTIVE_LOW>;
++		vddio-supply = <&vreg_l12c_1p8>;
++		avdd-supply = <&vreg_lcd_avdd>;
++		avee-supply = <&vreg_lcd_avee>;
++		backlight = <&backlight>;
++		/*
++		 * Mounted sideways: 1440x1600 native, 1600x1440 as held, the native left
++		 * edge at the top. The stock "180" is AYANEO's flip under Android's own
++		 * rotation.
++		 */
++		rotation = <270>;
++
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			port@0 {
++				reg = <0>;
++				panel_in_0: endpoint {
++					remote-endpoint = <&mdss_dsi0_out>;
++				};
++			};
++
++			port@1 {
++				reg = <1>;
++				panel_in_1: endpoint {
++					remote-endpoint = <&mdss_dsi1_out>;
++				};
++			};
++		};
++	};
++};
++
++&mdss_dsi0_out {
++	data-lanes = <0 1 2 3>;
++	remote-endpoint = <&panel_in_0>;
++};
++
++&mdss_dsi0_phy {
++	/* Stock: dsi-phy-v4.3.2, vdda-0p9 on L5B. */
++	vdds-supply = <&vreg_l5b_0p88>;
++	status = "okay";
++};
++
++&mdss_dsi1 {
++	vdda-supply = <&vreg_l10c_1p2>;
++	qcom,dual-dsi-mode;
++	qcom,sync-dual-dsi;
++	/* DSI1 is the slave, clocked from DSI0's PLL. */
++	assigned-clock-parents = <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
++				 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>;
++	status = "okay";
++};
++
++&mdss_dsi1_out {
++	data-lanes = <0 1 2 3>;
++	remote-endpoint = <&panel_in_1>;
++};
++
++&mdss_dsi1_phy {
++	vdds-supply = <&vreg_l5b_0p88>;
++	status = "okay";
++};
++
++&pcie0 {
++	max-link-speed = <2>;
++	status = "okay";
++};
++
++&pcie0_phy {
++	/* Stock's sequence is exactly upstream's SM8475 gen3x1 tables. */
++	compatible = "qcom,sm8475-qmp-gen3x1-pcie-phy";
++	/* Stock runs the rate-change clock at 19.2 MHz, not sm8450.dtsi's 100 MHz. */
++	assigned-clock-rates = <19200000>;
++	vdda-phy-supply = <&vreg_l5b_0p88>;
++	vdda-pll-supply = <&vreg_l10c_1p2>;
++	status = "okay";
++};
++
++&pcieport0 {
++	wifi@0 {
++		compatible = "pci17cb,1103";
++		reg = <0x10000 0x0 0x0 0x0 0x0>;
++
++		/*
++		 * The OTP has no board ID (0xff), and board-2.bin's generic BDF for that
++		 * is 2.4 GHz only: the image adds the ThinkPad X13s's BDF (LE_X13S) to
++		 * board-2.bin under this variant.
++		 */
++		qcom,calibration-variant = "AYANEO_Pocket_VERT";
++
++		vddrfacmn-supply = <&vreg_pmu_rfa_cmn_0p8>;
++		vddaon-supply = <&vreg_pmu_aon_0p8>;
++		vddwlcx-supply = <&vreg_pmu_wlcx_0p8>;
++		vddwlmx-supply = <&vreg_pmu_wlmx_0p8>;
++		vddpcie1p8-supply = <&vreg_pmu_pcie_1p8>;
++		vddpcie0p9-supply = <&vreg_pmu_pcie_0p9>;
++		vddrfa0p8-supply = <&vreg_pmu_rfa_0p8>;
++		vddrfa1p2-supply = <&vreg_pmu_rfa_1p2>;
++		vddrfa1p8-supply = <&vreg_pmu_rfa_1p7>;
++	};
++};
++
++&pcie1 {
++	/* The uPD720201 is a PCIe 2.0 x1 device. */
++	num-lanes = <1>;
++	status = "okay";
++
++	pcie@0 {
++		/* The Pocket S2's ID; the chip on this board is not identified yet. */
++		usb-controller@0 {
++			compatible = "pci1912,0014";
++			reg = <0x10000 0x0 0x0 0x0 0x0>;
++
++			avdd33-supply = <&upd720201_avdd33_reg>;
++			vdd10-supply = <&upd720201_vdd10_reg>;
++			vdd33-supply = <&upd720201_vdd33_reg>;
++			/* Not in the binding: the pwrctrl driver enables every supply. */
++			ep-supply = <&upd720201_ep_reg>;
++		};
++	};
++};
++
++&pcie1_phy {
++	/*
++	 * Not SM8450's gen4x2: the stock sequence is upstream's SM8475 gen3x1
++	 * tables written to both lanes of a v5-layout PHY.
++	 * shortcut: driven as that one-lane PHY, enough for the x1 uPD720201;
++	 * add a gen3x2 config if a two-lane device ever needs it.
++	 */
++	compatible = "qcom,sm8475-qmp-gen3x1-pcie-phy";
++	/* Stock runs the rate-change clock at 19.2 MHz, not sm8450.dtsi's 100 MHz. */
++	assigned-clock-rates = <19200000>;
++	vdda-phy-supply = <&vreg_l2h_0p88>;
++	vdda-pll-supply = <&vreg_l10c_1p2>;
++	status = "okay";
++};
++
++&pmk8350_vadc {
++	/* No channels described yet. */
++	status = "disabled";
++};
++
++&pon_pwrkey {
++	status = "okay";
++};
++
++&pon_resin {
++	linux,code = <KEY_VOLUMEDOWN>;
++	status = "okay";
++};
++
++&remoteproc_adsp {
++	/* AYANEO's, from modem_a (image/adsp.mdt and its .bNN segments). */
++	firmware-name = "qcom/sm8475/ayaneo/pocket-vert/adsp.mdt";
++	status = "okay";
++};
++
++&qupv3_id_0 {
++	status = "okay";
++};
++
++&qupv3_id_1 {
++	status = "okay";
++};
++
++&sdhc_2 {
++	/*
++	 * shortcut: non-removable and 3.3 V only (no vmmc/vqmmc); add cd-gpios
++	 * <&tlmm 92 GPIO_ACTIVE_LOW> and the l9c/l6c supplies from the stock tree
++	 * once the rails are described.
++	 */
++	pinctrl-names = "default", "sleep";
++	pinctrl-0 = <&sdc2_default_state>;
++	pinctrl-1 = <&sdc2_sleep_state>;
++	non-removable;
++	no-1-8-v;
++	no-sdio;
++	no-mmc;
++	status = "okay";
++};
++
++&ufs_mem_hc {
++	/* As the stock tree; its vdd-hba is the UFS GDSC, which power-domains covers. */
++	reset-gpios = <&tlmm 210 GPIO_ACTIVE_LOW>;
++	vcc-supply = <&vreg_l7b_2p504>;
++	vcc-max-microamp = <1100000>;
++	vccq-supply = <&vreg_l9b_1p2>;
++	vccq-max-microamp = <1200000>;
++	status = "okay";
++};
++
++&ufs_mem_phy {
++	/*
++	 * Cape's UFS PHY is not Waipio's: sm8475 tables in SM8550's v6 register
++	 * layout, at 0x1d80000 (stock: qcom,ufs-phy-qmp-v4-cape). The supplies
++	 * are shared with the eUSB2 PHY, which declares them too.
++	 */
++	compatible = "qcom,sm8475-qmp-ufs-phy";
++	reg = <0 0x01d80000 0 0x2000>;
++	vdda-phy-supply = <&vreg_l5b_0p88>;
++	vdda-pll-supply = <&vreg_l10c_1p2>;
++	status = "okay";
++};
++
++&usb_1 {
++	dr_mode = "otg";
++	status = "okay";
++};
++
++&usb_1_dwc3_hs {
++	remote-endpoint = <&pmic_glink_hs_in>;
++};
++
++/*
++ * The stock tree's usb_qmp_dp_phy: vdd L1B, core L10C. Cape's, not Waipio's:
++ * the stock init sequence writes the lanes at 0x1200-0x19ff (v6 layout).
++ */
++&usb_1_qmpphy {
++	compatible = "qcom,sm8475-qmp-usb3-dp-phy";
++	vdda-phy-supply = <&vreg_l1b_0p912>;
++	vdda-pll-supply = <&vreg_l10c_1p2>;
++	status = "okay";
++};
++
++&usb_1_qmpphy_out {
++	remote-endpoint = <&redriver_ss_in>;
++};
++
++/*
++ * Not working yet: DP alt mode negotiates and the redriver and PHY switch,
++ * but every AUX transfer to the sink times out (-110).
++ */
++&mdss_dp0 {
++	status = "okay";
++};
++
++&mdss_dp0_out {
++	data-lanes = <0 1>;
++};
++
++&usb_1_hsphy {
++	/*
++	 * Cape has SM8550's eUSB2 PHY here, not SM8450's femto PHY (stock tree:
++	 * qcom,usb-snps-eusb2-phy), behind an NXP eUSB2 repeater on i2c5.
++	 */
++	compatible = "qcom,sm8550-snps-eusb2-phy";
++	phys = <&eusb2_repeater>;
++	/* Shared with the UFS PHY: declared so UFS suspend cannot switch them off. */
++	vdd-supply = <&vreg_l5b_0p88>;
++	vdda12-supply = <&vreg_l10c_1p2>;
++	status = "okay";
++};
++
++&tlmm {
++	/* TrustZone's, as the stock tree's qcom,gpios-reserved; reading one resets the SoC. */
++	gpio-reserved-ranges = <28 4>, <36 4>;
++
++	usb3_portsel: usb3-portsel-state {
++		pins = "gpio91";
++		function = "usb_phy";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	bt_en: bt-en-state {
++		pins = "gpio81";
++		function = "gpio";
++		drive-strength = <16>;
++		output-low;
++		bias-pull-down;
++	};
++
++	wlan_en: wlan-en-state {
++		pins = "gpio80";
++		function = "gpio";
++		drive-strength = <16>;
++		output-low;
++		bias-pull-down;
++	};
++
++	xo_clk_default: xo-clk-state {
++		pins = "gpio204";
++		function = "gpio";
++		drive-strength = <16>;
++		output-low;
++		bias-pull-down;
++	};
++
++	/* Not the TLMM's default pull-down, under which INT never rises. */
++	ts_int_default: ts-int-default-state {
++		pins = "gpio21";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	ts_reset_default: ts-reset-default-state {
++		pins = "gpio20";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	/*
++	 * Driven high by the stock battery charger's default pinctrl
++	 * ("bubble_usb5v_out", "bubble_ltepwr", "bubble_lte5v": QRD names). What
++	 * they switch is unknown; held high as stock holds them.
++	 */
++	usb5v-out-hog {
++		gpio-hog;
++		gpios = <68 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "usb5v-out";
++	};
++
++	lte-pwr-hog {
++		gpio-hog;
++		gpios = <125 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "ltepwr";
++	};
++
++	lte-5v-hog {
++		gpio-hog;
++		gpios = <129 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "lte5v";
++	};
++};

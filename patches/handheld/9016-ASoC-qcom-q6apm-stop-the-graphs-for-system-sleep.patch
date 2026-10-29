@@ -1,0 +1,90 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] ASoC: qcom: q6apm: stop the graphs for system sleep
+
+The front and back end DAIs take TRIGGER_SUSPEND as a no-op, so a stream
+suspended for system sleep leaves its graphs running in the DSP. On the
+AYANEO Pocket VERT the ADSP then slept for 9 to 16 of 85 to 115 seconds
+of s2idle, and the SoC never reached AOSS sleep or CX collapse. With both
+graphs stopped it spent 435.8 of 440 seconds in both; stopping either one
+alone was not enough.
+
+Stop the graphs on TRIGGER_SUSPEND and drop SNDRV_PCM_INFO_RESUME, so that
+userspace prepares the stream again after resume: both prepare paths
+already stop, configure and start a graph, and q6apm_graph_stop() is a
+no-op on a stopped graph.
+
+A stream prepared again kept the hardware pointer of its last run until
+the DSP returned the first buffer, which ALSA read as a jump and then a
+wrap; PipeWire's recovery after resume ran into an xrun every time. Reset
+it with the buffer index when the fragments are set up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -283,6 +283,8 @@
+ 	mutex_lock(&graph->lock);
+ 
+ 	data->dsp_buf = 0;
++	/* a stream prepared again starts from period 0, not where the DSP left off */
++	atomic_set(&data->hw_ptr, 0);
+ 
+ 	if (data->buf) {
+ 		mutex_unlock(&graph->lock);
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -90,7 +90,7 @@
+ static const struct snd_pcm_hardware q6apm_dai_hardware_capture = {
+ 	.info =                 (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_BLOCK_TRANSFER |
+ 				 SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_INTERLEAVED |
+-				 SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME |
++				 SNDRV_PCM_INFO_PAUSE |
+ 				 SNDRV_PCM_INFO_NO_REWINDS | SNDRV_PCM_INFO_SYNC_APPLPTR |
+ 				 SNDRV_PCM_INFO_BATCH),
+ 	.formats =              (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE),
+@@ -110,7 +110,7 @@
+ static const struct snd_pcm_hardware q6apm_dai_hardware_playback = {
+ 	.info =                 (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_BLOCK_TRANSFER |
+ 				 SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_INTERLEAVED |
+-				 SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME |
++				 SNDRV_PCM_INFO_PAUSE |
+ 				 SNDRV_PCM_INFO_NO_REWINDS | SNDRV_PCM_INFO_SYNC_APPLPTR |
+ 				 SNDRV_PCM_INFO_BATCH),
+ 	.formats =              (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE),
+@@ -347,13 +347,19 @@
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+ 		break;
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++		/*
++		 * A graph left running keeps the DSP, and the SoC's XO, awake
++		 * through system sleep. No INFO_RESUME: prepare starts it again.
++		 */
++		ret = q6apm_graph_stop(prtd->graph);
++		fallthrough;
+ 	case SNDRV_PCM_TRIGGER_STOP:
+ 		/* TODO support be handled via SoftPause Module */
+ 		prtd->state = Q6APM_STREAM_STOPPED;
+ 		prtd->queue_ptr = 0;
+ 		prtd->last_pos_index = 0;
+ 		break;
+-	case SNDRV_PCM_TRIGGER_SUSPEND:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+ 		break;
+ 	default:
+--- a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
++++ b/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
+@@ -218,6 +218,13 @@
+ 				dai_data->is_port_started[dai->id] = true;
+ 		}
+ 		break;
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++		/* As the front end: idle the DSP for system sleep, prepare restarts it. */
++		if (dai_data->is_port_started[dai->id]) {
++			ret = q6apm_graph_stop(dai_data->graph[dai->id]);
++			dai_data->is_port_started[dai->id] = false;
++		}
++		break;
+ 	default:
+ 		break;
+ 	}

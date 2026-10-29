@@ -1,0 +1,25 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: qcom: cq8725s-ayn-odin3: load the SoCCP firmware
+
+The bootloader leaves an early SoCCP image running in D0 with no bus vote,
+and once the APSS releases every system NoC vote for sleep the SoC never
+comes back from SYSTEM_SUSPEND or s2idle. Point the SoCCP (9019/9020) at
+the AYN firmware the image ships, so the driver reloads it, the SoCCP
+parks in D3 and the boot bus vote is dropped. Without this the vote
+stays: the Odin 3 wakes, but never reaches DDR low power.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts
++++ b/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts
+@@ -278,6 +278,10 @@
+ 	status = "okay";
+ };
+ 
++&remoteproc_soccp {
++	firmware-name = "qcom/sm8750/ayn/odin3/soccp.mbn";
++};
++
+ &spk_amp_l {
+ 	firmware-name = "qcom/sm8750/ayn/odin3/aw883xx_acf.bin";
+ };

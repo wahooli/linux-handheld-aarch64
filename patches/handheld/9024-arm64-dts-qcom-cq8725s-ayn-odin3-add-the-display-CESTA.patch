@@ -1,0 +1,30 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: qcom: cq8725s-ayn-odin3: add the display CESTA
+
+Describe the display RSC, its CESTA resource manager, the SCC wrapper and
+the MDSS GDSC register for the suspend handoff in 9023, at the addresses
+armada-os/armada 008e910 used. With it the Odin 3 reaches AOSS deep sleep.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts
++++ b/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts
+@@ -424,3 +424,18 @@
+ 		};
+ 	};
+ };
++
++/* Display CESTA handoff at suspend (9023), for AOSS deep sleep */
++/ {
++	display-cesta@af20000 {
++		compatible = "armada,sm8750-disp-cesta";
++		reg = <0x0 0x0af20000 0x0 0x1000>,
++		      <0x0 0x0af21000 0x0 0x7000>,
++		      <0x0 0x0af30000 0x0 0x7000>,
++		      <0x0 0x0af09000 0x0 0x8>;
++		reg-names = "rscc", "crm", "wrapper", "gdsc";
++		power-domains = <&rpmhpd RPMHPD_MMCX>;
++		required-opps = <&rpmhpd_opp_low_svs>;
++		armada,mdss = <&mdss>;
++	};
++};

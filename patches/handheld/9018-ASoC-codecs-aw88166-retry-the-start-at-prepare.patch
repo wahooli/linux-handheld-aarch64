@@ -1,0 +1,74 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] ASoC: codecs: aw88166: retry the start at prepare
+
+The amp starts from DAPM PRE_PMU of its playback AIF, in a work item
+that checks its PLL against the I2S clocks and retries five times in
+quick succession. After system sleep ASoC powers DAPM back up before
+userspace prepares the suspended stream again, so with a DSP back end
+that stops its port for sleep the clocks are not running yet, the start
+fails and nothing tries again.
+
+Remember that DAPM has the playback path up, and start the amp again,
+synchronously, from the DAI's prepare, which runs after the CPU DAI's
+and so with the port running. With the amp already started it returns at
+once. The same as the AW88261 needed on the AYANEO Pocket VERT; the AYN
+Odin 3 has these.
+
+While the card is still resuming (not back at D0), leave the start to
+prepare. Otherwise the doomed attempt fails ("device start failed.
+retry = 0") and reloads the DSP firmware over I2C on every resume, and
+the first sound after waking waits for that.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/sound/soc/codecs/aw88166.c
++++ b/sound/soc/codecs/aw88166.c
+@@ -35,6 +35,7 @@
+ 	unsigned int re_init_val;
+ 	unsigned int dither_st;
+ 	bool phase_sync;
++	bool playback_pmu;
+ };
+ 
+ static const struct regmap_config aw88166_remap_config = {
+@@ -1308,8 +1309,25 @@
+ 	dev_dbg(dai->dev, "shutdown stream=%d", substream->stream);
+ }
+ 
++/*
++ * After system sleep DAPM powers the amp up before the stream is prepared
++ * again, so with the I2S port still stopped the PLL check fails. The CPU DAI
++ * is prepared first and starts the port: try again now.
++ */
++static int aw88166_prepare(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
++{
++	struct aw88166 *aw88166 = snd_soc_component_get_drvdata(dai->component);
++
++	guard(mutex)(&aw88166->lock);
++	if (aw88166->playback_pmu)
++		aw88166_start(aw88166, AW88166_SYNC_START);
++
++	return 0;
++}
++
+ static const struct snd_soc_dai_ops aw88166_dai_ops = {
+ 	.startup = aw88166_startup,
++	.prepare = aw88166_prepare,
+ 	.set_fmt = aw88166_set_fmt,
+ 	.set_sysclk = aw88166_set_dai_sysclk,
+ 	.hw_params = aw88166_hw_params,
+@@ -1701,9 +1719,13 @@
+ 	guard(mutex)(&aw88166->lock);
+ 	switch (event) {
+ 	case SND_SOC_DAPM_PRE_PMU:
+-		aw88166_start(aw88166, AW88166_ASYNC_START);
++		aw88166->playback_pmu = true;
++		/* Still resuming: the port is stopped, so prepare starts the amp. */
++		if (snd_power_get_state(component->card->snd_card) == SNDRV_CTL_POWER_D0)
++			aw88166_start(aw88166, AW88166_ASYNC_START);
+ 		break;
+ 	case SND_SOC_DAPM_POST_PMD:
++		aw88166->playback_pmu = false;
+ 		aw88166_stop(aw88166->aw_pa);
+ 		break;
+ 	default:

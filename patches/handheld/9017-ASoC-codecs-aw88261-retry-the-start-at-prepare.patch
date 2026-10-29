@@ -1,0 +1,71 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] ASoC: codecs: aw88261: retry the start at prepare
+
+The amp starts at DAPM PRE_PMU of its playback AIF and checks its PLL
+against the I2S clocks there, retrying five times in quick succession.
+After system sleep ASoC powers DAPM back up before userspace prepares
+the suspended stream again, so with a DSP back end that stops its port
+for sleep the clocks are not running yet, the start fails and nothing
+tries again: the AYANEO Pocket VERT's speakers stayed silent after
+resume ("start failure (-1)").
+
+Remember that DAPM has the playback path up, and retry the start from
+the DAI's prepare, which runs after the CPU DAI's and so with the port
+running. With the amp already started it returns at once. While the card
+is still resuming (not back at D0), skip the doomed attempt and leave the
+start to prepare.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/sound/soc/codecs/aw88261.h
++++ b/sound/soc/codecs/aw88261.h
+@@ -592,6 +592,7 @@
+ 	int frcset_en;
+ 	unsigned int mute_st;
+ 	unsigned int amppd_st;
++	bool playback_pmu;
+ 
+ 	unsigned int sr_value;
+ 	unsigned int cco_mux_value;
+--- a/sound/soc/codecs/aw88261.c
++++ b/sound/soc/codecs/aw88261.c
+@@ -865,7 +865,24 @@
+ 	return 0;
+ }
+ 
++/*
++ * After system sleep DAPM powers the amp up before the stream is prepared
++ * again, so with the I2S port still stopped the PLL check fails. The CPU DAI
++ * is prepared first and starts the port: try again now.
++ */
++static int aw88261_dai_prepare(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
++{
++	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(dai->component);
++
++	guard(mutex)(&aw88261->lock);
++	if (aw88261->playback_pmu)
++		aw88261_start(aw88261);
++
++	return 0;
++}
++
+ static const struct snd_soc_dai_ops aw88261_dai_ops = {
++	.prepare = aw88261_dai_prepare,
+ 	.set_fmt = aw88261_set_fmt,
+ 	.hw_params = aw88261_hw_params,
+ 	.set_tdm_slot = aw88261_set_tdm_slot,
+@@ -1039,9 +1056,13 @@
+ 	guard(mutex)(&aw88261->lock);
+ 	switch (event) {
+ 	case SND_SOC_DAPM_PRE_PMU:
+-		aw88261_start(aw88261);
++		aw88261->playback_pmu = true;
++		/* Still resuming: the port is stopped, so prepare starts the amp. */
++		if (snd_power_get_state(component->card->snd_card) == SNDRV_CTL_POWER_D0)
++			aw88261_start(aw88261);
+ 		break;
+ 	case SND_SOC_DAPM_POST_PMD:
++		aw88261->playback_pmu = false;
+ 		aw88261_dev_stop(aw88261->aw_pa);
+ 		break;
+ 	default:

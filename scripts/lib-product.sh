@@ -39,7 +39,7 @@ lp_load() {
     KERNEL_IMAGE=; KERNEL_IMAGE_DEST=; INITRAMFS_IMAGE=; INITRAMFS_FALLBACK=
     DTB_DEST=; INSTALL_VMLINUZ=
     # Arrays too: a leftover DTS from an earlier lp_load would be copied into the tree.
-    DTS=(); DTS_DELTA=(); DTB=(); ROCKNIX_STAGED=(); ROCKNIX_DIRS=()
+    DTS=(); DTS_DELTA=(); DTB=(); ROCKNIX_STAGED=(); ROCKNIX_DIRS=(); ARMADA_EXCLUDE=()
     # The sources.env BASE_VERSION is a global fallback; the conf's own pin wins.
     local base_global="${BASE_VERSION:-}"
     BASE_VERSION=

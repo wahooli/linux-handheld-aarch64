@@ -15,7 +15,7 @@ lp_lock "${HERE}"
 # Removed now, written only on success: its existence means the tree matches it.
 rm -f version.env
 
-ARMADA_RAW="https://raw.githubusercontent.com/armada-os/armada-packages/${ARMADA_REF}/kernel"
+ARMADA_RAW="https://raw.githubusercontent.com/armada-os/armada/${ARMADA_REF}/packages/kernel"
 ROCKNIX_RAW="https://raw.githubusercontent.com/ROCKNIX/distribution/${ROCKNIX_REF}"
 
 # Staged set tracks ROCKNIX's next branch: never applied, so a monthly tag would only be stale.
@@ -306,6 +306,20 @@ if [ -n "${SERIES_SRC}" ]; then
     done
 fi
 
+# ---- armada exclusions --------------------------------------------------------
+# <patch>=<git blob of armada's copy ours diverged from>: never fetched from armada.
+declare -A armada_pin=()
+for entry in ${ARMADA_EXCLUDE[@]+"${ARMADA_EXCLUDE[@]}"}; do
+    xname="${entry%%=*}"; xblob="${entry#*=}"
+    if [ "${xname}" = "${entry}" ] || [[ ! "${xblob}" =~ ^[0-9a-f]{40}$ ]]; then
+        fail "local: ARMADA_EXCLUDE entry ${entry} is not <patch>=<40-hex git blob>"
+        continue
+    fi
+    [[ " ${SERIES_PATCHES[*]-} " == *" ${xname} "* ]] \
+        || fail "local: ARMADA_EXCLUDE names ${xname}, which is not in the series any more -- remove the rule"
+    armada_pin["${xname}"]="${xblob}"
+done
+
 # ---- fetch --------------------------------------------------------------------
 # Per entry: patches/shared/ for a shared/ entry, else patches/<product>/ (committed; keeps its prefix in series.generated), then armada, then ROCKNIX.
 SERIES_ENTRIES=(); n_committed=0
@@ -334,6 +348,12 @@ for line in ${SERIES_PATCHES[@]+"${SERIES_PATCHES[@]}"}; do
         continue
     fi
 
+    # Armada's copy of an excluded patch does not apply here; never fall back to it.
+    if [ -n "${armada_pin[${line}]+x}" ]; then
+        fail "local: ${line} is in ARMADA_EXCLUDE but has no copy in patches/${PRODUCT}/"
+        continue
+    fi
+
     SERIES_ENTRIES+=("${line}")
     out="patches/${line}"
     if [ -f "${out}" ] && [ -z "${FORCE}" ]; then continue; fi
@@ -347,6 +367,17 @@ for line in ${SERIES_PATCHES[@]+"${SERIES_PATCHES[@]}"}; do
         fail "upstream: ${line} not found in patches/${PRODUCT}/, armada@${ARMADA_REF:0:12} or ROCKNIX@${ROCKNIX_REF}"
     fi
 done
+
+# An excluded patch armada has changed since: theirs may carry a fix ours lacks.
+if [ "${USE_ARMADA}" = yes ]; then
+    for xname in "${!armada_pin[@]}"; do
+        if ! try_armada "patches/${xname}" "${TMP}/excluded.patch"; then
+            note "${xname}: not at armada@${ARMADA_REF:0:12} (dropped, or the fetch failed); ours stays"
+        elif [ "$(git hash-object --no-filters "${TMP}/excluded.patch")" != "${armada_pin[${xname}]}" ]; then
+            note "${xname}: armada@${ARMADA_REF:0:12} changed it since ours diverged -- review theirs, then move its blob in ARMADA_EXCLUDE"
+        fi
+    done
+fi
 
 for f in "${DTS[@]}" "${DTS_DELTA[@]}"; do
     [ -f "dts/${f}" ] && [ -z "${FORCE}" ] && continue

@@ -23,37 +23,46 @@ because its IRQ cannot fire:
 The residue is not hibernate related -- it reproduces on a cleanly booted kernel
 -- and it survives the full 15 min because nothing services the down-migration.
 
-Give bwmon a system-sleep suspend/resume pair: stop the monitor and release the
-OPP vote (dev_pm_opp_set_opp(dev, NULL)) at suspend so DDR falls to the aggregate
-of the other, already quiesced, consumers; re-arm the monitor at resume, where
-the first IRQ re-applies a real vote. SYSTEM_SLEEP_PM_OPS covers s2idle and every
-hibernation phase.
+Give bwmon a system-sleep suspend/resume pair: stop the monitor and drop the
+vote to the lowest OPP at suspend so DDR falls to the aggregate of the other,
+already quiesced, consumers; re-arm the monitor at resume, where the first IRQ
+re-applies a real vote. SYSTEM_SLEEP_PM_OPS covers s2idle and every hibernation
+phase.
+
+The lowest OPP and not none, because the vote is ACTIVE_ONLY: the RPMh sleep set
+leaves it out and the wake set sends it again, so where the sleep set is reached
+and DDR goes into low power, DDR is voted back before the CPU runs.
 ---
 --- a/drivers/soc/qcom/icc-bwmon.c
 +++ b/drivers/soc/qcom/icc-bwmon.c
-@@ -815,6 +815,40 @@
+@@ -815,6 +815,45 @@
  	free_irq(bwmon->irq, bwmon);
  }
  
 +static int bwmon_suspend(struct device *dev)
 +{
 +	struct icc_bwmon *bwmon = dev_get_drvdata(dev);
++	unsigned int kbps = 0;
++	struct dev_pm_opp *opp;
 +
 +	/*
-+	 * Nothing services the bwmon IRQ across a system sleep, so the bandwidth
-+	 * it last voted stays applied for the whole suspend. On this platform
-+	 * s2idle never reaches the RPMh sleep set (the DDR self-refresh vote is
-+	 * never taken), so that stale ACTIVE vote governs the DDR frequency the
-+	 * entire time the machine is "asleep": suspend right after a workload and
-+	 * DDR is pinned at its busy corner until resume, for hundreds of mW.
-+	 *
-+	 * Stop the monitor and release the vote so DDR falls to the aggregate of
-+	 * the other, already quiesced, consumers. bwmon_resume() re-arms the
-+	 * monitor and the first post-resume IRQ re-applies a real vote.
++	 * Nothing services the bwmon IRQ across a system sleep, so its last vote
++	 * would stay applied for the whole suspend. Drop it to the lowest OPP: DDR
++	 * falls to the aggregate of the other, already quiesced, consumers. The
++	 * lowest and not none: the vote is ACTIVE_ONLY, so the sleep set leaves it
++	 * out and the wake set brings DDR back before the CPU runs. bwmon_resume()
++	 * re-arms the monitor.
 +	 */
 +	bwmon_disable(bwmon);
-+	dev_pm_opp_set_opp(bwmon->dev, NULL);
-+	bwmon->current_kbps = 0;
++	opp = dev_pm_opp_find_bw_ceil(bwmon->dev, &kbps, 0);
++	if (IS_ERR(opp)) {
++		dev_pm_opp_set_opp(bwmon->dev, NULL);
++		kbps = 0;
++	} else {
++		dev_pm_opp_set_opp(bwmon->dev, opp);
++		dev_pm_opp_put(opp);
++	}
++	bwmon->current_kbps = kbps;
 +
 +	return 0;
 +}
@@ -72,7 +81,7 @@ hibernation phase.
  static const struct icc_bwmon_data msm8998_bwmon_data = {
  	.sample_ms = 4,
  	.count_unit_kb = 1024,
-@@ -879,6 +913,7 @@
+@@ -879,6 +918,7 @@
  	.driver = {
  		.name = "qcom-bwmon",
  		.of_match_table = bwmon_of_match,

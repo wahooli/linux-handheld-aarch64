@@ -1,0 +1,44 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] HID: usbhid: apply jspoll to gamepads too
+
+usbhid.jspoll overrides the polling interval of devices whose top-level
+collection is Generic Desktop Joystick, but most controllers declare
+Gamepad (0x05) instead, so the parameter never reaches them.
+
+The AYANEO Pocket VERT's built-in pad (4001:0428, Gamepad) asks for a
+1 ms interval and answers every poll with the same report while idle:
+~1000 xHCI interrupts a second on one core, which kept that core out of
+its deep idle state most of the time (22% residency, 53% with the pad
+unbound). Treat Gamepad like Joystick, so the device's boot arguments
+and handheld-settingsd can set its rate.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/hid/usbhid/hid-core.c
++++ b/drivers/hid/usbhid/hid-core.c
+@@ -54,7 +54,7 @@
+ 
+ static unsigned int hid_jspoll_interval;
+ module_param_named(jspoll, hid_jspoll_interval, uint, 0644);
+-MODULE_PARM_DESC(jspoll, "Polling interval of joysticks");
++MODULE_PARM_DESC(jspoll, "Polling interval of joysticks and gamepads");
+ 
+ static unsigned int hid_kbpoll_interval;
+ module_param_named(kbpoll, hid_kbpoll_interval, uint, 0644);
+@@ -1129,7 +1129,7 @@
+ 				hid->name, endpoint->bInterval, interval);
+ 		}
+ 
+-		/* Change the polling interval of mice, joysticks
++		/* Change the polling interval of mice, joysticks, gamepads
+ 		 * and keyboards.
+ 		 */
+ 		switch (hid->collection->usage) {
+@@ -1138,6 +1138,7 @@
+ 				interval = hid_mousepoll_interval;
+ 			break;
+ 		case HID_GD_JOYSTICK:
++		case HID_GD_GAMEPAD:
+ 			if (hid_jspoll_interval > 0)
+ 				interval = hid_jspoll_interval;
+ 			break;

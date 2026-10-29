@@ -150,7 +150,7 @@ if [ -n "${uses_rocknix}" ]; then
 fi
 
 if [ -n "${uses_armada}" ]; then
-    new_armada="$(gh_get "${API}/repos/armada-os/armada-packages/commits?path=kernel&per_page=1" \
+    new_armada="$(gh_get "${API}/repos/armada-os/armada/commits?path=packages/kernel&per_page=1" \
         | jq -r '.[0].sha // empty')"
     [ -n "${new_armada}" ] || { echo "!! could not read armada commits" >&2; exit 1; }
     [ "${new_armada}" != "${ARMADA_REF}" ] && changed+=("armada ${ARMADA_REF:0:12} -> ${new_armada:0:12}")

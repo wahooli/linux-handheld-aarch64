@@ -1,0 +1,86 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] power: supply: qcom_battmgr: the AYANEO Pocket VERT's property ids
+
+The AYANEO Pocket VERT's ADSP firmware (ADSP.HT.5.7-01324-WAIPIO-1,
+OEM 285ca10e8be2) numbers its battery properties one higher than the
+list here: raw id 0 is an extra property, and BATT_STATUS..BATT_POWER_AVG
+answer at 1..24. Read with upstream ids, every value lands on the wrong
+property (state of health as OCV, temperature as technology, ...) and the
+model name answers BATT_TTF_AVG with a 132-byte string, which is refused
+with a 1 s timeout on every read of time_to_full_avg.
+
+Add the offset for this machine, on requests and on replies. Its
+capacities are in uAh, so report them as charge rather than refusing
+them on the default mWh unit, and leave out power_now: what the firmware
+returns for it is neither the battery's power nor follows its current
+(57 W while V x I was 3.5 W).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -9,6 +9,7 @@
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/nvmem-consumer.h>
++#include <linux/of.h>
+ #include <linux/of_device.h>
+ #include <linux/power_supply.h>
+ #include <linux/property.h>
+@@ -313,6 +314,10 @@
+ 	struct pmic_glink_client *client;
+ 
+ 	enum qcom_battmgr_variant variant;
++	/* added to battery property ids, see qcom_battmgr_probe() */
++	u32 bat_prop_offset;
++	/* the firmware's BATT_POWER_NOW is not the battery's power */
++	bool no_power_now;
+ 
+ 	struct power_supply *ac_psy;
+ 	struct power_supply *bat_psy;
+@@ -373,6 +378,9 @@
+ 		.value = cpu_to_le32(value),
+ 	};
+ 
++	if (opcode == BATTMGR_BAT_PROPERTY_GET || opcode == BATTMGR_BAT_PROPERTY_SET)
++		request.property = cpu_to_le32(property + battmgr->bat_prop_offset);
++
+ 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+ }
+ 
+@@ -563,6 +571,8 @@
+ 		val->intval = battmgr->status.current_now;
+ 		break;
+ 	case POWER_SUPPLY_PROP_POWER_NOW:
++		if (battmgr->no_power_now)
++			return -ENODATA;
+ 		val->intval = battmgr->status.power_now;
+ 		break;
+ 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+@@ -1381,7 +1391,7 @@
+ 
+ 	switch (opcode) {
+ 	case BATTMGR_BAT_PROPERTY_GET:
+-		property = le32_to_cpu(resp->intval.property);
++		property = le32_to_cpu(resp->intval.property) - battmgr->bat_prop_offset;
+ 		if (property == BATT_MODEL_NAME) {
+ 			if (payload_len != sizeof(resp->strval)) {
+ 				dev_warn(battmgr->dev,
+@@ -1658,6 +1668,17 @@
+ 	else
+ 		battmgr->variant = QCOM_BATTMGR_SM8350;
+ 
++	/*
++	 * The AYANEO Pocket VERT's ADSP firmware has one more battery property
++	 * ahead of BATT_STATUS, so each of these ids is one higher there. Its
++	 * capacities are in uAh, and its BATT_POWER_NOW is not the battery's power.
++	 */
++	if (of_machine_is_compatible("ayaneo,pocket-vert")) {
++		battmgr->bat_prop_offset = 1;
++		battmgr->unit = QCOM_BATTMGR_UNIT_mAh;
++		battmgr->no_power_now = true;
++	}
++
+ 	ret = qcom_battmgr_charge_control_thresholds_init(battmgr);
+ 	if (ret < 0)
+ 		return dev_err_probe(dev, ret,

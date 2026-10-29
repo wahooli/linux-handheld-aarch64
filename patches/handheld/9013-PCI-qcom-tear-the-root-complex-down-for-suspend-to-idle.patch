@@ -1,0 +1,98 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] PCI: qcom: tear the root complex down for suspend-to-idle
+
+dw_pcie_suspend_noirq() tears a root complex down only when the D3cold
+walk allows it, and on a devicetree system it never does: the root port
+has no platform power management and stays in D0. So both RCs stay up
+through s2idle with their GDSCs, PHYs, XO-fed aux clocks and a 1 kBps
+memory vote in the RPMh sleep set, and the SoC never reaches CX collapse,
+AOSS sleep or DDR low power.
+
+Tear the RC down for s2idle regardless. The endpoints are power cycled
+through pwrctrl on the way and have to cope: ath11k already reloads its
+firmware on every resume, and xhci-pci-renesas does with the next patch.
+
+Measured on the AYANEO Pocket VERT (SM8475P): qcom_stats aosd/cxsd/ddr
+stayed at 0 through every s2idle; with both RCs down they covered 120.5
+of 121.8 s asleep. Switchable at runtime through the s2idle_teardown
+module parameter.
+
+Deep suspend (PSCI SYSTEM_SUSPEND, the AYN Odin 3) has the same problem,
+worse: an RC whose bandwidth comes from its OPP table (SM8750) has no
+icc_mem path, and the suspend OPP is skipped for S2RAM, so the full OPP
+vote stays. The Odin 3 held DDR at 1708 MHz with aosd/cxsd/ddr at 0
+through every deep sleep. The deep_teardown parameter does the same
+teardown there, on by default.
+
+On SM8750 the teardown lets the APSS release every system NoC vote, and
+the wake then hangs unless the SoCCP is parked (9019-9021) and the PCIe
+GDSCs really collapse (upstream's PWRSTS_OFF_ON).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/pci/controller/dwc/pcie-designware.h
++++ b/drivers/pci/controller/dwc/pcie-designware.h
+@@ -471,6 +471,7 @@
+ 	bool			native_ecam;
+ 	bool                    skip_l23_ready;
+ 	bool			skip_pwrctrl_off;
++	bool			force_teardown;
+ };
+ 
+ struct dw_pcie_ep_ops {
+--- a/drivers/pci/controller/dwc/pcie-designware-host.c
++++ b/drivers/pci/controller/dwc/pcie-designware-host.c
+@@ -1231,7 +1231,9 @@
+ 	if (!dw_pcie_link_up(pci))
+ 		goto stop_link;
+ 
+-	if (!pci_host_common_d3cold_possible(pci->pp.bridge, &pme_capable))
++	/* force_teardown: the host driver has its endpoints cope with power loss. */
++	if (!pci_host_common_d3cold_possible(pci->pp.bridge, &pme_capable) &&
++	    !pci->pp.force_teardown)
+ 		return 0;
+ 
+ 	if (pci->pp.ops->pme_turn_off) {
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -2408,6 +2408,28 @@
+ 	return ret;
+ }
+ 
++/*
++ * s2idle_teardown: tear the RC down for suspend-to-idle even when the D3cold
++ * walk refuses, which on a devicetree system it always does. Left up, the RC
++ * keeps its GDSC, PHY, aux clock and a sleep-set memory vote, and the SoC
++ * never reaches CX collapse or DDR low power. The endpoints are power cycled
++ * through pwrctrl.
++ */
++static bool s2idle_teardown = true;
++module_param(s2idle_teardown, bool, 0644);
++MODULE_PARM_DESC(s2idle_teardown,
++		 "s2idle: tear the RC down at suspend even when the D3cold walk refuses (default 1)");
++
++/*
++ * deep_teardown: the same for deep suspend. An RC whose bandwidth comes from
++ * its OPP table (SM8750) otherwise keeps the full OPP vote: icc_mem is NULL
++ * and the suspend OPP is skipped for S2RAM.
++ */
++static bool deep_teardown = true;
++module_param(deep_teardown, bool, 0644);
++MODULE_PARM_DESC(deep_teardown,
++		 "deep: tear the RC down at suspend even when the D3cold walk refuses (default 1)");
++
+ static int qcom_pcie_suspend_noirq(struct device *dev)
+ {
+ 	struct qcom_pcie *pcie;
+@@ -2417,7 +2439,11 @@
+ 	if (!pcie)
+ 		return 0;
+
++	pcie->pci->pp.force_teardown =
++		(s2idle_teardown && pm_suspend_target_state == PM_SUSPEND_TO_IDLE) ||
++		(deep_teardown && pm_suspend_target_state == PM_SUSPEND_MEM);
+ 	ret = dw_pcie_suspend_noirq(pcie->pci);
++	pcie->pci->pp.force_teardown = false;
+ 	if (ret)
+ 		return ret;
+ 

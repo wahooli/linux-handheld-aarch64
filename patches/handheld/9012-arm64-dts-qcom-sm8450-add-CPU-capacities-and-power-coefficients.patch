@@ -1,0 +1,92 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: qcom: sm8450: add CPU capacities and power coefficients
+
+sm8450.dtsi gives its CPUs no capacity-dmips-mhz, so every core reports
+a cpu_capacity of 1024 and the scheduler treats the four Cortex-A510s
+like the Cortex-X2. It has no energy model either, so EAS stays off and
+a busy thread lands on whichever core is free.
+
+On the AYANEO Pocket VERT (SM8475) this halved a game's frame rate: the
+main thread of Horizon Chase Turbo, running under x86 emulation, spent
+about half its time on the A510s. Pinning it to CPUs 4-7 took the game
+from ~20 to ~60 fps.
+
+The values are the stock Android device tree's for the same cores:
+A510 1024 / 100, A710 2253 / 257, X2 2386 / 509.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/arch/arm64/boot/dts/qcom/sm8450.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8450.dtsi
+@@ -61,6 +61,8 @@
+ 			power-domains = <&cpu_pd0>;
+ 			power-domain-names = "psci";
+ 			qcom,freq-domain = <&cpufreq_hw 0>;
++			capacity-dmips-mhz = <1024>;
++			dynamic-power-coefficient = <100>;
+ 			#cooling-cells = <2>;
+ 			clocks = <&cpufreq_hw 0>;
+ 			l2_0: l2-cache {
+@@ -85,6 +87,8 @@
+ 			power-domains = <&cpu_pd1>;
+ 			power-domain-names = "psci";
+ 			qcom,freq-domain = <&cpufreq_hw 0>;
++			capacity-dmips-mhz = <1024>;
++			dynamic-power-coefficient = <100>;
+ 			#cooling-cells = <2>;
+ 			clocks = <&cpufreq_hw 0>;
+ 			l2_100: l2-cache {
+@@ -104,6 +108,8 @@
+ 			power-domains = <&cpu_pd2>;
+ 			power-domain-names = "psci";
+ 			qcom,freq-domain = <&cpufreq_hw 0>;
++			capacity-dmips-mhz = <1024>;
++			dynamic-power-coefficient = <100>;
+ 			#cooling-cells = <2>;
+ 			clocks = <&cpufreq_hw 0>;
+ 			l2_200: l2-cache {
+@@ -123,6 +129,8 @@
+ 			power-domains = <&cpu_pd3>;
+ 			power-domain-names = "psci";
+ 			qcom,freq-domain = <&cpufreq_hw 0>;
++			capacity-dmips-mhz = <1024>;
++			dynamic-power-coefficient = <100>;
+ 			#cooling-cells = <2>;
+ 			clocks = <&cpufreq_hw 0>;
+ 			l2_300: l2-cache {
+@@ -142,6 +150,8 @@
+ 			power-domains = <&cpu_pd4>;
+ 			power-domain-names = "psci";
+ 			qcom,freq-domain = <&cpufreq_hw 1>;
++			capacity-dmips-mhz = <2253>;
++			dynamic-power-coefficient = <257>;
+ 			#cooling-cells = <2>;
+ 			clocks = <&cpufreq_hw 1>;
+ 			l2_400: l2-cache {
+@@ -161,6 +171,8 @@
+ 			power-domains = <&cpu_pd5>;
+ 			power-domain-names = "psci";
+ 			qcom,freq-domain = <&cpufreq_hw 1>;
++			capacity-dmips-mhz = <2253>;
++			dynamic-power-coefficient = <257>;
+ 			#cooling-cells = <2>;
+ 			clocks = <&cpufreq_hw 1>;
+ 			l2_500: l2-cache {
+@@ -180,6 +192,8 @@
+ 			power-domains = <&cpu_pd6>;
+ 			power-domain-names = "psci";
+ 			qcom,freq-domain = <&cpufreq_hw 1>;
++			capacity-dmips-mhz = <2253>;
++			dynamic-power-coefficient = <257>;
+ 			#cooling-cells = <2>;
+ 			clocks = <&cpufreq_hw 1>;
+ 			l2_600: l2-cache {
+@@ -199,6 +213,8 @@
+ 			power-domains = <&cpu_pd7>;
+ 			power-domain-names = "psci";
+ 			qcom,freq-domain = <&cpufreq_hw 2>;
++			capacity-dmips-mhz = <2386>;
++			dynamic-power-coefficient = <509>;
+ 			#cooling-cells = <2>;
+ 			clocks = <&cpufreq_hw 2>;
+ 			l2_700: l2-cache {
