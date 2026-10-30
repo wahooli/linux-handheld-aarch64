@@ -1,0 +1,106 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: qcom: sm8450: add the bandwidth monitors
+
+SM8450 has the two BWMONs mainline describes for SM8550: the CPU to LLCC
+monitor (BWMON v4) at 0x190b6400 and the LLCC to DDR one (v5) at
+0x19091000, at the same interrupts. Qualcomm's tree has both (qcom,bwmon4
+and qcom,bwmon5). Without them nothing votes the CPU's memory bandwidth:
+once the interconnects' sync_state drops the boot votes, DDR stays at the
+display's vote and the CPUs stall on memory. On the AYANEO Pocket VERT the
+Steam UI lagged and a game never reached its menu.
+
+The OPP steps are the stock DDR (547-3196 MHz, 4-byte bus) and LLCC
+(300-1066 MHz, 16-byte bus) tables. The sm8450 compatibles are not in the
+binding yet; the driver matches the fallbacks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/arch/arm64/boot/dts/qcom/sm8450.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8450.dtsi
+@@ -5288,6 +5288,86 @@
+ 			#clock-cells = <1>;
+ 		};
+ 
++		pmu@19091000 {
++			compatible = "qcom,sm8450-llcc-bwmon", "qcom,sc7280-llcc-bwmon";
++			reg = <0 0x19091000 0 0x1000>;
++			interrupts = <GIC_SPI 81 IRQ_TYPE_LEVEL_HIGH>;
++			interconnects = <&mc_virt MASTER_LLCC QCOM_ICC_TAG_ACTIVE_ONLY
++					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ACTIVE_ONLY>;
++
++			operating-points-v2 = <&llcc_bwmon_opp_table>;
++
++			llcc_bwmon_opp_table: opp-table {
++				compatible = "operating-points-v2";
++
++				opp-0 {
++					opp-peak-kBps = <2188000>;
++				};
++
++				opp-1 {
++					opp-peak-kBps = <3072000>;
++				};
++
++				opp-2 {
++					opp-peak-kBps = <6220000>;
++				};
++
++				opp-3 {
++					opp-peak-kBps = <6832000>;
++				};
++
++				opp-4 {
++					opp-peak-kBps = <8368000>;
++				};
++
++				opp-5 {
++					opp-peak-kBps = <10944000>;
++				};
++
++				opp-6 {
++					opp-peak-kBps = <12784000>;
++				};
++			};
++		};
++
++		pmu@190b6400 {
++			compatible = "qcom,sm8450-cpu-bwmon", "qcom,sdm845-bwmon";
++			reg = <0 0x190b6400 0 0x600>;
++			interrupts = <GIC_SPI 581 IRQ_TYPE_LEVEL_HIGH>;
++			interconnects = <&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ACTIVE_ONLY
++					 &gem_noc SLAVE_LLCC QCOM_ICC_TAG_ACTIVE_ONLY>;
++
++			operating-points-v2 = <&cpu_bwmon_opp_table>;
++
++			cpu_bwmon_opp_table: opp-table {
++				compatible = "operating-points-v2";
++
++				opp-0 {
++					opp-peak-kBps = <4800000>;
++				};
++
++				opp-1 {
++					opp-peak-kBps = <7456000>;
++				};
++
++				opp-2 {
++					opp-peak-kBps = <9600000>;
++				};
++
++				opp-3 {
++					opp-peak-kBps = <12896000>;
++				};
++
++				opp-4 {
++					opp-peak-kBps = <14928000>;
++				};
++
++				opp-5 {
++					opp-peak-kBps = <17056000>;
++				};
++			};
++		};
++
+ 		gem_noc: interconnect@19100000 {
+ 			compatible = "qcom,sm8450-gem-noc";
+ 			reg = <0 0x19100000 0 0xbb800>;

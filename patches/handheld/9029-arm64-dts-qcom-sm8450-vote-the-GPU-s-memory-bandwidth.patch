@@ -1,0 +1,105 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: qcom: sm8450: vote the GPU's memory bandwidth
+
+The SM8450 GPU node has no interconnect path and its OPPs no bandwidth,
+unlike SM8550's. The A730 has no GMU bandwidth table in the driver, so its
+DDR vote comes from dev_pm_opp_set_opp() on the "gfx-mem" path, and with
+none the GPU's traffic reached DDR only through the LLCC bandwidth
+monitor's reaction. Once the interconnects' sync_state dropped the boot
+votes, the AYANEO Pocket VERT's games ran at the GPU's top OPP and stopped
+around 90 fps where they had reached 120.
+
+Add the path as SM8550 has it and a peak vote per OPP: the stock tree's bus
+level for the nearest stock GPU frequency at or above it. At 818 MHz the
+GPU now votes 13.1 GB/s, DDR follows to its top step, and Horizon Chase
+reaches 120 fps again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/arch/arm64/boot/dts/qcom/sm8450.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8450.dtsi
+@@ -2455,6 +2455,10 @@
+ 			iommus = <&adreno_smmu 0 0x400>,
+ 				 <&adreno_smmu 1 0x400>;
+ 
++			interconnects = <&gem_noc MASTER_GFX3D QCOM_ICC_TAG_ALWAYS
++					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
++			interconnect-names = "gfx-mem";
++
+ 			operating-points-v2 = <&gpu_opp_table>;
+ 
+ 			qcom,gmu = <&gmu>;
+@@ -2472,61 +2476,73 @@
+ 				opp-818000000 {
+ 					opp-hz = /bits/ 64 <818000000>;
+ 					opp-level = <RPMH_REGULATOR_LEVEL_TURBO>;
++					opp-peak-kBps = <13085937>;
+ 				};
+ 
+ 				opp-791000000 {
+ 					opp-hz = /bits/ 64 <791000000>;
+ 					opp-level = <RPMH_REGULATOR_LEVEL_NOM_L1>;
++					opp-peak-kBps = <13085937>;
+ 				};
+ 
+ 				opp-734000000 {
+ 					opp-hz = /bits/ 64 <734000000>;
+ 					opp-level = <RPMH_REGULATOR_LEVEL_NOM>;
++					opp-peak-kBps = <12484375>;
+ 				};
+ 
+ 				opp-640000000 {
+ 					opp-hz = /bits/ 64 <640000000>;
+ 					opp-level = <RPMH_REGULATOR_LEVEL_SVS_L2>;
++					opp-peak-kBps = <8171875>;
+ 				};
+ 
+ 				opp-599000000 {
+ 					opp-hz = /bits/ 64 <599000000>;
+ 					opp-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
++					opp-peak-kBps = <8171875>;
+ 				};
+ 
+ 				opp-545000000 {
+ 					opp-hz = /bits/ 64 <545000000>;
+ 					opp-level = <RPMH_REGULATOR_LEVEL_SVS_L0>;
++					opp-peak-kBps = <8171875>;
+ 				};
+ 
+ 				opp-492000000 {
+ 					opp-hz = /bits/ 64 <492000000>;
+ 					opp-level = <RPMH_REGULATOR_LEVEL_SVS>;
++					opp-peak-kBps = <6074218>;
+ 				};
+ 
+ 				opp-421000000 {
+ 					opp-hz = /bits/ 64 <421000000>;
+ 					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_L1>;
++					opp-peak-kBps = <6074218>;
+ 				};
+ 
+ 				opp-350000000 {
+ 					opp-hz = /bits/ 64 <350000000>;
+ 					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
++					opp-peak-kBps = <2136718>;
+ 				};
+ 
+ 				opp-317000000 {
+ 					opp-hz = /bits/ 64 <317000000>;
+ 					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
++					opp-peak-kBps = <1761718>;
+ 				};
+ 
+ 				opp-285000000 {
+ 					opp-hz = /bits/ 64 <285000000>;
+ 					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D1>;
++					opp-peak-kBps = <1761718>;
+ 				};
+ 
+ 				opp-220000000 {
+ 					opp-hz = /bits/ 64 <220000000>;
+ 					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D1>;
++					opp-peak-kBps = <1761718>;
+ 				};
+ 			};
+ 		};

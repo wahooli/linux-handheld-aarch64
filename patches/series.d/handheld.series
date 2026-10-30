@@ -219,3 +219,13 @@ v9_20260801_sachin_garg_media_iris_cache_work_mode_in_iris_set_stage.patch
 9022-soc-qcom-override-the-SM8750-PCIe-state-manager-power-control.patch
 9023-soc-qcom-hand-the-SM8750-MDSS-to-the-display-sequencer-at-suspend.patch
 9024-arm64-dts-qcom-cq8725s-ayn-odin3-add-the-display-CESTA.patch
+9026-drm-msm-dpu-AVR-on-DPU-8-and-split-DSI.patch
+9027-drm-msm-dpu-repeat-frames-below-the-AVR-range.patch
+9028-arm64-dts-qcom-sm8450-add-the-bandwidth-monitors.patch
+9029-arm64-dts-qcom-sm8450-vote-the-GPU-s-memory-bandwidth.patch
+shared/0248-drm-msm-adreno-a6xx-Mark-cxpd-device_link-as-stateless.patch
+shared/0249-drm-msm-Centralize-the-standalone-drm-device-check-for-GPU.patch
+shared/0250-drm-msm-adreno-Fix-invalid-drvdata-typecast-in-adreno_remove.patch
+shared/0251-drm-msm-Always-use-component-model-for-standalone-GPU.patch
+shared/0252-drm-msm-Attach-a-driver-to-the-GMU.patch
+9030-pinctrl-qcom-sm8450-lpass-lpi-force-runtime-suspend-across-system-sleep.patch

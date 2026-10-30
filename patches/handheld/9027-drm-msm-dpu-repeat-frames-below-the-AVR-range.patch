@@ -1,0 +1,143 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] drm/msm/dpu: repeat frames below the AVR range
+
+Below the panel's variable refresh floor, AVR holds a frame to the floor and
+then starts a repeat whenever the next frame lands, so frame lengths jump
+around. An LCD shows that as flicker: the AYANEO Pocket VERT's did with
+games under 60 fps.
+
+Do what amdgpu calls below-the-range compensation: from the last frame's
+time, pick the k that puts k even repeats nearest the middle of the range,
+and end each repeat's front porch from a timer with the trigger a commit
+uses. The longest frame stays at the floor: rewriting INTF_AVR_VTOTAL per
+frame while AVR ran underran the fetch on both of the VERT's interfaces.
+Between the floor and twice the shortest frame no even multiple fits, and
+below 10 fps it isn't tried; those frames hold to the floor as before.
+
+On the VERT (72-120 Hz) a 45 fps game refreshes at 91.6 Hz and a 30 fps one
+at 90.1 Hz, mostly in 10-12 ms frames, with no underruns.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
+@@ -7,6 +7,7 @@
+ #ifndef __DPU_ENCODER_PHYS_H__
+ #define __DPU_ENCODER_PHYS_H__
+ 
++#include <linux/hrtimer.h>
+ #include <drm/drm_writeback.h>
+ #include <linux/jiffies.h>
+ 
+@@ -200,6 +201,13 @@ struct dpu_encoder_phys {
+ 	bool has_intf_te;
+ 	bool avr_capable;
+ 	bool avr_enabled;
++	/* AVR repeats below the range: the mode's and the floor's frame length */
++	u32 avr_min_ns;
++	u32 avr_max_ns;
++	ktime_t avr_last_kickoff;
++	ktime_t avr_repeat;
++	unsigned int avr_repeats;
++	struct hrtimer avr_timer;
+ };
+ 
+ static inline int dpu_encoder_phys_inc_pending(struct dpu_encoder_phys *phys)
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+@@ -284,6 +284,8 @@ static void dpu_encoder_phys_vid_setup_a
+ 	if (lines > vtotal) {
+ 		intf->ops.setup_avr(intf, (u32)(lines * htotal));
+ 		phys_enc->avr_capable = true;
++		phys_enc->avr_min_ns = div_u64((u64)vtotal * htotal * NSEC_PER_MSEC, clock_khz);
++		phys_enc->avr_max_ns = div_u64(lines * htotal * NSEC_PER_MSEC, clock_khz);
+ 	}
+ 	spin_unlock_irqrestore(phys_enc->enc_spinlock, lock_flags);
+ 
+@@ -322,6 +324,51 @@ static void dpu_encoder_phys_vid_update_
+ 		 phys_enc->hw_intf->idx - INTF_0, want ? "on" : "off");
+ }
+ 
++/*
++ * Below the range, show a frame k times at even intervals, as amdgpu's BTR:
++ * a timer ends each repeat's front porch with a commit's trigger. The frame
++ * length stays at the floor; rewriting it while AVR runs underruns the fetch.
++ */
++static enum hrtimer_restart dpu_encoder_phys_vid_avr_repeat(struct hrtimer *timer)
++{
++	struct dpu_encoder_phys *phys_enc =
++		container_of(timer, struct dpu_encoder_phys, avr_timer);
++	unsigned long lock_flags;
++
++	spin_lock_irqsave(phys_enc->enc_spinlock, lock_flags);
++	if (phys_enc->avr_enabled)
++		phys_enc->hw_intf->ops.avr_trigger(phys_enc->hw_intf);
++	spin_unlock_irqrestore(phys_enc->enc_spinlock, lock_flags);
++
++	if (--phys_enc->avr_repeats == 0)
++		return HRTIMER_NORESTART;
++	hrtimer_forward_now(timer, phys_enc->avr_repeat);
++	return HRTIMER_RESTART;
++}
++
++static void dpu_encoder_phys_vid_avr_plan(struct dpu_encoder_phys *phys_enc)
++{
++	ktime_t now = ktime_get();
++	u64 t = ktime_to_ns(ktime_sub(now, phys_enc->avr_last_kickoff));
++	u64 lo, hi, k;
++
++	hrtimer_cancel(&phys_enc->avr_timer);
++	phys_enc->avr_last_kickoff = now;
++	phys_enc->avr_repeats = 0;
++	if (!phys_enc->avr_enabled || t <= phys_enc->avr_max_ns ||
++	    t >= 100 * NSEC_PER_MSEC)
++		return;
++
++	lo = DIV64_U64_ROUND_UP(t, phys_enc->avr_max_ns);
++	hi = div64_u64(t, phys_enc->avr_min_ns);
++	if (lo > hi)
++		return;
++	k = clamp(DIV64_U64_ROUND_CLOSEST(2 * t, phys_enc->avr_min_ns + phys_enc->avr_max_ns),
++		  lo, hi);
++	phys_enc->avr_repeat = ns_to_ktime(div64_u64(t, k));
++	phys_enc->avr_repeats = k - 1;
++}
++
+ static void dpu_encoder_phys_vid_setup_timing_engine(
+ 		struct dpu_encoder_phys *phys_enc)
+ {
+@@ -645,6 +692,7 @@ static void dpu_encoder_phys_vid_prepare
+ 	drm_enc = phys_enc->parent;
+ 
+ 	dpu_encoder_phys_vid_update_avr(phys_enc);
++	dpu_encoder_phys_vid_avr_plan(phys_enc);
+ 
+ 	ctl = phys_enc->hw_ctl;
+ 	if (!ctl->ops.wait_reset_status)
+@@ -689,6 +737,7 @@ static void dpu_encoder_phys_vid_disable
+ 		return;
+ 	}
+ 
++	hrtimer_cancel(&phys_enc->avr_timer);
+ 	spin_lock_irqsave(phys_enc->enc_spinlock, lock_flags);
+ 	/* A held front porch would delay the vsync waited for below. */
+ 	if (phys_enc->avr_enabled)
+@@ -765,6 +814,9 @@ static void dpu_encoder_phys_vid_handle_
+ 		spin_lock_irqsave(phys_enc->enc_spinlock, lock_flags);
+ 		phys_enc->hw_intf->ops.avr_trigger(phys_enc->hw_intf);
+ 		spin_unlock_irqrestore(phys_enc->enc_spinlock, lock_flags);
++		if (phys_enc->avr_repeats)
++			hrtimer_start(&phys_enc->avr_timer, phys_enc->avr_repeat,
++				      HRTIMER_MODE_REL);
+ 	}
+ }
+ 
+@@ -879,6 +931,8 @@ struct dpu_encoder_phys *dpu_encoder_phy
+ 	DPU_DEBUG_VIDENC(phys_enc, "\n");
+ 
+ 	dpu_encoder_phys_init(phys_enc, p);
++	hrtimer_setup(&phys_enc->avr_timer, dpu_encoder_phys_vid_avr_repeat,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	mutex_init(&phys_enc->vblank_ctl_lock);
+ 	phys_enc->vblank_refcount = 0;
+ 

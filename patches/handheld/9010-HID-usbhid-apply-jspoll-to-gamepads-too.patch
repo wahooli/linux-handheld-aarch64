@@ -12,6 +12,15 @@ its deep idle state most of the time (22% residency, 53% with the pad
 unbound). Treat Gamepad like Joystick, so the device's boot arguments
 and handheld-settingsd can set its rate.
 
+The overrides only ever reached the URB, and xHCI ignores urb->interval:
+it schedules the endpoint at the interval it read from the descriptor
+when the endpoint was added. Write the interval into the descriptor and
+re-add the interface's endpoints with usb_set_interface(), so the host
+controller picks it up. The override now stays in the cached descriptor
+across a rebind, so take the device's own interval from the raw
+configuration descriptor instead, which also keeps the fullspeed quirk
+from applying itself twice.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
 --- a/drivers/hid/usbhid/hid-core.c
@@ -25,8 +34,51 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  
  static unsigned int hid_kbpoll_interval;
  module_param_named(kbpoll, hid_kbpoll_interval, uint, 0644);
-@@ -1129,7 +1129,7 @@
- 				hid->name, endpoint->bInterval, interval);
+@@ -1079,6 +1079,21 @@
+ 	return ret;
+ }
+ 
++/* The device's own bInterval: the cached descriptor may hold an earlier override. */
++static int usbhid_own_interval(struct usb_device *dev,
++			       const struct usb_endpoint_descriptor *endpoint)
++{
++	const u8 *p = dev->rawdescriptors[dev->actconfig - dev->config];
++	unsigned int len = le16_to_cpu(dev->actconfig->desc.wTotalLength);
++	unsigned int off;
++
++	for (off = 0; off + USB_DT_ENDPOINT_SIZE <= len && p[off] >= 2; off += p[off])
++		if (p[off + 1] == USB_DT_ENDPOINT &&
++		    p[off + 2] == endpoint->bEndpointAddress)
++			return p[off + 6];
++	return endpoint->bInterval;
++}
++
+ static int usbhid_start(struct hid_device *hid)
+ {
+ 	struct usb_interface *intf = to_usb_interface(hid->dev.parent);
+@@ -1086,6 +1101,7 @@
+ 	struct usb_device *dev = interface_to_usbdev(intf);
+ 	struct usbhid_device *usbhid = hid->driver_data;
+ 	unsigned int n, insize = 0;
++	bool new_interval = false;
+ 	int ret;
+ 
+ 	mutex_lock(&usbhid->mutex);
+@@ -1119,17 +1135,17 @@
+ 		if (!usb_endpoint_xfer_int(endpoint))
+ 			continue;
+ 
+-		interval = endpoint->bInterval;
++		interval = usbhid_own_interval(dev, endpoint);
+ 
+ 		/* Some vendors give fullspeed interval on highspeed devices */
+ 		if (hid->quirks & HID_QUIRK_FULLSPEED_INTERVAL &&
+ 		    dev->speed == USB_SPEED_HIGH) {
+-			interval = fls(endpoint->bInterval*8);
+ 			pr_info("%s: Fixing fullspeed to highspeed interval: %d -> %d\n",
+-				hid->name, endpoint->bInterval, interval);
++				hid->name, interval, fls(interval * 8));
++			interval = fls(interval * 8);
  		}
  
 -		/* Change the polling interval of mice, joysticks
@@ -34,7 +86,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  		 * and keyboards.
  		 */
  		switch (hid->collection->usage) {
-@@ -1138,6 +1138,7 @@
+@@ -1138,6 +1154,7 @@
  				interval = hid_mousepoll_interval;
  			break;
  		case HID_GD_JOYSTICK:
@@ -42,3 +94,34 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  			if (hid_jspoll_interval > 0)
  				interval = hid_jspoll_interval;
  			break;
+@@ -1147,6 +1164,15 @@
+ 			break;
+ 		}
+ 
++		/*
++		 * xHCI polls at the interval it set up from the descriptor and
++		 * ignores the URB's: hand it this one through the descriptor.
++		 */
++		if (interval != endpoint->bInterval) {
++			endpoint->bInterval = interval;
++			new_interval = true;
++		}
++
+ 		ret = -ENOMEM;
+ 		if (usb_endpoint_dir_in(endpoint)) {
+ 			if (usbhid->urbin)
+@@ -1171,6 +1197,14 @@
+ 		}
+ 	}
+ 
++	/* Re-adding the endpoints makes the host controller read the descriptor again. */
++	if (new_interval) {
++		ret = usb_set_interface(dev, interface->desc.bInterfaceNumber,
++					interface->desc.bAlternateSetting);
++		if (ret)
++			hid_warn(hid, "could not apply the polling interval: %d\n", ret);
++	}
++
+ 	usbhid->urbctrl = usb_alloc_urb(0, GFP_KERNEL);
+ 	if (!usbhid->urbctrl) {
+ 		ret = -ENOMEM;

@@ -1,0 +1,37 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] drm/msm/dpu: AVR on DPU 8 and split DSI
+
+0107 sets up the INTF's AVR on DPU 9 and later only. DPU 8 has the same
+block at the same offsets: Qualcomm's SM8450 driver runs Qsync on it for
+video mode panels.
+
+A split display halves each INTF's horizontal timings but kept the full
+pixel clock, so AVR's longest frame came out twice as long as the panel's
+floor. Halve the clock with them.
+
+The AYANEO Pocket VERT (SM8475, DPU 8, two DSI links) runs variable refresh
+through both.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+@@ -355,6 +355,7 @@ static void dpu_encoder_phys_vid_setup_t
+ 		mode.hsync_start >>= 1;
+ 		mode.hsync_end >>= 1;
+ 		mode.hskew >>= 1;
++		mode.clock >>= 1;
+ 
+ 		DPU_DEBUG_VIDENC(phys_enc,
+ 			"split_role %d, halve horizontal %d %d %d %d %d\n",
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+@@ -708,7 +708,7 @@ struct dpu_hw_intf *dpu_hw_intf_init(str
+ 	if (mdss_rev->core_major_ver >= 7)
+ 		c->ops.program_intf_cmd_cfg = dpu_hw_intf_program_intf_cmd_cfg;
+ 
+-	if (mdss_rev->core_major_ver >= 9 && cfg->type == INTF_DSI) {
++	if (mdss_rev->core_major_ver >= 8 && cfg->type == INTF_DSI) {
+ 		c->ops.setup_avr = dpu_hw_intf_setup_avr;
+ 		c->ops.enable_avr = dpu_hw_intf_enable_avr;
+ 		c->ops.avr_trigger = dpu_hw_intf_avr_trigger;

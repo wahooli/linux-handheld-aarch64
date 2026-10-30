@@ -1,0 +1,26 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] pinctrl: qcom: sm8450-lpass-lpi: force runtime suspend across system sleep
+
+The sm8450 LPI pin controller has only runtime PM ops, and it is a
+device-link supplier of the SoundWire controllers and the LPASS macros.
+On the AYANEO Pocket VERT the WCD938x SoundWire masters are kept
+runtime-active for jack detection; for system sleep they and the macros
+are force-suspended (0563, 0564) but keep their link references, so the
+pin controller stays active with its LPASS_HW_MACRO and LPASS_HW_DCODEC
+votes. The ADSP then never sleeps and the SoC never reaches AOSD, CXSD or
+DDR low power: 0 of 59.6 s, against 98.9% with the masters runtime
+suspended. Force the runtime suspend across system sleep, as 0565 does
+for the sm8650 driver.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/pinctrl/qcom/pinctrl-sm8450-lpass-lpi.c
++++ b/drivers/pinctrl/qcom/pinctrl-sm8450-lpass-lpi.c
+@@ -205,6 +205,7 @@ static const struct of_device_id lpi_pin
+ MODULE_DEVICE_TABLE(of, lpi_pinctrl_of_match);
+ 
+ static const struct dev_pm_ops lpi_pinctrl_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+ 	RUNTIME_PM_OPS(pm_clk_suspend, pm_clk_resume, NULL)
+ };
+ 

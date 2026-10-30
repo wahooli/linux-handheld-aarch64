@@ -6,6 +6,15 @@ two DSI links (720x1600 each, 4 lanes, video burst mode). Mode, timings and
 command sequences are the stock devicetree's "ar13 90hz video mode dsi
 panel", which defines one 60 Hz timing only.
 
+The panel follows the link's pixel clock, so the same timings also run it at
+72, 75, 90, 100 and 120 Hz; those are offered as extra modes, 60 Hz stays
+preferred. Below 60 Hz the slower scan tears, and above 120 Hz the panel
+loses sync.
+
+It declares a variable refresh range of 72 to 120 Hz, which the DPU runs
+through the INTF's AVR (0107, 9026, 9027) on the 120 Hz timing. Held
+longer than that, the panel flickers.
+
 It switches vddio and the SGM3804 bias rails (avdd/avee) and takes the
 SY7758 backlight. The two other enable GPIOs and vci stay as the bootloader
 left them.
@@ -24,7 +33,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 +	depends on DRM_MIPI_DSI
 +	depends on BACKLIGHT_CLASS_DEVICE
 +	help
-+	  Say Y here if you want to enable support for the 1440x1600 60Hz
++	  Say Y here if you want to enable support for the 1440x1600
 +	  dual-DSI video mode LCD of the AYANEO Pocket VERT handheld.
 +
 +	  To compile this driver as a module, choose M here.
@@ -42,7 +51,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  obj-$(CONFIG_DRM_PANEL_XINPENG_XPP055C272) += panel-xinpeng-xpp055c272.o
 --- /dev/null
 +++ b/drivers/gpu/drm/panel/panel-ayaneo-pocket-vert.c
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,312 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * AYANEO Pocket VERT panel: 1440x1600 LCD on a Novatek-style controller,
@@ -71,7 +80,6 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 +#include <drm/drm_modes.h>
 +#include <drm/drm_of.h>
 +#include <drm/drm_panel.h>
-+#include <drm/drm_probe_helper.h>
 +
 +struct pocket_vert {
 +	struct drm_panel panel;
@@ -108,6 +116,15 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 +	.height_mm = 66,
 +	.type = DRM_MODE_TYPE_DRIVER,
 +};
++
++/*
++ * The same timings at a scaled pixel clock: below 60 Hz the scan tears, above
++ * 120 the panel loses sync.
++ */
++static const unsigned int pocket_vert_refresh_rates[] = { 60, 72, 75, 90, 100, 120 };
++
++/* Variable refresh floor: frames held longer than this flicker. */
++#define POCKET_VERT_VRR_MIN_HZ	72
 +
 +/* qcom,mdss-dsi-reset-sequence = <0 10 1 10 1 10>, reset is active low. */
 +static void pocket_vert_reset(struct pocket_vert *ctx)
@@ -214,10 +231,31 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 +				 struct drm_connector *connector)
 +{
 +	struct pocket_vert *ctx = to_pocket_vert(panel);
++	struct drm_display_mode *mode;
++	unsigned int i;
 +
 +	drm_connector_set_panel_orientation(connector, ctx->orientation);
 +
-+	return drm_connector_helper_get_modes_fixed(connector, &pocket_vert_mode);
++	for (i = 0; i < ARRAY_SIZE(pocket_vert_refresh_rates); i++) {
++		mode = drm_mode_duplicate(connector->dev, &pocket_vert_mode);
++		if (!mode)
++			return -ENOMEM;
++
++		mode->clock = mode->htotal * mode->vtotal * pocket_vert_refresh_rates[i] / 1000;
++		if (pocket_vert_refresh_rates[i] == 60)
++			mode->type |= DRM_MODE_TYPE_PREFERRED;
++		drm_mode_set_name(mode);
++		drm_mode_probed_add(connector, mode);
++	}
++
++	connector->display_info.width_mm = pocket_vert_mode.width_mm;
++	connector->display_info.height_mm = pocket_vert_mode.height_mm;
++	connector->display_info.monitor_range.min_vfreq = POCKET_VERT_VRR_MIN_HZ;
++	connector->display_info.monitor_range.max_vfreq =
++		pocket_vert_refresh_rates[ARRAY_SIZE(pocket_vert_refresh_rates) - 1];
++	drm_connector_set_vrr_capable_property(connector, true);
++
++	return i;
 +}
 +
 +static enum drm_panel_orientation pocket_vert_get_orientation(struct drm_panel *panel)
