@@ -93,3 +93,4 @@ shared/0243-local-drm-msm-serialize-devcoredump-reads.patch
 shared/0247-soc-qcom-add-ADSP-power-limits-Modern-Standby-notifier.patch
 0248-local-soc-qcom-aoss-keep-X1E-out-of-AOSD-at-EL2.patch
 0249-local-remoteproc-qcom_q6v5_pas-unbind-q6prm-before-releasing-the-GLINK-edge.patch
+shared/0253-local-sched-fair-use-BORE-s-base-slice-in-update_protect_slice.patch
