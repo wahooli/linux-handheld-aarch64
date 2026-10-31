@@ -8,21 +8,87 @@ SM8250's platform with a gen2 firmware description, taking buffer sizes
 as for SC7280's gen2 firmware, and MXC rather than MX as the OPP rail,
 as their video clock controller runs from MXC and MMCX.
 
-This firmware (video-firmware.2.4) predates RESUME with a payload: sent
-HFI_CMD_SETTINGS_CHANGE as one, it answers with an information flag
-instead of resuming, holds the bitstream buffer after a resolution
-change and never decodes. Qualcomm's driver sends RESUME without a
-payload; do so for this platform.
+Their firmware (video-firmware.2.4) is an early gen2 one:
+
+- It takes HFI_CMD_RESUME without a payload. Sent HFI_CMD_SETTINGS_CHANGE
+  as one, it answers with an information flag instead of resuming, holds
+  the bitstream after the resolution change and never decodes.
+  Qualcomm's driver sends no payload.
+
+- A settings change before the first frame pauses both ports, also when
+  the client started its capture queue before the stream. Steam's
+  streaming client does that and never answers the source change event,
+  so nothing resumed. When nothing has been decoded yet and the stream
+  fits the capture format, resume both ports from the driver, as the
+  client's capture streamon would.
+
+- It then hands back one empty capture buffer flagged LAST for that
+  settings change. Taken as the end of a drain, it stopped the session
+  after one frame; queue it again instead.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
+--- a/drivers/media/platform/qcom/iris/iris_common.c
++++ b/drivers/media/platform/qcom/iris/iris_common.c
+@@ -6,6 +6,7 @@
+ #include <media/v4l2-mem2mem.h>
+ 
+ #include "iris_common.h"
++#include "iris_buffer.h"
+ #include "iris_ctrls.h"
+ #include "iris_instance.h"
+ #include "iris_power.h"
+@@ -155,6 +156,33 @@
+ 	return iris_inst_change_sub_state(inst, clear_sub_state, 0);
+ }
+ 
++int iris_resume_first_ipsc(struct iris_inst *inst)
++{
++	const struct iris_hfi_session_ops *hfi_ops = inst->hfi_session_ops;
++	int ret;
++
++	ret = iris_alloc_and_queue_input_int_bufs(inst);
++	if (ret)
++		return ret;
++	ret = iris_set_stage(inst, STAGE);
++	if (ret)
++		return ret;
++	ret = iris_set_pipe(inst, PIPE);
++	if (ret)
++		return ret;
++	ret = hfi_ops->session_resume_drc(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
++	if (ret)
++		return ret;
++	ret = hfi_ops->session_resume_drc(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++	if (ret)
++		return ret;
++
++	inst->auto_resumed = true;
++
++	return iris_inst_change_sub_state(inst, IRIS_INST_SUB_FIRST_IPSC |
++					  IRIS_INST_SUB_DRC | IRIS_INST_SUB_INPUT_PAUSE, 0);
++}
++
+ static void iris_flush_deferred_buffers(struct iris_inst *inst,
+ 					enum iris_buffer_type type)
+ {
+--- a/drivers/media/platform/qcom/iris/iris_common.h
++++ b/drivers/media/platform/qcom/iris/iris_common.h
+@@ -13,6 +13,7 @@
+ void iris_set_ts_metadata(struct iris_inst *inst, struct vb2_v4l2_buffer *vbuf);
+ int iris_process_streamon_input(struct iris_inst *inst);
+ int iris_process_streamon_output(struct iris_inst *inst);
++int iris_resume_first_ipsc(struct iris_inst *inst);
+ int iris_session_streamoff(struct iris_inst *inst, u32 plane);
+ 
+ #endif
 --- a/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c
 +++ b/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c
 @@ -1179,6 +1179,7 @@
  {
  	struct iris_inst_hfi_gen2 *inst_hfi_gen2 = to_iris_inst_hfi_gen2(inst);
  	u32 payload = HFI_CMD_SETTINGS_CHANGE;
-+	bool none = inst->core->iris_platform_data->resume_no_payload;
++	bool none = inst->core->iris_platform_data->early_gen2_fw;
  
  	iris_hfi_gen2_packet_session_command(inst,
  					     HFI_CMD_RESUME,
@@ -39,6 +105,83 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  
  	return iris_hfi_queue_cmd_write(inst->core, inst_hfi_gen2->packet,
  					inst_hfi_gen2->packet->size);
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen2_response.c
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen2_response.c
+@@ -5,6 +5,7 @@
+ 
+ #include <media/v4l2-mem2mem.h>
+ 
++#include "iris_common.h"
+ #include "iris_hfi_gen2.h"
+ #include "iris_hfi_gen2_defines.h"
+ #include "iris_hfi_gen2_packet.h"
+@@ -354,6 +355,22 @@
+ 	bool found = false;
+ 	int ret;
+ 
++	/*
++	 * After a resume by the driver, the firmware hands back one empty buffer
++	 * flagged LAST for the settings change: queue it again, it ends nothing.
++	 */
++	if (inst->auto_resumed && !hfi_buffer->data_size &&
++	    hfi_buffer->flags & (HFI_BUF_FW_FLAG_LAST | HFI_BUF_FW_FLAG_PSC_LAST)) {
++		v4l2_m2m_for_each_dst_buf_safe(m2m_ctx, m2m_buffer, n) {
++			buf = to_iris_buffer(&m2m_buffer->vb);
++			if (buf->index == hfi_buffer->index &&
++			    buf->device_addr == hfi_buffer->base_address) {
++				inst->auto_resumed = false;
++				return inst->hfi_session_ops->session_queue_buf(inst, buf);
++			}
++		}
++	}
++
+ 	if (hfi_buffer->flags & HFI_BUF_FW_FLAG_LAST) {
+ 		ret = iris_inst_sub_state_change_drain_last(inst);
+ 		if (ret)
+@@ -667,6 +684,8 @@
+ static int iris_hfi_gen2_handle_src_change(struct iris_inst *inst,
+ 					   struct iris_hfi_packet *pkt)
+ {
++	struct v4l2_pix_format_mplane *dst = &inst->fmt_dst->fmt.pix_mp;
++	u32 width = dst->width, height = dst->height;
+ 	int ret;
+ 
+ 	if (pkt->port != HFI_PORT_BITSTREAM)
+@@ -679,6 +698,16 @@
+ 	iris_hfi_gen2_read_input_subcr_params(inst);
+ 	iris_vdec_src_change(inst);
+ 
++	/*
++	 * A client that started its capture queue before the stream (Steam's
++	 * streaming client) does not answer the event: when nothing has been
++	 * decoded and the stream fits its buffers, resume as its streamon would.
++	 */
++	if (inst->core->iris_platform_data->early_gen2_fw && !inst->sequence_cap &&
++	    vb2_is_streaming(v4l2_m2m_get_dst_vq(inst->m2m_ctx)) &&
++	    dst->width <= width && dst->height <= height)
++		return iris_resume_first_ipsc(inst);
++
+ 	return 0;
+ }
+ 
+--- a/drivers/media/platform/qcom/iris/iris_instance.h
++++ b/drivers/media/platform/qcom/iris/iris_instance.h
+@@ -67,6 +67,7 @@
+  * @metadata_idx: index for metadata buffer
+  * @codec: codec type
+  * @last_buffer_dequeued: a flag to indicate that last buffer is sent by driver
++ * @auto_resumed: resumed by the driver after the first settings change
+  * @last_buf_ns: start time of received input buffer for current one second FPS window
+  * @frame_counter: input buffer counter for current one second FPS window
+  * @frame_rate: frame rate of current instance
+@@ -114,6 +115,7 @@
+ 	u32				metadata_idx;
+ 	u32				codec;
+ 	bool				last_buffer_dequeued;
++	bool				auto_resumed;
+ 	u64				last_buf_ns;
+ 	u32				frame_counter;
+ 	u32				frame_rate;
 --- a/drivers/media/platform/qcom/iris/iris_platform_common.h
 +++ b/drivers/media/platform/qcom/iris/iris_platform_common.h
 @@ -58,6 +58,7 @@
@@ -49,12 +192,16 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  extern const struct iris_platform_data sm8550_data;
  extern const struct iris_platform_data sm8650_data;
  extern const struct iris_platform_data sm8750_data;
-@@ -320,6 +321,8 @@
+@@ -320,6 +321,12 @@
  	u32 tz_cp_config_data_size;
  	u32 num_vpp_pipe;
  	bool no_aon;
-+	/* gen2 firmware that takes RESUME without a payload (SM8450) */
-+	bool resume_no_payload;
++	/*
++	 * Gen2 firmware of SM8450's generation: RESUME takes no payload, and a
++	 * settings change before the first frame pauses both ports even when the
++	 * capture queue already runs.
++	 */
++	bool early_gen2_fw;
  	u32 max_session_count;
  	/* max number of macroblocks per frame supported */
  	u32 max_core_mbpf;
@@ -112,7 +259,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 +	.inst_caps = &platform_inst_cap_vpu2,
 +	.tz_cp_config_data = tz_cp_config_vpu2,
 +	.tz_cp_config_data_size = ARRAY_SIZE(tz_cp_config_vpu2),
-+	.resume_no_payload = true,
++	.early_gen2_fw = true,
 +	.num_vpp_pipe = 4,
 +	.max_session_count = 16,
 +	.max_core_mbpf = NUM_MBS_8K,
