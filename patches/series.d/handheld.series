@@ -229,4 +229,6 @@ shared/0250-drm-msm-adreno-Fix-invalid-drvdata-typecast-in-adreno_remove.patch
 shared/0251-drm-msm-Always-use-component-model-for-standalone-GPU.patch
 shared/0252-drm-msm-Attach-a-driver-to-the-GMU.patch
 9030-pinctrl-qcom-sm8450-lpass-lpi-force-runtime-suspend-across-system-sleep.patch
+9031-media-iris-add-SM8450-support.patch
+9032-arm64-dts-qcom-sm8450-add-the-iris-video-codec.patch
 shared/0253-local-sched-fair-use-BORE-s-base-slice-in-update_protect_slice.patch

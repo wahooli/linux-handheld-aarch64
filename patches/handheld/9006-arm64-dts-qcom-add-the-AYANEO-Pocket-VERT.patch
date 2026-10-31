@@ -27,7 +27,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  sm8550-hdk-display-card-rear-camera-card-dtbs	:= sm8550-hdk.dtb sm8550-hdk-display-card.dtbo sm8550-hdk-rear-camera-card.dtbo
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8475-ayaneo-pocket-vert.dts
-@@ -0,0 +1,1295 @@
+@@ -0,0 +1,1301 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * AYANEO Pocket VERT: Snapdragon 8+ Gen 1 (SM8475P, soc_id 531), built on
@@ -751,6 +751,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 +		#phy-cells = <0>;
 +	};
 +
++};
++
++&iris {
++	/* AYANEO's, from /vendor/firmware/vpu20_4v.mbn. */
++	firmware-name = "qcom/sm8475/ayaneo/pocket-vert/vpu20_4v.mbn";
++	status = "okay";
 +};
 +
 +&pm8350c_gpios {

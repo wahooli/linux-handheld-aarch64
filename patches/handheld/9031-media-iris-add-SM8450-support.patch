@@ -1,0 +1,133 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] media: iris: add SM8450 support
+
+SM8450 and SM8475 have SM8250's iris2 VPU with four pipes, but their
+firmware speaks the gen2 HFI: Qualcomm's driver binds them as
+msm-vidc-waipio on its iris2 variant and loads vpu20_4v. Add them as
+SM8250's platform with a gen2 firmware description, taking buffer sizes
+as for SC7280's gen2 firmware, and MXC rather than MX as the OPP rail,
+as their video clock controller runs from MXC and MMCX.
+
+This firmware (video-firmware.2.4) predates RESUME with a payload: sent
+HFI_CMD_SETTINGS_CHANGE as one, it answers with an information flag
+instead of resuming, holds the bitstream buffer after a resolution
+change and never decodes. Qualcomm's driver sends RESUME without a
+payload; do so for this platform.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c
+@@ -1179,6 +1179,7 @@
+ {
+ 	struct iris_inst_hfi_gen2 *inst_hfi_gen2 = to_iris_inst_hfi_gen2(inst);
+ 	u32 payload = HFI_CMD_SETTINGS_CHANGE;
++	bool none = inst->core->iris_platform_data->resume_no_payload;
+ 
+ 	iris_hfi_gen2_packet_session_command(inst,
+ 					     HFI_CMD_RESUME,
+@@ -1186,9 +1187,9 @@
+ 					     HFI_HOST_FLAGS_INTR_REQUIRED),
+ 					     iris_hfi_gen2_get_port(inst, plane),
+ 					     inst->session_id,
+-					     HFI_PAYLOAD_U32,
+-					     &payload,
+-					     sizeof(u32));
++					     none ? HFI_PAYLOAD_NONE : HFI_PAYLOAD_U32,
++					     none ? NULL : &payload,
++					     none ? 0 : sizeof(u32));
+ 
+ 	return iris_hfi_queue_cmd_write(inst->core, inst_hfi_gen2->packet,
+ 					inst_hfi_gen2->packet->size);
+--- a/drivers/media/platform/qcom/iris/iris_platform_common.h
++++ b/drivers/media/platform/qcom/iris/iris_platform_common.h
+@@ -58,6 +58,7 @@
+ extern const struct iris_platform_data qcs8300_data;
+ extern const struct iris_platform_data sc7280_data;
+ extern const struct iris_platform_data sm8250_data;
++extern const struct iris_platform_data sm8450_data;
+ extern const struct iris_platform_data sm8550_data;
+ extern const struct iris_platform_data sm8650_data;
+ extern const struct iris_platform_data sm8750_data;
+@@ -320,6 +321,8 @@
+ 	u32 tz_cp_config_data_size;
+ 	u32 num_vpp_pipe;
+ 	bool no_aon;
++	/* gen2 firmware that takes RESUME without a payload (SM8450) */
++	bool resume_no_payload;
+ 	u32 max_session_count;
+ 	/* max number of macroblocks per frame supported */
+ 	u32 max_core_mbpf;
+--- a/drivers/media/platform/qcom/iris/iris_platform_vpu2.c
++++ b/drivers/media/platform/qcom/iris/iris_platform_vpu2.c
+@@ -41,6 +41,12 @@
+ 	.fwname = "qcom/vpu/vpu20_p4.mbn",
+ };
+ 
++static const struct iris_firmware_desc iris_vpu20_p4_gen2_desc = {
++	.firmware_data = &iris_hfi_gen2_data,
++	.get_vpu_buffer_size = iris_vpu33_buf_size,
++	.fwname = "qcom/vpu/vpu20_p4_gen2.mbn",
++};
++
+ static const u32 iris_fmts_vpu2_dec[] = {
+ 	[IRIS_FMT_H264] = V4L2_PIX_FMT_H264,
+ 	[IRIS_FMT_HEVC] = V4L2_PIX_FMT_HEVC,
+@@ -68,6 +74,8 @@
+ 
+ static const char * const iris_pmdomain_table_vpu2[] = { "venus", "vcodec0" };
+ 
++static const char * const sm8450_opp_pd_table[] = { "mxc", "mmcx" };
++
+ static const struct tz_cp_config tz_cp_config_vpu2[] = {
+ 	{
+ 		.cp_start = 0,
+@@ -161,5 +169,35 @@
+ 	.num_vpp_pipe = 4,
+ 	.max_session_count = 16,
+ 	.max_core_mbpf = NUM_MBS_8K,
++	.max_core_mbps = ((7680 * 4320) / 256) * 60,
++};
++
++const struct iris_platform_data sm8450_data = {
++	.firmware_desc_gen2 = &iris_vpu20_p4_gen2_desc,
++	.vpu_ops = &iris_vpu2_ops,
++	.icc_tbl = iris_icc_info_vpu2,
++	.icc_tbl_size = ARRAY_SIZE(iris_icc_info_vpu2),
++	.clk_rst_tbl = iris_clk_reset_table_vpu2,
++	.clk_rst_tbl_size = ARRAY_SIZE(iris_clk_reset_table_vpu2),
++	.bw_tbl_dec = sm8250_bw_table_dec,
++	.bw_tbl_dec_size = ARRAY_SIZE(sm8250_bw_table_dec),
++	.pmdomain_tbl = iris_pmdomain_table_vpu2,
++	.pmdomain_tbl_size = ARRAY_SIZE(iris_pmdomain_table_vpu2),
++	.opp_pd_tbl = sm8450_opp_pd_table,
++	.opp_pd_tbl_size = ARRAY_SIZE(sm8450_opp_pd_table),
++	.clk_tbl = sm8250_clk_table,
++	.clk_tbl_size = ARRAY_SIZE(sm8250_clk_table),
++	.opp_clk_tbl = sm8250_opp_clk_table,
++	/* Upper bound of DMA address range */
++	.dma_mask = 0xe0000000 - 1,
++	.inst_iris_fmts = iris_fmts_vpu2_dec,
++	.inst_iris_fmts_size = ARRAY_SIZE(iris_fmts_vpu2_dec),
++	.inst_caps = &platform_inst_cap_vpu2,
++	.tz_cp_config_data = tz_cp_config_vpu2,
++	.tz_cp_config_data_size = ARRAY_SIZE(tz_cp_config_vpu2),
++	.resume_no_payload = true,
++	.num_vpp_pipe = 4,
++	.max_session_count = 16,
++	.max_core_mbpf = NUM_MBS_8K,
+ 	.max_core_mbps = ((7680 * 4320) / 256) * 60,
+ };
+--- a/drivers/media/platform/qcom/iris/iris_probe.c
++++ b/drivers/media/platform/qcom/iris/iris_probe.c
+@@ -373,6 +373,10 @@
+ 		.data = &sm8250_data,
+ 	},
+ 	{
++		.compatible = "qcom,sm8450-iris",
++		.data = &sm8450_data,
++	},
++	{
+ 		.compatible = "qcom,sm8550-iris",
+ 		.data = &sm8550_data,
+ 	},
