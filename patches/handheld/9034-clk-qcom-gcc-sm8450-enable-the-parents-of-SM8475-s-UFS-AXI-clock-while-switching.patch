@@ -1,0 +1,24 @@
+From: Waltteri Hooli <1420194+wahooli@users.noreply.github.com>
+Subject: [PATCH] clk: qcom: gcc-sm8450: enable the parents of SM8475's UFS AXI
+ clock while switching
+
+SM8475's UFS AXI clock reaches its turbo rates from GPLL2. ufshcd sets
+the rate at probe before it enables the clock, so GPLL2 is not running
+when the RCG switches to it, and the update times out:
+"gcc_ufs_phy_axi_clk_src: rcg didn't update its configuration". Keep
+both parents on across the switch, as SM8150 and SM8250 do for their
+SDCC2 clock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/clk/qcom/gcc-sm8450.c
++++ b/drivers/clk/qcom/gcc-sm8450.c
+@@ -1076,7 +1076,7 @@
+ 	.name = "gcc_ufs_phy_axi_clk_src",
+ 	.parent_data = sm8475_gcc_parent_data_3,
+ 	.num_parents = ARRAY_SIZE(sm8475_gcc_parent_map_3),
+-	.flags = CLK_SET_RATE_PARENT,
++	.flags = CLK_SET_RATE_PARENT | CLK_OPS_PARENT_ENABLE,
+ 	.ops = &clk_rcg2_ops,
+ };
+ 
