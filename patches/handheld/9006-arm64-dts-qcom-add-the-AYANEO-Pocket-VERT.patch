@@ -27,7 +27,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  sm8550-hdk-display-card-rear-camera-card-dtbs	:= sm8550-hdk.dtb sm8550-hdk-display-card.dtbo sm8550-hdk-rear-camera-card.dtbo
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8475-ayaneo-pocket-vert.dts
-@@ -0,0 +1,1301 @@
+@@ -0,0 +1,1345 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * AYANEO Pocket VERT: Snapdragon 8+ Gen 1 (SM8475P, soc_id 531), built on
@@ -437,6 +437,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 +			regulator-name = "vreg_l5b_0p88";
 +			regulator-min-microvolt = <880000>;
 +			regulator-max-microvolt = <880000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 +		};
 +
 +		vreg_l6b_1p2: ldo6 {
@@ -449,12 +450,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 +			regulator-name = "vreg_l7b_2p504";
 +			regulator-min-microvolt = <2504000>;
 +			regulator-max-microvolt = <2504000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 +		};
 +
 +		vreg_l9b_1p2: ldo9 {
 +			regulator-name = "vreg_l9b_1p2";
 +			regulator-min-microvolt = <1200000>;
 +			regulator-max-microvolt = <1200000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 +		};
 +	};
 +
@@ -525,6 +528,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 +			regulator-name = "vreg_l10c_1p2";
 +			regulator-min-microvolt = <1200000>;
 +			regulator-max-microvolt = <1200000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 +		};
 +
 +		vreg_l12c_1p8: ldo12 {
@@ -1169,7 +1173,47 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 +	vcc-max-microamp = <1100000>;
 +	vccq-supply = <&vreg_l9b_1p2>;
 +	vccq-max-microamp = <1200000>;
++
++	/*
++	 * SM8475 runs the UFS AXI clock from GPLL2 under load (Qualcomm's
++	 * "turbo"). At sm8450's 300 MHz, sustained HS-G4 writes break the link.
++	 */
++	/delete-property/ freq-table-hz;
++	required-opps = <&rpmhpd_opp_nom>;
++	operating-points-v2 = <&ufs_opp_table>;
 +	status = "okay";
++
++	ufs_opp_table: opp-table {
++		compatible = "operating-points-v2";
++
++		opp-75000000 {
++			opp-hz = /bits/ 64 <75000000>, /bits/ 64 <0>, /bits/ 64 <0>,
++				 /bits/ 64 <75000000>, /bits/ 64 <0>, /bits/ 64 <0>,
++				 /bits/ 64 <0>, /bits/ 64 <0>;
++			required-opps = <&rpmhpd_opp_low_svs>;
++		};
++
++		opp-150000000 {
++			opp-hz = /bits/ 64 <150000000>, /bits/ 64 <0>, /bits/ 64 <0>,
++				 /bits/ 64 <150000000>, /bits/ 64 <0>, /bits/ 64 <0>,
++				 /bits/ 64 <0>, /bits/ 64 <0>;
++			required-opps = <&rpmhpd_opp_svs>;
++		};
++
++		opp-300000000 {
++			opp-hz = /bits/ 64 <300000000>, /bits/ 64 <0>, /bits/ 64 <0>,
++				 /bits/ 64 <300000000>, /bits/ 64 <0>, /bits/ 64 <0>,
++				 /bits/ 64 <0>, /bits/ 64 <0>;
++			required-opps = <&rpmhpd_opp_nom>;
++		};
++
++		opp-806400000 {
++			opp-hz = /bits/ 64 <806400000>, /bits/ 64 <0>, /bits/ 64 <0>,
++				 /bits/ 64 <300000000>, /bits/ 64 <0>, /bits/ 64 <0>,
++				 /bits/ 64 <0>, /bits/ 64 <0>;
++			required-opps = <&rpmhpd_opp_turbo_l1>;
++		};
++	};
 +};
 +
 +&ufs_mem_phy {
